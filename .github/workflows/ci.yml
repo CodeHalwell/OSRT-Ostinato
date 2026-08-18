@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      # NOTE: `ruff format --check` is deliberately NOT enforced yet. The
+      # inherited v6 tree was never ruff-formatted: 49 of 54 files would be
+      # rewritten, and that diff would tangle with the substantive v7 changes
+      # (mHC removal, the OSRT_V7 preset). Format in one deliberate commit
+      # once those land, then add this gate back.
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Parameter budget (canonical source for param counts)
+        run: PYTHONPATH=src uv run python scripts/compute_budget.py

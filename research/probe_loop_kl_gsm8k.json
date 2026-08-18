@@ -1,0 +1,101 @@
+{
+  "ckpt": "checkpoints/v5/osrt_v5_midtrain_final.pt",
+  "texts": "general",
+  "full_loops": 6,
+  "full_ce": 2.4757,
+  "full_ppl": 11.89,
+  "rows": [
+    {
+      "loops": 2,
+      "kl_full_given_k": 0.7212,
+      "top1_agree": 0.5993,
+      "ce": 3.2476,
+      "ppl": 25.729
+    },
+    {
+      "loops": 3,
+      "kl_full_given_k": 0.3655,
+      "top1_agree": 0.7201,
+      "ce": 2.8369,
+      "ppl": 17.063
+    },
+    {
+      "loops": 4,
+      "kl_full_given_k": 0.1869,
+      "top1_agree": 0.8099,
+      "ce": 2.6353,
+      "ppl": 13.947
+    },
+    {
+      "loops": 5,
+      "kl_full_given_k": 0.0718,
+      "top1_agree": 0.889,
+      "ce": 2.5341,
+      "ppl": 12.605
+    }
+  ],
+  "flip_types": {
+    "boundary": "6->5",
+    "flip_rate": 0.111,
+    "mean_conf_flipped": 0.2393,
+    "mean_conf_unflipped": 0.5621,
+    "gold_category_counts_all": {
+      "digit": 1904,
+      "math_op": 1418,
+      "reasoning_connective": 128,
+      "punct/space": 1004,
+      "word/other": 5495
+    },
+    "gold_category_counts_flipped": {
+      "digit": 242,
+      "math_op": 169,
+      "reasoning_connective": 12,
+      "punct/space": 55,
+      "word/other": 626
+    },
+    "enrichment_flip_vs_all": {
+      "digit": 1.15,
+      "math_op": 1.07,
+      "reasoning_connective": 0.84,
+      "punct/space": 0.49,
+      "word/other": 1.03
+    },
+    "flip_rate_by_category": {
+      "digit": 0.127,
+      "math_op": 0.119,
+      "reasoning_connective": 0.094,
+      "punct/space": 0.055,
+      "word/other": 0.114
+    },
+    "per_boundary_flip_rate_by_category": {
+      "3->2": {
+        "digit": 0.389,
+        "math_op": 0.254,
+        "reasoning_connective": 0.336,
+        "punct/space": 0.196,
+        "word/other": 0.226
+      },
+      "4->3": {
+        "digit": 0.268,
+        "math_op": 0.147,
+        "reasoning_connective": 0.25,
+        "punct/space": 0.132,
+        "word/other": 0.188
+      },
+      "5->4": {
+        "digit": 0.184,
+        "math_op": 0.131,
+        "reasoning_connective": 0.18,
+        "punct/space": 0.098,
+        "word/other": 0.151
+      },
+      "6->5": {
+        "digit": 0.127,
+        "math_op": 0.119,
+        "reasoning_connective": 0.094,
+        "punct/space": 0.055,
+        "word/other": 0.114
+      }
+    }
+  }
+}

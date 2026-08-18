@@ -1,0 +1,37 @@
+{
+  "ckpt": "checkpoints/v5/osrt_v5_midtrain_final.pt",
+  "texts": "general",
+  "full_loops": 6,
+  "full_ce": 4.7932,
+  "full_ppl": 120.692,
+  "rows": [
+    {
+      "loops": 2,
+      "kl_full_given_k": 0.3881,
+      "top1_agree": 0.6218,
+      "ce": 5.2032,
+      "ppl": 181.859
+    },
+    {
+      "loops": 3,
+      "kl_full_given_k": 0.1795,
+      "top1_agree": 0.7143,
+      "ce": 4.9966,
+      "ppl": 147.906
+    },
+    {
+      "loops": 4,
+      "kl_full_given_k": 0.104,
+      "top1_agree": 0.7521,
+      "ce": 4.9115,
+      "ppl": 135.838
+    },
+    {
+      "loops": 5,
+      "kl_full_given_k": 0.0407,
+      "top1_agree": 0.8445,
+      "ce": 4.8528,
+      "ppl": 128.1
+    }
+  ]
+}

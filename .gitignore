@@ -1,0 +1,60 @@
+# ── Python ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.venv/
+venv/
+.python-version.local
+
+# ── Tooling caches ─────────────────────────────────────────────────────
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# ── Secrets — never commit ─────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+.netrc
+
+# ── Model weights & checkpoints ────────────────────────────────────────
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+checkpoints/
+
+# ── Training data ──────────────────────────────────────────────────────
+# Learned the hard way: a 103MB jsonl is over GitHub's 100MB hard limit and
+# the push is rejected outright. Data lives on HF, not in git.
+data/
+rollouts/
+*.jsonl
+!tests/**/*.jsonl
+
+# ── Run artefacts ──────────────────────────────────────────────────────
+wandb/
+outputs/
+*.log
+
+# ── Third-party papers ─────────────────────────────────────────────────
+# arXiv's default licence grants no third-party redistribution right.
+# Cite the arXiv ID; keep PDFs local.
+research/*.pdf
+
+# ── Editor / agent scratch ─────────────────────────────────────────────
+.claude/
+.agents/
+.junie/
+
+# NOTE: notebooks are NOT blanket-ignored here. The previous repo had a bare
+# `*.ipynb` rule, which meant every notebook needed `git add -f` and several
+# were silently never committed. Ignore outputs instead, via nbstripout.

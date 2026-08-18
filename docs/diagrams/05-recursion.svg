@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 720">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <style><![CDATA[
+      svg { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .box { rx: 4; ry: 4; stroke-width: 1.2; }
+      .lbl { font-size: 13px; fill: #0f172a; font-weight: 600; }
+      .sub { font-size: 10.5px; fill: #475569; }
+      .ttl { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .e { fill: none; stroke: #475569; stroke-width: 1.3; marker-end: url(#arr); }
+      
+      /* Academic Color Palette */
+      .b0 { fill: #eff6ff; stroke: #1d4ed8; }
+      .b1 { fill: #fff7ed; stroke: #c2410c; }
+      .b2 { fill: #f3e8ff; stroke: #6b21a8; }
+      .io { fill: #f1f5f9; stroke: #475569; }
+      .head { fill: #ecfdf5; stroke: #047857; }
+      .note-box { fill: #f8fafc; stroke: #475569; stroke-width: 1.2; }
+      
+      .bx { font-size: 11px; font-weight: 600; fill: #0f172a; }
+      .eff { font-size: 9px; fill: #475569; }
+    ]]></style>
+  </defs>
+
+  <!-- background -->
+  <rect width="100%" height="100%" fill="#ffffff"/>
+
+  <text x="30" y="36" class="ttl">Recursion — 3 physical blocks × 6 loops = 18 effective layers</text>
+  <text x="30" y="56" class="sub">weight-shared depth: the same 3 blocks are re-applied 6 times; loop index L = loop·3 + block</text>
+
+  <!-- physical blocks legend (left) -->
+  <rect x="30" y="92" width="150" height="150" rx="10" fill="none" stroke="#64748b" stroke-dasharray="5 4"/>
+  <text x="105" y="112" text-anchor="middle" class="sub" font-weight="700" fill="#0f172a">3 physical blocks</text>
+  <text x="105" y="126" text-anchor="middle" class="eff">(the only weights)</text>
+  
+  <rect class="box b0" x="48" y="138" width="114" height="28" rx="6" stroke-width="1.5"/>
+  <text x="105" y="156" text-anchor="middle" class="bx">Block 0</text>
+  
+  <rect class="box b1" x="48" y="174" width="114" height="28" rx="6" stroke-width="1.5"/>
+  <text x="105" y="192" text-anchor="middle" class="bx">Block 1</text>
+  
+  <rect class="box b2" x="48" y="210" width="114" height="28" rx="6" stroke-width="1.5"/>
+  <text x="105" y="228" text-anchor="middle" class="bx">Block 2</text>
+  
+  <text x="105" y="262" text-anchor="middle" class="eff">reused 6× →</text>
+
+  <!-- embedding -->
+  <rect class="box io" x="300" y="92" width="280" height="34" rx="9" stroke-width="1.6"/>
+  <text x="440" y="114" text-anchor="middle" class="lbl">token embedding (65,536 × 1536)</text>
+  <line class="e" x1="440" y1="126" x2="440" y2="146"/>
+
+  <!-- 6 loop rows -->
+  <!-- loop 0 -->
+  <g>
+    <text x="585" y="168" text-anchor="start" class="sub">loop 0</text>
+    <rect class="box b0" x="306" y="148" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="163" text-anchor="middle" class="bx">B0</text><text x="348" y="174" text-anchor="middle" class="eff">L0</text>
+    <rect class="box b1" x="398" y="148" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="163" text-anchor="middle" class="bx">B1</text><text x="440" y="174" text-anchor="middle" class="eff">L1</text>
+    <rect class="box b2" x="490" y="148" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="163" text-anchor="middle" class="bx">B2</text><text x="532" y="174" text-anchor="middle" class="eff">L2</text>
+  </g>
+  <line class="e" x1="440" y1="178" x2="440" y2="194"/>
+  
+  <!-- loop 1 -->
+  <g>
+    <text x="585" y="216" text-anchor="start" class="sub">loop 1</text>
+    <rect class="box b0" x="306" y="196" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="211" text-anchor="middle" class="bx">B0</text><text x="348" y="222" text-anchor="middle" class="eff">L3</text>
+    <rect class="box b1" x="398" y="196" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="211" text-anchor="middle" class="bx">B1</text><text x="440" y="222" text-anchor="middle" class="eff">L4</text>
+    <rect class="box b2" x="490" y="196" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="211" text-anchor="middle" class="bx">B2</text><text x="532" y="222" text-anchor="middle" class="eff">L5</text>
+  </g>
+  <line class="e" x1="440" y1="226" x2="440" y2="242"/>
+  
+  <!-- loop 2 -->
+  <g>
+    <text x="585" y="264" text-anchor="start" class="sub">loop 2</text>
+    <rect class="box b0" x="306" y="244" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="259" text-anchor="middle" class="bx">B0</text><text x="348" y="270" text-anchor="middle" class="eff">L6</text>
+    <rect class="box b1" x="398" y="244" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="259" text-anchor="middle" class="bx">B1</text><text x="440" y="270" text-anchor="middle" class="eff">L7</text>
+    <rect class="box b2" x="490" y="244" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="259" text-anchor="middle" class="bx">B2</text><text x="532" y="270" text-anchor="middle" class="eff">L8</text>
+  </g>
+  <line class="e" x1="440" y1="274" x2="440" y2="290"/>
+  
+  <!-- loop 3 -->
+  <g>
+    <text x="585" y="312" text-anchor="start" class="sub">loop 3</text>
+    <rect class="box b0" x="306" y="292" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="307" text-anchor="middle" class="bx">B0</text><text x="348" y="318" text-anchor="middle" class="eff">L9</text>
+    <rect class="box b1" x="398" y="292" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="307" text-anchor="middle" class="bx">B1</text><text x="440" y="318" text-anchor="middle" class="eff">L10</text>
+    <rect class="box b2" x="490" y="292" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="307" text-anchor="middle" class="bx">B2</text><text x="532" y="318" text-anchor="middle" class="eff">L11</text>
+  </g>
+  <line class="e" x1="440" y1="322" x2="440" y2="338"/>
+  
+  <!-- loop 4 -->
+  <g>
+    <text x="585" y="360" text-anchor="start" class="sub">loop 4</text>
+    <rect class="box b0" x="306" y="340" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="355" text-anchor="middle" class="bx">B0</text><text x="348" y="366" text-anchor="middle" class="eff">L12</text>
+    <rect class="box b1" x="398" y="340" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="355" text-anchor="middle" class="bx">B1</text><text x="440" y="366" text-anchor="middle" class="eff">L13</text>
+    <rect class="box b2" x="490" y="340" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="355" text-anchor="middle" class="bx">B2</text><text x="532" y="366" text-anchor="middle" class="eff">L14</text>
+  </g>
+  <line class="e" x1="440" y1="370" x2="440" y2="386"/>
+  
+  <!-- loop 5 -->
+  <g>
+    <text x="585" y="408" text-anchor="start" class="sub">loop 5</text>
+    <rect class="box b0" x="306" y="388" width="84" height="30" rx="6" stroke-width="1.4"/><text x="348" y="403" text-anchor="middle" class="bx">B0</text><text x="348" y="414" text-anchor="middle" class="eff">L15</text>
+    <rect class="box b1" x="398" y="388" width="84" height="30" rx="6" stroke-width="1.4"/><text x="440" y="403" text-anchor="middle" class="bx">B1</text><text x="440" y="414" text-anchor="middle" class="eff">L16</text>
+    <rect class="box b2" x="490" y="388" width="84" height="30" rx="6" stroke-width="1.4"/><text x="532" y="403" text-anchor="middle" class="bx">B2</text><text x="532" y="414" text-anchor="middle" class="eff">L17</text>
+  </g>
+  <line class="e" x1="440" y1="418" x2="440" y2="436"/>
+
+  <!-- reuse arrows from physical blocks -->
+  <path d="M162,150 C230,150 240,162 300,162" fill="none" stroke="#1d4ed8" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)" opacity="0.5"/>
+  <path d="M162,188 C230,300 240,400 300,403" fill="none" stroke="#6b21a8" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)" opacity="0.5"/>
+
+  <!-- norm + collapse + heads -->
+  <rect class="box io" x="300" y="436" width="280" height="34" rx="9" stroke-width="1.6"/>
+  <text x="440" y="458" text-anchor="middle" class="lbl">mHC collapse → RMSNorm (norm_out)</text>
+  <line class="e" x1="440" y1="470" x2="440" y2="486"/>
+  
+  <rect class="box head" x="300" y="486" width="280" height="34" rx="9" stroke-width="1.6"/>
+  <text x="440" y="508" text-anchor="middle" class="lbl">tied LM head  (+ 2 MTP heads, train)</text>
+
+  <!-- note -->
+  <rect x="30" y="548" width="620" height="120" rx="8" class="box note-box"/>
+  <text x="45" y="570" class="sub" font-weight="700" fill="#0f172a">Effective depth without the parameters.</text>
+  <text x="45" y="590" class="sub" fill="#334155">18 transformer applications, but only 3 blocks' worth of weights — the recursion buys depth</text>
+  <text x="45" y="606" class="sub" fill="#334155">cheaply. Each effective layer L also carries its own HRA adapter (18 adapters) and a loop</text>
+  <text x="45" y="622" class="sub" fill="#334155">embedding, so the shared blocks can still specialise per iteration.</text>
+  <text x="45" y="646" class="sub" fill="#6b21a8" font-weight="600">Collapse telemetry tracks ‖Δx‖/‖x‖ at each of the 18 layers to catch loops degenerating to no-ops.</text>
+</svg>

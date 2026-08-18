@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 800">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <style><![CDATA[
+      svg { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .box { rx: 5; ry: 5; stroke-width: 1.2; }
+      .lbl { font-size: 13.5px; fill: #0f172a; font-weight: 600; }
+      .sub { font-size: 10.5px; fill: #475569; }
+      .ttl { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .note { font-size: 11px; fill: #334155; }
+      .e { fill: none; stroke: #475569; stroke-width: 1.3; marker-end: url(#arr); }
+      
+      /* Academic Color Palette */
+      .moe { fill: #fff7ed; stroke: #c2410c; }
+      .exp { fill: #fffbeb; stroke: #b45309; }
+      .norm { fill: #f8fafc; stroke: #475569; }
+      .io { fill: #f1f5f9; stroke: #475569; }
+      .route { fill: #fff7ed; stroke: #ea580c; }
+      .aux { fill: #f7fee7; stroke: #4d7c0f; }
+      .telemetry-box { fill: #ecfdf5; stroke: #047857; stroke-width: 1.2; }
+    ]]></style>
+  </defs>
+
+  <!-- background -->
+  <rect width="100%" height="100%" fill="#ffffff"/>
+
+  <text x="30" y="38" class="ttl">OSRT MoE — DeepSeekMoE shape, top-2 of 8 + shared, grouped-GEMM dispatch</text>
+  <text x="30" y="60" class="sub">1 shared expert (h=2816) + 8 routed (h=3840), top-2 · aux-loss-free balance bias · dropless</text>
+
+  <!-- input -->
+  <rect class="box io" x="340" y="80" width="200" height="40"/>
+  <text x="440" y="105" text-anchor="middle" class="lbl">hidden (B, S, 1536)</text>
+  <line class="e" x1="440" y1="120" x2="440" y2="146"/>
+
+  <!-- RMSNorm -->
+  <rect class="box norm" x="340" y="146" width="200" height="40"/>
+  <text x="440" y="171" text-anchor="middle" class="lbl">RMSNorm (norm_moe)</text>
+
+  <!-- split: shared (left) + router (right) -->
+  <line class="e" x1="390" y1="186" x2="180" y2="226"/>
+  <line class="e" x1="490" y1="186" x2="560" y2="226"/>
+
+  <!-- shared expert -->
+  <rect class="box exp" x="60" y="226" width="240" height="56"/>
+  <text x="180" y="248" text-anchor="middle" class="lbl">Shared expert (always on)</text>
+  <text x="180" y="266" text-anchor="middle" class="sub">SwiGLU, h=2816 — every token</text>
+  <line class="e" x1="180" y1="282" x2="320" y2="600"/>
+
+  <!-- router -->
+  <rect class="box route" x="530" y="226" width="300" height="40"/>
+  <text x="680" y="251" text-anchor="middle" class="lbl">Router  1536 → 8 logits</text>
+  <line class="e" x1="680" y1="266" x2="680" y2="292"/>
+  
+  <rect class="box route" x="530" y="292" width="300" height="58"/>
+  <text x="680" y="312" text-anchor="middle" class="lbl">sqrt-softplus → + balance bias</text>
+  <text x="680" y="328" text-anchor="middle" class="sub">→ + Gumbel noise (train) → softmax</text>
+  <text x="680" y="343" text-anchor="middle" class="sub">aux-loss-free bias keeps load balanced</text>
+  <line class="e" x1="680" y1="350" x2="680" y2="376"/>
+  
+  <rect class="box route" x="560" y="376" width="240" height="40"/>
+  <text x="680" y="401" text-anchor="middle" class="lbl">top-2 select  (idx, gate)</text>
+
+  <!-- aux losses side -->
+  <rect class="box aux" x="720" y="120" width="150" height="92"/>
+  <text x="795" y="142" text-anchor="middle" class="note" font-weight="700" fill="#4d7c0f">aux losses</text>
+  <text x="795" y="160" text-anchor="middle" class="sub">Switch balance</text>
+  <text x="795" y="175" text-anchor="middle" class="sub">z-loss (ST-MoE)</text>
+  <text x="795" y="190" text-anchor="middle" class="sub">seq-balance</text>
+  <text x="795" y="205" text-anchor="middle" class="sub">+ per-loop aux</text>
+  <line class="e" x1="680" y1="266" x2="760" y2="212"/>
+
+  <!-- grouped-GEMM dispatch -->
+  <line class="e" x1="680" y1="416" x2="680" y2="442"/>
+  <rect class="box moe" x="470" y="442" width="420" height="120"/>
+  <text x="680" y="464" text-anchor="middle" class="lbl">Grouped-GEMM dispatch  (B4, dropless)</text>
+  <line x1="486" y1="474" x2="874" y2="474" stroke="#c2410c" stroke-dasharray="3 3"/>
+  <text x="680" y="492" text-anchor="middle" class="sub">flatten (token,rank) pairs → argsort by expert</text>
+  <text x="680" y="508" text-anchor="middle" class="sub">→ bincount/cumsum offsets → torch._grouped_mm</text>
+  <text x="680" y="524" text-anchor="middle" class="sub">grouped SwiGLU over 8 experts (h=3840 each)</text>
+  <text x="680" y="540" text-anchor="middle" class="sub">→ × gate → index_add scatter back per token</text>
+  <text x="680" y="555" text-anchor="middle" class="sub" fill="#b45309">no .nonzero() loop → fullgraph torch.compile</text>
+  <line class="e" x1="680" y1="562" x2="540" y2="600"/>
+
+  <!-- combine -->
+  <rect class="box moe" x="320" y="600" width="280" height="48"/>
+  <text x="460" y="620" text-anchor="middle" class="lbl">combine: shared_out + gate · routed</text>
+  <text x="460" y="636" text-anchor="middle" class="sub">caller applies moe_gate to routed only</text>
+  <line class="e" x1="460" y1="648" x2="460" y2="674"/>
+  
+  <rect class="box io" x="360" y="674" width="200" height="40"/>
+  <text x="460" y="699" text-anchor="middle" class="lbl">MoE output (B, S, 1536)</text>
+
+  <!-- telemetry note -->
+  <rect x="25" y="600" width="280" height="120" class="box telemetry-box"/>
+  <text x="40" y="622" class="note" font-weight="700" fill="#047857">Collapse telemetry</text>
+  <text x="40" y="642" class="note">marginal entropy → ln(8)=2.079 (uniform)</text>
+  <text x="40" y="658" class="note">per-token entropy &lt; marginal = real routing</text>
+  <text x="40" y="674" class="note">dead_experts (load &lt; 10% uniform)</text>
+  <text x="40" y="690" class="note">prebias stats catch raw-router collapse</text>
+  <text x="40" y="706" class="note">before the bias controller masks it</text>
+</svg>

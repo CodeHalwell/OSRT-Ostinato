@@ -1,0 +1,64 @@
+{
+  "ckpt": "checkpoints/v5/osrt_v5_midtrain_final.pt",
+  "texts": "mixed",
+  "full_loops": 6,
+  "full_ce": 3.3713,
+  "full_ppl": 29.117,
+  "rows": [
+    {
+      "loops": 2,
+      "kl_full_given_k": 0.3941,
+      "top1_agree": 0.6816,
+      "ce": 3.6887,
+      "ppl": 39.992
+    },
+    {
+      "loops": 3,
+      "kl_full_given_k": 0.1849,
+      "top1_agree": 0.7512,
+      "ce": 3.5007,
+      "ppl": 33.138
+    },
+    {
+      "loops": 4,
+      "kl_full_given_k": 0.1102,
+      "top1_agree": 0.7811,
+      "ce": 3.434,
+      "ppl": 31.0
+    },
+    {
+      "loops": 5,
+      "kl_full_given_k": 0.0442,
+      "top1_agree": 0.8781,
+      "ce": 3.4082,
+      "ppl": 30.212
+    }
+  ],
+  "flip_types": {
+    "boundary": "6->5",
+    "flip_rate": 0.1219,
+    "mean_conf_flipped": 0.1769,
+    "mean_conf_unflipped": 0.4626,
+    "gold_category_counts_all": {
+      "digit": 27,
+      "math_op": 16,
+      "reasoning_connective": 6,
+      "punct/space": 41,
+      "word/other": 312
+    },
+    "gold_category_counts_flipped": {
+      "digit": 1,
+      "math_op": 0,
+      "reasoning_connective": 0,
+      "punct/space": 4,
+      "word/other": 44
+    },
+    "enrichment_flip_vs_all": {
+      "digit": 0.3,
+      "math_op": 0.0,
+      "reasoning_connective": 0.0,
+      "punct/space": 0.8,
+      "word/other": 1.16
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "model_type": "osrt",
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "bos_token": "<|begin_of_text|>",
+  "eos_token": "<|end_of_text|>",
+  "pad_token": "<|padding|>",
+  "unk_token": "<|unknown|>",
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "clean_up_tokenization_spaces": false
+}
