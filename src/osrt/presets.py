@@ -64,12 +64,13 @@ OSRT_V7: dict = dict(
     mtp_loss_weight=0.3,
     router_aux_loss_coeff=0.10,
     router_z_loss_coeff=1e-3,
+    # Quantile Balancing — REQUIRED at v7's granularity (roadmap §14.6).
+    router_balance_mode="quantile",
     router_balance_bias_enabled=True,
     # sqrt(softplus) routing affinity: the balance bias steers TOP-K selection
     # on the non-negative affinity; gating weights renormalise the selected
     # balanced affinities. NOTE: §14.6 makes Quantile Balancing REQUIRED for
-    # v7 — at E=28 one dead expert is 3.6% of block capacity and the current
-    # +/-gamma heuristic was tuned at E=8. Not yet implemented.
+
     router_affinity="sqrt_softplus",
     max_position_embeddings=4096,
 )

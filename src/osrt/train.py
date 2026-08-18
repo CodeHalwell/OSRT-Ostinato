@@ -45,9 +45,28 @@ from osrt.train_config import PretrainConfig
 
 
 def get_lr(step: int, cfg: PretrainConfig) -> float:
-    """Cosine LR with linear warmup, returning the AdamW/Lion peak_lr."""
+    """Learning rate at `step`, returning the AdamW/Lion peak_lr scale.
+
+    Two schedules, selected by `cfg.lr_schedule`:
+
+    * "wsd" (default, v7) — linear warmup, a flat stable phase, then a linear
+      decay to min_lr over the last `wsd_decay_frac` of the run. The stable
+      phase is the point: a drip-funded run can stop and resume anywhere in it
+      without re-warming or reshaping the curve, and only the branch that
+      produces a release checkpoint pays the decay.
+    * "cosine" — v6's schedule, kept so historical runs stay reproducible.
+    """
     if step < cfg.warmup_steps:
         return cfg.peak_lr * step / cfg.warmup_steps
+
+    if getattr(cfg, "lr_schedule", "cosine") == "wsd":
+        decay_steps = max(int(cfg.total_steps * cfg.wsd_decay_frac), 1)
+        decay_start = max(cfg.total_steps - decay_steps, cfg.warmup_steps)
+        if step < decay_start:
+            return cfg.peak_lr                       # stable phase
+        frac = min((step - decay_start) / decay_steps, 1.0)
+        return cfg.peak_lr + (cfg.min_lr - cfg.peak_lr) * frac
+
     progress = (step - cfg.warmup_steps) / max(cfg.total_steps - cfg.warmup_steps, 1)
     return cfg.min_lr + 0.5 * (cfg.peak_lr - cfg.min_lr) * (
         1 + math.cos(math.pi * progress)
@@ -57,7 +76,7 @@ def get_lr(step: int, cfg: PretrainConfig) -> float:
 def _set_param_group_lrs(
     optimizer, step: int, cfg: PretrainConfig,
 ) -> float:
-    """Apply the cosine schedule to every param group, respecting the
+    """Apply the LR schedule to every param group, respecting the
     per-group `_peak_lr` / `_min_lr` tags written at construction.
 
     Returns the AdamW/Lion-scale LR for logging. Muon groups (when

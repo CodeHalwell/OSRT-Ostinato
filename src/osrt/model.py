@@ -131,6 +131,14 @@ def _glu_combine(
     return F.silu(gate) * up
 
 
+# Quantile-Balancing histogram resolution. These are numerical parameters, not
+# tuning knobs: the range brackets both router-score conventions and the bin
+# count sets threshold precision (16/1000 of the range).
+QB_BINS = 512
+QB_LO = -8.0
+QB_HI = 8.0
+
+
 class ExpertFFN(nn.Module):
     """SwiGLU / SiTU-GLU feed-forward. Used for both shared and routed experts."""
 
@@ -312,6 +320,7 @@ class MoELayer(nn.Module):
         # Capacity is enforced per MoE call, so loop-specific load imbalance
         # must be corrected per loop. A single block-level bias can look
         # balanced in aggregate while individual loop calls overflow.
+        self.balance_mode = config.router_balance_mode
         self.bias_enabled = config.router_balance_bias_enabled
         self.bias_update_rate = config.router_balance_bias_update_rate
         self.bias_ema_rate = config.router_balance_bias_ema_rate
@@ -328,6 +337,26 @@ class MoELayer(nn.Module):
         )
         self.register_buffer(
             "balance_total_accum",
+            torch.zeros(self.num_loops, dtype=torch.float32),
+            persistent=False,
+        )
+        # ── Quantile Balancing (Kimi K3) ────────────────────────────────
+        # Histogram of the PRE-BIAS router score per (loop, expert). The
+        # update sets each expert's bias from the score quantile matching its
+        # target load, so every expert ends up with the same share of its own
+        # distribution above the selection threshold. Deterministic: no update
+        # rate, no EMA, no clamp target to tune. QB_LO/HI bracket both score
+        # conventions (sqrt(softplus) affinity >= 0, and raw logits).
+        self.qb_bins = QB_BINS
+        self.qb_lo, self.qb_hi = QB_LO, QB_HI
+        self.register_buffer(
+            "qb_hist",
+            torch.zeros(self.num_loops, self.num_routed, QB_BINS,
+                        dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "qb_token_count",
             torch.zeros(self.num_loops, dtype=torch.float32),
             persistent=False,
         )
@@ -435,8 +464,15 @@ class MoELayer(nn.Module):
 
     @torch._dynamo.disable
     @torch.no_grad()
-    def _accumulate_balance_counts(self, top_idx: Tensor, loop_idx: int) -> None:
-        """Accumulate clean top-k assignment counts for the bias controller."""
+    def _accumulate_balance_counts(
+        self, top_idx: Tensor, loop_idx: int, score: Tensor | None = None,
+    ) -> None:
+        """Accumulate load statistics for the bias controller.
+
+        `score` is the PRE-BIAS per-expert router score (N, E) and is required
+        only by Quantile Balancing, which needs the distribution rather than
+        just the realised counts.
+        """
         if not self.bias_enabled:
             return
         flat = top_idx.reshape(-1)
@@ -444,10 +480,64 @@ class MoELayer(nn.Module):
         self.balance_count_accum[loop_idx].add_(counts)
         self.balance_total_accum[loop_idx].add_(counts.sum())
 
+        if self.balance_mode == "quantile" and score is not None:
+            width = (self.qb_hi - self.qb_lo) / self.qb_bins
+            idx = ((score.detach().float() - self.qb_lo) / width).long()
+            idx = idx.clamp_(0, self.qb_bins - 1).t()          # (E, N)
+            self.qb_hist[loop_idx].scatter_add_(
+                1, idx, torch.ones_like(idx, dtype=torch.float32),
+            )
+            self.qb_token_count[loop_idx].add_(float(score.shape[0]))
+
+    @torch.no_grad()
+    def _apply_quantile_balance(self) -> None:
+        """Quantile Balancing (Kimi K3): set each expert's bias from the
+        router-score quantile that matches its target load.
+
+        For a target selection fraction p = top_k / num_routed, find for every
+        expert the score threshold t_e with exactly p of ITS OWN score mass
+        above it, then set bias_e = mean(t) - t_e. Every expert then presents
+        the same fraction of its distribution above the common selection
+        threshold, so load equalises in one shot rather than by nudging.
+
+        Deterministic and hyperparameter-free: no update rate, no EMA, no
+        clamp target. Contrast the heuristic controller, whose +/-gamma step
+        was tuned at E=8 and which at E=28 must move 3.5x as many biases with
+        3.5x less load signal per expert.
+        """
+        active = self.qb_token_count > 0
+        if not active.any():
+            return
+        p = self.top_k / self.num_routed
+        width = (self.qb_hi - self.qb_lo) / self.qb_bins
+
+        hist = self.qb_hist[active]                       # (A, E, B)
+        target = p * self.qb_token_count[active].view(-1, 1)   # (A, 1)
+        # Mass at or above each bin. Non-increasing in bin index, so the count
+        # of bins meeting the target is exactly the highest qualifying index+1.
+        cum_above = hist.flip(-1).cumsum(-1).flip(-1)      # (A, E, B)
+        idx = (cum_above >= target.unsqueeze(-1)).sum(-1) - 1   # (A, E)
+        idx = idx.clamp_(0, self.qb_bins - 1)
+        thresh = self.qb_lo + (idx.float() + 0.5) * width  # (A, E)
+
+        # Centre so the biases sum to zero: only differences steer top-k, and
+        # an uncentred set would drift without bound across updates.
+        bias = thresh.mean(dim=-1, keepdim=True) - thresh
+        self.router_balance_bias[active] = bias.clamp(
+            -self.bias_max, self.bias_max,
+        )
+        self.qb_hist.zero_()
+        self.qb_token_count.zero_()
+
     @torch.no_grad()
     def apply_balance_update(self) -> None:
         """Update per-expert routing bias once from accumulated clean load."""
         if not self.bias_enabled:
+            return
+        if self.balance_mode == "quantile":
+            self._apply_quantile_balance()
+            self.balance_count_accum.zero_()
+            self.balance_total_accum.zero_()
             return
         active = self.balance_total_accum > 0
         if not active.any():
@@ -970,7 +1060,12 @@ class MoELayer(nn.Module):
                 self.top_k, dim=-1,
             )
         if self.training and self.balance_accum_enabled:
-            self._accumulate_balance_counts(clean_top_idx, loop_idx)
+            prebias_score = (
+                affinity if affinity_mode == "sqrt_softplus" else router_logits
+            )
+            self._accumulate_balance_counts(
+                clean_top_idx, loop_idx, score=prebias_score,
+            )
 
         # Renormalise so the K chosen gates sum to 1. Without this, the MoE
         # output would be down-weighted when K > 1 just because softmax is

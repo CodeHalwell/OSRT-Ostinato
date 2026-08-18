@@ -134,6 +134,21 @@ class PretrainConfig:
     # which re-warm from this checkpoint — so annealing the base to min here is
     # correct. To train a longer base, raise this BEFORE the first chunk and
     # keep it fixed across resumes (changing it mid-run reshapes the cosine).
+    # LR schedule. "cosine" is v6's; "wsd" is warmup-stable-decay
+    # (trunk-and-branch), adopted for v7 by roadmap item 0.2 and now the
+    # unanimous 2026 practice (Nemotron two-phase WSD, Kimi Linear).
+    #
+    # Why it matters here specifically: this project trains in ~$120/month
+    # drip chunks. Under cosine, every extension either re-warms (paying the
+    # tax again) or reshapes the curve mid-run — §2.2 records the token-budget
+    # arithmetic as the plan's weakest link, and re-warm waste comes straight
+    # off it. WSD holds LR flat through the trunk so a run can be stopped and
+    # resumed at no cost, and decays only on the branch that produces a
+    # release checkpoint.
+    lr_schedule: str = "wsd"
+    # Fraction of total_steps spent in the final decay ramp. 0.2 is the
+    # common choice; the stable phase is everything between warmup and it.
+    wsd_decay_frac: float = 0.2
     total_steps: int = 3_500
     warmup_steps: int = 400          # ~11% — spins up Muon + the MoE balance bias
     peak_lr: float = 6e-4

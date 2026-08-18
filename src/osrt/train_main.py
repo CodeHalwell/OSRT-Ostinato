@@ -96,32 +96,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _build_model_config(tokenizer_path: str) -> OSRTConfig:
-    """Load the tokenizer once to seed vocab/special-token IDs into the
-    model config. Mirrors the same construction used by `app.py::pretrain`."""
+    """Load the tokenizer once to seed vocab/special-token IDs into the config.
+
+    Two distinct vocab numbers, and conflating them is a real bug:
+
+      * `real_vocab_size` — the tokenizer's true size. Logits are sliced to it,
+        so it must match `len(tok)` exactly or the model can emit ids the
+        tokenizer cannot decode.
+      * `vocab_size` — the embedding/head row count, padded up to a multiple of
+        128 for tensor cores. Padding rows are never valid targets.
+
+    An earlier revision set BOTH to `len(tok)`, silently discarding the
+    preset's padding.
+    """
     from transformers import AutoTokenizer
 
     if not os.path.isdir(tokenizer_path):
         raise FileNotFoundError(
-            f"Tokenizer directory not found at {tokenizer_path}. "
-            f"Either sync it from Modal "
-            f"(`modal volume get osrt-v4-tokenizer / ./tokenizer/`) or "
-            f"retrain via `scripts/train_tokenizer.py`.",
+            f"Tokenizer directory not found at {tokenizer_path}. Build it with "
+            f"`python scripts/build_tokenizer_v7.py --out {tokenizer_path}`.",
         )
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
-    print(f"Tokenizer loaded: vocab_size={len(tok)}", flush=True)
+    real = len(tok)
+    padded = ((real + 127) // 128) * 128
+    print(f"Tokenizer loaded: real_vocab_size={real} -> vocab_size={padded}",
+          flush=True)
 
-    expected_vocab = 65536
-    if len(tok) != expected_vocab:
+    from osrt.presets import OSRT_V7, build_config
+    if real != OSRT_V7["real_vocab_size"]:
         print(
-            f"WARNING: expected vocab {expected_vocab} but got {len(tok)}. "
-            f"The model config will follow the tokenizer's actual vocab.",
+            f"WARNING: tokenizer has {real} tokens but the OSRT_V7 preset "
+            f"expects {OSRT_V7['real_vocab_size']}. The model will follow the "
+            f"tokenizer. If this is not a deliberate tokenizer change, stop: "
+            f"a checkpoint trained at one vocab cannot load at another.",
             flush=True,
         )
-
-    from osrt.presets import build_config
     return build_config(
-        vocab_size=len(tok),
-        real_vocab_size=len(tok),
+        vocab_size=padded,
+        real_vocab_size=real,
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,

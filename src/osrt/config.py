@@ -219,6 +219,13 @@ class OSRTConfig(PretrainedConfig):
         # subset once LR ramps. The bias directly counter-rotates that load
         # imbalance. Since it is persistent and applied at eval, clean router
         # health means "router logits + loop-specific balance bias, no Gumbel".
+        # Balance-bias controller. "heuristic" is the v6 +/-gamma nudge tuned
+        # at E=8; "quantile" is Kimi K3's Quantile Balancing, which sets each
+        # expert's bias directly from the router-score quantile matching its
+        # target load — deterministic and free of update_rate/ema_rate/max.
+        # v7 REQUIRES quantile (roadmap §14.6): at E=28 one dead expert is
+        # 3.6% of block capacity, where the heuristic's tuning was done at 8.
+        router_balance_mode: str = "heuristic",
         router_balance_bias_enabled: bool = True,
         router_balance_bias_update_rate: float = 0.10,
         router_balance_bias_ema_rate: float = 0.05,
@@ -338,6 +345,7 @@ class OSRTConfig(PretrainedConfig):
         self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
+        self.router_balance_mode = router_balance_mode
         self.router_balance_bias_enabled = router_balance_bias_enabled
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
@@ -450,6 +458,11 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_seq_balance_loss_coeff must be >= 0, got "
                 f"{self.router_seq_balance_loss_coeff}"
+            )
+        if self.router_balance_mode not in ("heuristic", "quantile"):
+            raise ValueError(
+                f"router_balance_mode must be 'heuristic' or 'quantile', "
+                f"got {self.router_balance_mode!r}"
             )
         if self.router_balance_bias_update_rate < 0:
             raise ValueError(
