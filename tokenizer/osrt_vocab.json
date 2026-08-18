@@ -1,0 +1,8 @@
+{
+  "base": "HuggingFaceTB/SmolLM2-1.7B",
+  "base_vocab": 49152,
+  "special_added": 32,
+  "real_vocab_size": 49184,
+  "vocab_size": 49280,
+  "pad_to_multiple": 128
+}

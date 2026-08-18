@@ -323,8 +323,12 @@ def test_sft_system_turn_masking():
     pids = tok.encode(prompt, add_special_tokens=False)
     rids = tok.encode(resp, add_special_tokens=False)
     labels = [IGNORE_INDEX] * len(pids) + rids
-    # system token (id 13) is in the masked prefix
-    assert 13 in pids
+    # the <|system|> token is in the masked prefix. Look the id up rather than
+    # hardcoding it: the literal 13 was the v6 vocab's id and silently coupled
+    # this test to one tokenizer (it broke on the G2 swap to the v7 vocab).
+    sys_id = tok.convert_tokens_to_ids("<|system|>")
+    assert sys_id != tok.unk_token_id, "<|system|> missing from the tokenizer"
+    assert sys_id in pids
     assert all(x == IGNORE_INDEX for x in labels[:len(pids)])
     assert all(x != IGNORE_INDEX for x in labels[len(pids):])
 
