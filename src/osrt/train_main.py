@@ -14,8 +14,8 @@ Usage (Lightning Studio, EC2, or local with a CUDA GPU):
         --tokenizer-path ./tokenizer \\
         --ckpt-dir ./checkpoints/v5
 
-Resumes automatically from the highest `osrt_v5_step_N.pt` /
-`osrt_v5_rescue_step_N.pt` in `--ckpt-dir`. To start fresh, point at
+Resumes automatically from the highest `osrt_step_N.pt` /
+`osrt_rescue_step_N.pt` in `--ckpt-dir`. To start fresh, point at
 an empty directory.
 
 For a 1200-step Foundation-matched smoke test (~1h on H100, ~1.6h on
@@ -56,7 +56,7 @@ class _LocalVol:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pretrain OSRT v5 outside Modal (Lightning, on-prem, etc.)",
+        description="Pretrain OSRT v7 outside Modal (Colab, on-prem, etc.)",
     )
     p.add_argument(
         "--tokenizer-path",
@@ -66,8 +66,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--ckpt-dir",
-        default=os.environ.get("OSRT_CKPT_DIR", "./checkpoints/v5"),
+        default=os.environ.get("OSRT_CKPT_DIR", "./checkpoints/v7"),
         help="Directory for ckpts. Resumed from the highest step file here.",
+    )
+    p.add_argument(
+        "--hf-repo",
+        default=os.environ.get("OSRT_HF_CKPT_REPO", ""),
+        help="Private HF repo id for cross-session checkpoint sync (e.g. "
+             "'user/osrt-v7-ckpt'). Colab wipes local disk when the VM is "
+             "released, so a multi-session run MUST persist off-VM. When set: "
+             "pull the newest checkpoint before training, push each new one as "
+             "it is written, and flush the tail before exit. Needs HF_TOKEN.",
     )
     p.add_argument(
         "--total-steps",
@@ -167,19 +176,40 @@ def main(argv: list[str] | None = None) -> None:
         train_cfg.wandb_log = False
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
+
+    # Cross-session chaining. run_training's resume-scan globs
+    # {ckpt_dir}/osrt_step_*.pt, so pulling the newest file into that directory
+    # before the scan is the whole mechanism — no trainer change needed.
+    sync = None
+    if args.hf_repo:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        from scripts import hf_ckpt_sync as sync
+        print(f"HF ckpt sync: {args.hf_repo} (prefix 'osrt')", flush=True)
+        sync.pull_latest(args.hf_repo, args.ckpt_dir, "osrt")
+        sync.start_push_daemon(args.hf_repo, args.ckpt_dir, "osrt")
     print(
         f"Pretrain (Muon hybrid + aux). Tokenizer={args.tokenizer_path}, "
         f"ckpt_dir={args.ckpt_dir}, total_steps={train_cfg.total_steps}",
         flush=True,
     )
 
-    run_training(
-        model_config=model_config,
-        train_cfg=train_cfg,
-        vol=_LocalVol(),
-        tokenizer_name=args.tokenizer_path,
-        ckpt_dir=args.ckpt_dir,
-    )
+    try:
+        run_training(
+            model_config=model_config,
+            train_cfg=train_cfg,
+            vol=_LocalVol(),
+            tokenizer_name=args.tokenizer_path,
+            ckpt_dir=args.ckpt_dir,
+        )
+    finally:
+        # The push daemon polls, and both the rescue path and the end-of-run
+        # path exit within one interval of their final save — so the single
+        # most important checkpoint is the one most likely to miss its upload
+        # window. Flush synchronously, and do it in `finally` so a crash or a
+        # Colab pre-emption still persists the tail. (ckpt-sync §2)
+        if sync is not None:
+            print("flushing checkpoints to HF...", flush=True)
+            sync.flush(args.hf_repo, args.ckpt_dir, "osrt")
 
 
 if __name__ == "__main__":

@@ -969,8 +969,8 @@ def run_training(
     # on ties. When steps differ, higher step always wins regardless
     # of pattern.
     for pattern in (
-        f"{ckpt_dir}/osrt_v5_step_*.pt",
-        f"{ckpt_dir}/osrt_v5_rescue_step_*.pt",
+        f"{ckpt_dir}/osrt_step_*.pt",
+        f"{ckpt_dir}/osrt_rescue_step_*.pt",
     ):
         for f in glob.glob(pattern):
             s = _extract_step(f)
@@ -981,7 +981,7 @@ def run_training(
                 best_ckpt = f
 
     # Explicit notice if there's a FAILED checkpoint — user should know.
-    failed_paths = sorted(glob.glob(f"{ckpt_dir}/osrt_v5_failed_step_*.pt"))
+    failed_paths = sorted(glob.glob(f"{ckpt_dir}/osrt_failed_step_*.pt"))
     if failed_paths:
         print(
             f"WARNING: Found {len(failed_paths)} failed-early-stop "
@@ -1346,7 +1346,7 @@ def run_training(
                     "before retrying.",
                     flush=True,
                 )
-                failed_path = f"{ckpt_dir}/osrt_v5_failed_step_{step}.pt"
+                failed_path = f"{ckpt_dir}/osrt_failed_step_{step}.pt"
                 save_checkpoint(model, optimizer, step, failed_path)
                 vol.commit()
                 early_stop_triggered = True
@@ -1362,7 +1362,7 @@ def run_training(
         # Runs AFTER early-stop check so failed runs never produce a
         # step_N.pt that would bypass the gate on resume.
         if step > 0 and step % train_cfg.ckpt_interval == 0:
-            path = f"{ckpt_dir}/osrt_v5_step_{step}.pt"
+            path = f"{ckpt_dir}/osrt_step_{step}.pt"
             save_checkpoint(model, optimizer, step, path)
             vol.commit()
 
@@ -1370,7 +1370,7 @@ def run_training(
         # Rescue filename includes the step so resume scanner can rank it
         # against numbered checkpoints.
         if time.time() - start_time > 82_800:
-            rescue_path = f"{ckpt_dir}/osrt_v5_rescue_step_{step}.pt"
+            rescue_path = f"{ckpt_dir}/osrt_rescue_step_{step}.pt"
             save_checkpoint(model, optimizer, step, rescue_path)
             vol.commit()
             print(
@@ -1394,9 +1394,9 @@ def run_training(
         )
         # Gate the final save: sanity/mem/compile checks set
         # save_final_checkpoint=False so they don't write a throwaway
-        # osrt_v5_final.pt that would clobber a real run's final on the volume.
+        # osrt_final.pt that would clobber a real run's final on the volume.
         if getattr(train_cfg, "save_final_checkpoint", True):
-            final_path = f"{ckpt_dir}/osrt_v5_final.pt"
+            final_path = f"{ckpt_dir}/osrt_final.pt"
             save_checkpoint(model, optimizer, step, final_path)
             vol.commit()
             print(f"Final checkpoint: {final_path}", flush=True)

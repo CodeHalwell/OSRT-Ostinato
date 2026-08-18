@@ -145,6 +145,12 @@ class PretrainConfig:
     # off it. WSD holds LR flat through the trunk so a run can be stopped and
     # resumed at no cost, and decays only on the branch that produces a
     # release checkpoint.
+    # DataLoader workers for the streaming corpus. 0 is correct on Colab:
+    # HF streaming + BPE inside forked workers leaks semaphores and dies with
+    # "Bad file descriptor" once workers x streams gets large, and a dead
+    # worker on a session-capped runtime costs the whole session. On a
+    # dedicated box raise it.
+    dataloader_num_workers: int = 0
     lr_schedule: str = "wsd"
     # Fraction of total_steps spent in the final decay ramp. 0.2 is the
     # common choice; the stable phase is everything between warmup and it.
