@@ -58,23 +58,33 @@ loops × blocks (G4).
 The roadmap's §12 is an independent citation audit of §§4–6 — **read it before
 citing any external claim from this repo.** Three material errors were found.
 
+## What is and is not in this repo
+
+**Present:** the architecture (`model.py`, `muon.py`, `hra.py`, `fused_ce.py`,
+`quant.py`, `monitoring.py`), the pretraining spine (`train.py`, `data.py`,
+`train_config.py`, `train_main.py`), the chat contract (`system_prompts.py`),
+the tokenizer, and the tooling under `scripts/`.
+
+**Deliberately absent — v6, archived, not ported:**
+
+| removed | why |
+|---|---|
+| `mhc.py` and every call site | decided off permanently, roadmap §12.3 |
+| `sft_train/sft_eval/sft_data.py` | v6 SFT pipeline, redesigned for v7 |
+| `grpo_train.py`, `rewards.py` | v6 RL. The reward is **on record as having made the model measurably worse** (soup − step100 θ = +8.00pp, p=0.002). v7 post-training is redesigned around a verifier that does not exist yet |
+| `lm_eval_wrapper.py` | v6 eval lane |
+| 31 v6 stage configs | Pretrain-extend ×3, LoopFix ×2, MOPD, SystemSFT, Midtrain ×6, SFT v1–v4/Long/Refresh/Math, GRPO ×4 |
+| `run_pretrain_extend`, `run_rollout_eval` | dead once their configs went |
+
+All of it remains in this repo's git history and in
+`CodeHalwell/OSRT-605M-A269M`. **Do not resurrect any of it without reading
+the roadmap first** — most was removed because it was superseded, and the
+GRPO reward because it was measurably harmful.
+
+`docs/v6/` holds the v6 handoff and Colab recipe: kept only because the
+roadmap cites them, labelled so nobody mistakes them for current.
+
 ## Environment & commands
-
-Python **3.11**, dependencies via **uv** (`uv.lock` is committed).
-
-```bash
-uv sync                       # install deps (incl. dev: pytest, ruff)
-uv run pytest                 # full CPU suite
-uv run ruff check .           # lint — this repo starts at zero errors, keep it there
-uv run ruff format .
-
-PYTHONPATH=src uv run python scripts/compute_budget.py   # canonical param counts
-PYTHONPATH=src uv run python scripts/sanity_overfit.py   # overfit one batch → loss ~0
-PYTHONPATH=src uv run python scripts/dummy_train.py      # synthetic copy task
-```
-
-CI runs lint, format check, tests and the budget script on every push and PR.
-
 ## Conventions & gotchas
 
 - **`src/osrt/` is ground truth.** When docs and code disagree, the code wins;

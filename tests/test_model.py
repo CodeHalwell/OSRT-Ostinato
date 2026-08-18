@@ -1188,46 +1188,8 @@ def test_balance_loss_pushes_router_weights():
 # ── Reward parsing regressions ─────────────────────────────────────────
 
 
-def test_extract_numeric_answer_returns_last_number_in_answer_tag():
-    """Reviewer-found regression: the old parser returned the first number
-    inside the answer tag, so "After 3 steps, the answer is 12" scored as
-    3 instead of 12. The fix takes the last number, which is the model's
-    final committed answer.
-    """
-    from osrt.rewards import extract_numeric_answer
-
-    text = (
-        "<|think|>3 steps of reasoning...<|/think|>"
-        "<|answer|>After 3 steps, the answer is 12<|/answer|>"
-    )
-    assert extract_numeric_answer(text) == "12"
 
 
-def test_extract_numeric_answer_handles_plain_number():
-    """A bare number inside the answer tag should still parse correctly."""
-    from osrt.rewards import extract_numeric_answer
-
-    text = "<|think|>...<|/think|><|answer|>42<|/answer|>"
-    assert extract_numeric_answer(text) == "42"
-
-
-def test_extract_numeric_answer_strips_commas():
-    """Numbers with thousand separators should be normalised."""
-    from osrt.rewards import extract_numeric_answer
-
-    text = "<|answer|>The total is 1,234<|/answer|>"
-    assert extract_numeric_answer(text) == "1234"
-
-
-def test_extract_numeric_answer_falls_back_to_post_think():
-    """No answer tag — should pick the last number after </think>."""
-    from osrt.rewards import extract_numeric_answer
-
-    text = "<think>Working it out: 10, then 20...</think> So the final is 30"
-    assert extract_numeric_answer(text) == "30"
-
-
-# ── Batch-safe generate ────────────────────────────────────────────────
 
 
 def test_generate_batch_safe_with_repetition_penalty():

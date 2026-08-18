@@ -5,7 +5,7 @@ so a multi-session run must persist checkpoints off-VM. This pushes each new
 `{prefix}_step_*.pt` to a private HF repo as it's saved, and pulls the latest
 back on start — so the resume-scan in run_pretrain_extend chains across sessions.
 
-Used by lightning_midtrain3.py via --hf-repo. Needs HF_TOKEN in the env.
+Cross-session checkpoint sync to a private HF repo. Needs HF_TOKEN in the env.
 """
 from __future__ import annotations
 

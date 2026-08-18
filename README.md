@@ -49,7 +49,12 @@ PYTHONPATH=src uv run python scripts/sanity_overfit.py   # overfit one batch
 
 ## Status
 
-Planning and porting. Nothing trained under v7 yet. The open decision gates —
+**Pre-training-run.** The architecture, tokenizer and pretraining spine are in
+place; nothing has been trained under v7. The v6 post-training stack (SFT, GRPO,
+reward functions, eval lanes) was **not** ported — v7 redesigns it around a
+verifier that does not exist yet, and the v6 GRPO reward is on record as having
+made the model measurably worse. History lives in
+[`CodeHalwell/OSRT-605M-A269M`](https://github.com/CodeHalwell/OSRT-605M-A269M). The open decision gates —
 and the evidence behind each — are tracked in the roadmap; the measure-first
 rule from `LEARNINGS.md` still governs.
 

@@ -348,7 +348,7 @@ class MoELayer(nn.Module):
         # MoE applications per forward this adds up. The training loop
         # flips this off on non-logging steps via
         # OSRTForCausalLM.set_moe_telemetry(False). Default True so
-        # downstream consumers (sft_train, monitoring, test_monitoring)
+        # downstream consumers (monitoring, test_monitoring)
         # keep working without explicit opt-in.
         self.telemetry_enabled: bool = True
 
@@ -1101,7 +1101,7 @@ class MoELayer(nn.Module):
         # non-logging steps via OSRTForCausalLM.set_moe_telemetry().
         # When skipped, the self.last_* attributes retain the values
         # from the previous logging step — that's safe because
-        # consumers (_collect_moe_metrics, sft_train MoE telemetry
+        # consumers (_collect_moe_metrics, MoE telemetry
         # block) only read them on logging steps too.
         if not self.telemetry_enabled:
             return shared_out, moe_out
@@ -2131,7 +2131,7 @@ class OSRTModel(OSRTPreTrainedModel):
         to False on non-logging steps so MoE diagnostics are only paid
         for when actually consumed.
 
-        Consumers (`_collect_moe_metrics`, sft_train's MoE block,
+        Consumers (`_collect_moe_metrics`, the MoE telemetry block,
         `monitoring.moe_health`) read the `block.moe.last_*` lists; on
         disabled steps these retain the previous-step values, but no
         consumer reads them on those steps (all reads are inside

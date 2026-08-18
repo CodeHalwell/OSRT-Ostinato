@@ -15,7 +15,7 @@ seven-checkpoint trajectory, recomputes the per-checkpoint accuracies and refits
 the slope inside each replicate. It also runs leave-one-checkpoint-out fits, so
 a single influential checkpoint can't carry a conclusion on its own.
 
-Reads the per-checkpoint JSON written by app.py::sft_eval_sweep (which stores
+Reads per-checkpoint eval JSON (see git history for the v6 producer; stores
 `items.on` / `items.off` as 0/1 lists indexed by problem).
 
 Usage:
