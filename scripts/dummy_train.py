@@ -7,8 +7,8 @@ induction mechanism (attend back exactly half the sequence), so a falling loss
 on FRESH batches each step means the architecture is genuinely learning
 structure — not memorizing one batch.
 
-Exercises the real canonical stack scaled to CPU: GQA + MLA latent cache, mHC
-(Birkhoff/Sinkhorn 4-channel stream), sqrt(softplus) routing, SwiGLU clamps,
+Exercises the real canonical stack scaled to CPU: GQA + MLA latent cache,
+sqrt(softplus) routing, SwiGLU clamps,
 per-head attention sink, aux-loop loss, Muon+AdamW. Logs the recursion/MoE
 collapse monitoring every few steps so you can watch for MoE collapse or lack
 of loop-depth spread on a live run.
@@ -59,7 +59,6 @@ def main() -> None:
         num_routed_experts=8, top_k_experts=2,
         expert_hidden=128, shared_expert_hidden=128,
         max_position_embeddings=SEQ,
-        use_mhc=True, n_hc=4, mhc_sinkhorn_iters=20,      # mHC
         swiglu_clamp=10.0,                                # SwiGLU clamp
         attention_sink=True,                              # attention sink
         router_affinity="sqrt_softplus",                  # sqrt-softplus routing
@@ -70,12 +69,12 @@ def main() -> None:
     model = OSRTForCausalLM(cfg)
     model.train()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model: {n_params/1e6:.2f}M params | features: GQA+MLA, mHC, "
+    print(f"model: {n_params/1e6:.2f}M params | features: GQA+MLA, "
           f"sqrt_softplus, SwiGLU-clamp, attn-sink, aux-loop\n")
 
     muon_params, adamw_groups = build_param_groups(model.named_parameters(), 0.01)
     # Conservative LR + a short warmup + gradient clipping — standard training
-    # hygiene for a deep recursive + mHC stack. Muon's effective step is large,
+    # hygiene for a deep recursive stack. Muon's effective step is large,
     # so without clipping the gradient spikes diverge.
     base_muon_lr, base_adamw_lr = 5e-3, 1.5e-3
     muon = Muon(muon_params, lr=base_muon_lr)

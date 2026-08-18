@@ -1,12 +1,20 @@
 # Attention
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Part of the `docs/` architecture series for OSRT-605M. This document explains the attention sub-block; see `ARCHITECTURE.md` §6 (attention) and §13 (KV cache) for the original design intent, and `src/osrt/model.py` for the implementation that ships.*
 
 ---
 
 ## 1. Purpose / summary
 
-Each physical transformer block in OSRT-605M runs an attention sub-block followed by a Mixture-of-Experts sub-block (`RecursiveBlock`, `src/osrt/model.py:1019`). The attention sub-block is grouped-query attention (GQA) with an MLA-style **compressed K/V latent**: 24 query heads attend over 8 key/value heads of head-dim 64, but instead of caching K *and* V it caches a single un-rotated 512-dim latent `c_kv`, reads K straight off it, and derives V from it with one learned linear map. The actual attention is **standard flash SDPA** (`F.scaled_dot_product_attention`) — the score matrix is never materialised. On top of GQA + latent KV it layers two numerical/expressivity refinements that have become standard in 2024–2025 small models: **QK-Norm** (bound the logits) and **RoPE** (inject position). A third refinement — a learnable **attention sink** (let a head attend to "nothing") — was implemented but is now **dropped from the shipping preset** (`attention_sink=False`); its code path still exists behind that flag but is dormant (§6). The method returns a *pre-residual contribution* — the caller decides how to fold it back into the stream (plain residual add, or a manifold-constrained hyper-connection mix). This document walks each piece and explains *why* it is built the way it is.
+Each physical transformer block in OSRT runs an attention sub-block followed by a Mixture-of-Experts sub-block (`RecursiveBlock`, `src/osrt/model.py:1019`). The attention sub-block is grouped-query attention (GQA) with an MLA-style **compressed K/V latent**: 24 query heads attend over 8 key/value heads of head-dim 64, but instead of caching K *and* V it caches a single un-rotated 512-dim latent `c_kv`, reads K straight off it, and derives V from it with one learned linear map. The actual attention is **standard flash SDPA** (`F.scaled_dot_product_attention`) — the score matrix is never materialised. On top of GQA + latent KV it layers two numerical/expressivity refinements that have become standard in 2024–2025 small models: **QK-Norm** (bound the logits) and **RoPE** (inject position). A third refinement — a learnable **attention sink** (let a head attend to "nothing") — was implemented but is now **dropped from the shipping preset** (`attention_sink=False`); its code path still exists behind that flag but is dormant (§6). The method returns a *pre-residual contribution*, which the caller folds back into the stream with a plain residual add. This document walks each piece and explains *why* it is built the way it is.
 
 The whole attention stack costs **17,308,032 parameters across the 3 blocks** (`scripts/compute_budget.py` — see §8).
 
@@ -228,15 +236,9 @@ The caller — `RecursiveBlock.forward` (`src/osrt/model.py:1135-1176`) — deci
   x = x + self._moe(x, loop_idx, token_ids=token_ids)
   ```
 
-- **mHC path** (manifold-constrained hyper-connections, `src/osrt/model.py:1153-1167`): the residual stream carries `n_hc` channels, and the contribution is mixed via a learned `generate` / `input_view` / `update` triple rather than a bare add:
-  ```python
-  a, b_mat, c_out = self.mhc_attn.generate(x)
-  x_in = self.mhc_attn.input_view(x, a)
-  f_attn, present_kv = self._attention(x_in, ...)
-  x = self.mhc_attn.update(x, b_mat, c_out, f_attn)
-  ```
+(v6 also carried a multi-channel mHC path here, mixing the contribution through a learned doubly-stochastic matrix instead of a bare add. mHC was removed in v7 — roadmap §12.3 — so the plain add above is the only path.)
 
-Either way, attention's job ends at producing `f_attn`; the residual integration is the block's responsibility. This is why the attention method is written to return a contribution and stay agnostic about the stream shape.
+Attention's job ends at producing `f_attn`; the residual integration is the block's responsibility. This is why the attention method is written to return a contribution and stay agnostic about the stream shape.
 
 ---
 
@@ -287,7 +289,7 @@ For context, attention is a small slice of the 605M physical total — the route
 | `_attention_with_sink` (manual sink path) | `src/osrt/model.py:1057-1121` |
 | `compute_rope_freqs` / `apply_rope` | `src/osrt/model.py:47-90` |
 | RoPE table init | `src/osrt/model.py:1239-1246` |
-| `forward` (residual + mHC integration) | `src/osrt/model.py:1135-1176` |
+| `forward` (residual integration) | `src/osrt/model.py` |
 | Preset (heads/kv/head_dim/sink) | `src/osrt/presets.py:22-47` |
 | Config validation | `src/osrt/config.py:352-373` |
 | Param budget | `scripts/compute_budget.py` |

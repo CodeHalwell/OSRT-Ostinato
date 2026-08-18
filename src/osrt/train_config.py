@@ -1513,7 +1513,7 @@ class SFTv1Config(SFTConfig):
     pretrained_checkpoint: str = "/vol/checkpoints/v5/osrt_v5_midtrain_final.pt"
     stage_prefix: str = "sft_v1"
     seq_len: int = 2048
-    # The v6 model (601M, mHC, MTP, 8 experts) OOMs at batch8/seq2048
+    # The v6 model OOMed at batch8/seq2048
     # un-checkpointed (the SFTConfig defaults were sized for the v5 363M).
     # Enable gradient checkpointing (run_sft sets _osrt_grad_ckpt) AND split
     # the effective-64 batch as 4x16 so the per-step activation peak is halved.
@@ -2651,7 +2651,7 @@ class GRPOv6Config(GRPOConfig):
 
     FULL-PARAMETER, not HRA-only. The HRA adapter is a rank-256 parallel bypass
     around ATTENTION only (model.py:1442), so freezing the base would leave
-    GRPO unable to touch the MoE experts, the router, mHC or the embeddings —
+    GRPO unable to touch the MoE experts, the router or the embeddings —
     where this architecture's capacity lives — and the adapters are already
     fitted through midtrain and SFT. Safety comes instead from peak_lr 1.5e-6
     (inherited; set after a prior collapse), kl_coeff 0.15, checkpoints every

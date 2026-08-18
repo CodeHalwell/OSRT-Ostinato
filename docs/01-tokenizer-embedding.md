@@ -1,5 +1,13 @@
 # Tokenizer & Embedding
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Chapter 1 of the `docs/` architecture series. Read [`00-overview.md`](00-overview.md)
 first. Like every chapter, this one is grounded in the real artifacts on disk
 (`tokenizer/`, `src/osrt/`) and cites `file:line`; where the code or the on-disk
@@ -337,8 +345,6 @@ The embedding output is the **loop-0 input** to the recursive stack. In
 ```python
 # src/osrt/model.py:1351-1355
 x = self.embedding(input_ids)
-if self.use_mhc:
-    x = x.unsqueeze(2).repeat(1, 1, self.config.n_hc, 1)   # → n_hc-channel stream
 ```
 
 Two things to notice:
@@ -348,17 +354,15 @@ Two things to notice:
    lookup; the blocks then transform `x` in place. The embedding therefore sets
    the *scale and geometry* of the entire residual stream — which is why its init
    and its no-weight-decay treatment matter.
-2. **mHC expansion.** When Manifold-Constrained Hyper-Connections are enabled
-   (`use_mhc=True` in the preset, `presets.py:43`), the single `dim`-vector per
-   token is broadcast into an `n_hc`-channel residual stream right after embedding
-   — `.repeat`, not `.expand`, so the channels are independent storage. The
-   mechanics of that multi-channel stream are the subject of
-   [`04-mhc.md`](04-mhc.md); the loop-conditioning that breaks symmetry between
-   passes lives in [`06-recursion.md`](06-recursion.md).
+2. **Single residual stream.** The embedding output feeds one `dim`-vector
+   per token straight into the recursive blocks. (v6 expanded this into a
+   4-channel mHC stream; mHC was removed in v7 — roadmap §12.3.) The
+   loop-conditioning that breaks symmetry between passes lives in
+   [`05-recursion.md`](05-recursion.md).
 
 For the full depth-recurrence story — loop embeddings, per-pass adapters, the
-tied LM head applied at intermediate loops — see [`06-recursion.md`](06-recursion.md)
-and [`07-heads-and-losses.md`](07-heads-and-losses.md).
+tied LM head applied at intermediate loops — see [`05-recursion.md`](05-recursion.md)
+and [`06-heads-and-losses.md`](06-heads-and-losses.md).
 
 ---
 

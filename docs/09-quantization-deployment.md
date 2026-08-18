@@ -1,5 +1,13 @@
 # Quantization & Deployment
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how a
 > **601M-parameter mixture-of-experts model** is squeezed down to run on small /
 > edge hardware (phones, a Raspberry Pi 5): the deployment memory budget and why
@@ -60,7 +68,6 @@ The real per-component parameter breakdown, straight from
 ```
   embedding           100,690,944    (16.7%)
   attention            17,308,032    ( 2.9%)
-  mhc                     921,766    ( 0.2%)
   shared_expert        38,928,384    ( 6.5%)
   routed_experts      424,673,280    (70.6%)   ← the dominant term
   router                   36,867
@@ -98,7 +105,7 @@ Shared experts (int8, 38.9M)                          39 MB
 Routed experts (mixed FP4 @ ~3.5 bit avg, 424.7M):
     424.7M × 3.5 bits / 8  ≈ 186 MB (+~2% AlphaQ meta) ~190 MB
 HRA adapters (bf16, 14.2M × 2 bytes)                  28 MB
-mHC + router + norms + loop_emb (bf16)                ~2 MB
+router + norms + loop_emb (bf16)                      ~2 MB
 MTP heads (dropped at deploy)                          0 MB
   ----------------------------------------------------------
 TOTAL ON DISK / RESIDENT                             ~377 MB
@@ -326,7 +333,7 @@ different thing. Only the last layer (int4 KV) is implemented today.
 | **Base weights** (embedding, attention, shared experts) | int8, symmetric per-channel | 2× over bf16 on the ~157M "dense" params; int8 is near-lossless for these | PLANNED |
 | **Routed experts** | mixed FP4 (MXFP4 + AlphaQ 2/3/4-bit) | the big win — ~5× over bf16 on the 71% term, ~190 MB | PLANNED |
 | **KV cache** | int4 TurboQuant (rotation + symmetric grid + nibble pack) | 4× over bf16 on the *runtime* cache; bounds context growth | IMPLEMENTED (`quant.py`, standalone) |
-| HRA adapters, router, mHC, loop-emb, norms | bf16 | kept full precision — small and sensitive | (no quant needed) |
+| HRA adapters, router, loop-emb, norms | bf16 | kept full precision — small and sensitive | (no quant needed) |
 
 **Why each layer, and the order to apply them:**
 
@@ -342,7 +349,7 @@ different thing. Only the last layer (int4 KV) is implemented today.
    change the on-disk weight size at all; it bounds the *runtime* memory so a
    long context does not dwarf the weights.
 
-**Leave alone:** HRA adapters (14.2M), router, mHC, loop embeddings, norms, and
+**Leave alone:** HRA adapters (14.2M), router, loop embeddings, norms, and
 biases stay **bf16** (`ARCHITECTURE.md §14.1`). They are small (a few MB total)
 and quantization-sensitive — the HRA adapters carry the RL-tuned behaviour, the
 router decides expert selection, and norms/biases are numerically delicate.
@@ -391,7 +398,7 @@ residency or more aggressive routed bits).
 | int4 nibble packing | 2 nibbles / `uint8` | **IMPLEMENTED** | `quant.py:112-136` |
 | int8 base weights | symmetric per-channel QAT (embedding, attention, shared experts) | **PLANNED** (no code) | `ARCHITECTURE.md §14.1` |
 | Routed-expert FP4 / AlphaQ | mixed 2/3/4-bit, PL-Alpha-Hill + ILP, ~3.5 bit avg | **PLANNED** (no code) | `ARCHITECTURE.md §14.3` |
-| HRA / router / mHC / norms bf16 | keep full precision | **PLANNED** (deploy policy) | `ARCHITECTURE.md §14.1` |
+| HRA / router / norms bf16 | keep full precision | **PLANNED** (deploy policy) | `ARCHITECTURE.md §14.1` |
 | MTP-head drop at deploy | omit 4.72M head params | **PLANNED** (deploy policy) | `compute_budget.py`, §2 |
 
 **The one-line summary:** the int4 **KV-cache** quantizer is real, tested code
@@ -466,6 +473,6 @@ imports (`fused_ce`, `hra`, `muon`) are **not auto-copied** by
 - **Why V is recomputed from K** (the halving that makes the K-only cache
   possible): `ARCHITECTURE.md §6.3`, `§13.1`.
 - **Parameter budget & active-vs-physical:** `scripts/compute_budget.py`,
-  `ARCHITECTURE.md §2.1`; HRA adapters `docs/05-hra-adapters.md`; routed experts
+  `ARCHITECTURE.md §2.1`; HRA adapters `docs/04-hra-adapters.md`; routed experts
   `docs/03-moe-and-routing.md`.
 - **Full memory math at inference:** `ARCHITECTURE.md §15.3`.

@@ -1,4 +1,4 @@
-# OSRT-605M — Architecture Overview
+# OSRT Ostinato — Architecture Overview
 
 *The entry point to the `docs/` architecture series. Read this first, then
 follow the numbered chapters. Each chapter is grounded in `src/osrt/` and
@@ -12,7 +12,7 @@ disagree, the chapters trust the code and flag the drift.*
 **OSRT** = **Optimized Sparse Recursive Transformer**.
 
 - **O**ptimized — Muon optimizer + a quantized deployment stack
-- **S**parse — mixture-of-experts (top-2 of 8 routed + 1 shared per block)
+- **S**parse — mixture-of-experts (top-4 of 28 routed + 1 shared per block)
 - **R**ecursive — 3 physical blocks applied 6 times via depth recurrence
 - **T**ransformer — a standard pre-norm decoder backbone
 
@@ -20,39 +20,35 @@ It is a **recursive Mixtral-style sparse MoE decoder**: only 3 physical
 decoder blocks exist, but they are run **6 times in a loop** (weights
 reused each pass), giving **18 effective layers** of depth from one-third
 the parameters. The design folds in a stack of 2025-2026 small-LM
-techniques (MLA-style KV compression, manifold-constrained residuals,
-Muon, aux-loss-free MoE balancing) on top of the lessons from the v5
-(363M) lineage.
+techniques (MLA-style KV compression, Muon, aux-loss-free MoE balancing)
+on top of the lessons from the v5 lineage.
 
 The single defining bet: **depth recurrence is parameter-efficient
-depth**. A 605M-parameter model does the forward compute of a much
-deeper dense model because the same blocks are traversed six times.
+depth** — the model does the forward compute of a much deeper dense model
+because the same blocks are traversed six times.
 
 ## The numbers (generated, not hand-derived)
 
 All counts come from `PYTHONPATH=src python scripts/compute_budget.py`,
-which instantiates the canonical `OSRT_605M_A288M` preset
-(`src/osrt/presets.py`) and counts real parameters. Re-run it after any
-config change.
+which instantiates the canonical `OSRT_V7` preset (`src/osrt/presets.py`)
+and counts real parameters. Re-run it after any config change — this file
+deliberately quotes no number that the script does not generate.
 
 | quantity | value |
 |---|---|
-| **Physical parameters** | **601,444,393 (~601M)** |
-| **Active per token (inference)** | **278,217,769 (~278M, 46.3%)** |
+| **Physical parameters** | **968,468,355** |
+| **Active per token (inference)** | **263,035,779 (27.2%)** |
 | Hidden dim `d_model` | 1,536 |
-| Vocab | 65,536 (byte-level BPE) |
+| Vocab | 49,280 padded / 49,184 real (SmolLM2 base + 32 OSRT specials) |
 | Physical blocks × loops | 3 × 6 = **18 effective layers** |
 | Attention | GQA 24 query / 8 KV heads, head_dim 64 |
-| MoE | 1 shared (h=2,816) + 8 routed (h=3,840), top-2 |
+| MoE | 1 shared (h=2,816) + 28 routed (h=2,112), top-4 |
 | HRA adapters | rank 256, 18 (one per effective layer) |
-| mHC | `n_hc=4`, Sinkhorn 20 iters |
 | MTP heads | 2 (training-only, dropped at deploy) |
 
-> **Naming note.** The repo (`OSRT-605M-A269M`) and the preset
-> (`OSRT_605M_A288M`) carry numbers from earlier, pre-generation counts.
-> The instantiated model is **601M / 278M**. The names are kept (renaming
-> the repo breaks clones); trust this table and `compute_budget.py`, not
-> the names.
+> **Naming rule.** No parameter count appears in any name — repo, preset,
+> package or directory. The v6 lineage carried four mutually inconsistent
+> stale counts at once. `scripts/compute_budget.py` is the only source.
 
 ## Status
 
@@ -64,9 +60,7 @@ the attention sink was **dropped** in favour of flash
 flash fits — `presets.py:47-54`), and **grouped-GEMM MoE** is on
 (`moe_grouped_gemm=True`, validated on H100 to track the loop path,
 dropless, ~9-12% faster — `presets.py:55-60`). Fused cross-entropy and
-gradient checkpointing are wired and mandatory for the 80GB fit
-(seq-2048 footprint ~39.5GB); mHC stability still needs profiling on real
-hardware.
+gradient checkpointing are wired and mandatory for the fit.
 
 ## How a token flows through the model
 
@@ -76,35 +70,29 @@ input_ids
    ▼
 [ Embedding ]  (tied with the LM head)                      → ch.01
    │
-   ▼  initialise the n_hc=4 mHC residual stream             → ch.04
-   │
-   ├─────────────── for loop r in 0..5 (6 loops) ───────────┐  → ch.06
+   ├─────────────── for loop r in 0..5 (6 loops) ───────────┐  → ch.05
    │                                                          │
    │   for block b in 0..2 (3 physical blocks):              │
    │     ┌──────────────────────────────────────────────┐   │
    │     │ Attention sub-block                            │   │
    │     │   GQA + KDV (Key-Derived Value) latent cache   │   │ → ch.02
    │     │   QK-Norm, RoPE, flash SDPA (no sink)          │   │
-   │     │   + HRA rank-256 adapter (this effective layer)│   │ → ch.05
-   │     │ mHC mixes the contribution into the streams    │   │ → ch.04
+   │     │   + HRA rank-256 adapter (this effective layer)│   │ → ch.04
    │     ├──────────────────────────────────────────────┤   │
    │     │ MoE sub-block                                  │   │
-   │     │   loop_emb biases the router                   │   │ → ch.06
-   │     │   sqrt(softplus) router, top-2 of 8            │   │ → ch.03
-   │     │   1 shared expert (always on) + 2 routed       │   │
+   │     │   loop_emb biases the router                   │   │ → ch.05
+   │     │   sqrt(softplus) router, top-4 of 28           │   │ → ch.03
+   │     │   1 shared expert (always on) + 4 routed       │   │
    │     │   aux-loss-free balance bias                   │   │
    │     │   grouped-GEMM dispatch (dropless, fullgraph)  │   │
-   │     │ mHC mixes the contribution into the streams    │   │
    │     └──────────────────────────────────────────────┘   │
    │                                                          │
-   │   (end of loop r → per-loop aux loss + collapse         │ → ch.06/07
+   │   (end of loop r → per-loop aux loss + collapse         │ → ch.05/06
    │      telemetry: loop/update_norm_l* residual norm)      │
    └──────────────────────────────────────────────────────────┘
    │
-   ▼  collapse the n_hc streams (dedicated mhc_collapse head) → ch.04
-   │
    ▼
-[ Tied LM head ] → logits (B, S, 65536)                      → ch.07
+[ Tied LM head ] → logits (B, S, 49280)                      → ch.05
    │
    ├─ training: + per-loop aux LM losses + MTP losses
    │            + router balance / z losses                   → ch.07
@@ -120,14 +108,13 @@ shrinks it for deployment.
 |---|---|---|
 | 01 | [Tokenizer & Embedding](01-tokenizer-embedding.md) | byte-level BPE, the 21-token contract (14 built / 7 missing), tied embedding ↔ LM head |
 | 02 | [Attention](02-attention.md) | GQA via flash `F.scaled_dot_product_attention`, the KDV (Key-Derived Value) latent KV cache, RoPE, QK-Norm (attention sink dropped) |
-| 03 | [MoE & Routing](03-moe-and-routing.md) | shared + 8 routed experts, sqrt(softplus) router, aux-loss-free balancing, hash routing, SwiGLU clamp |
-| 04 | [mHC](04-mhc.md) | the n_hc=4 residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing, the collapse head |
-| 05 | [HRA Adapters](05-hra-adapters.md) | the 18 rank-256 attention-path adapters (+ the separate injected retrofit path) |
-| 06 | [Recursion](06-recursion.md) | depth recurrence, loop embeddings, loop dropout, per-loop aux heads |
-| 07 | [Heads & Losses](07-heads-and-losses.md) | tied LM head, per-loop aux losses, MTP heads, router losses, the total loss |
-| 08 | [Optimizer (Muon)](08-optimizer.md) | Muon + Newton-Schulz, the Muon/AdamW split, decoupled weight decay |
-| 09 | [Inference & KV Cache](09-inference-kv-cache.md) | prefill/decode, the latent-only cache, preallocated decode, speculative decoding |
-| 10 | [Quantization & Deployment](10-quantization-deployment.md) | int4 KV (implemented), AlphaQ FP4 experts (planned), the memory budget |
+| 03 | [MoE & Routing](03-moe-and-routing.md) | shared + 28 routed experts, sqrt(softplus) router, aux-loss-free balancing, hash routing, SwiGLU clamp |
+| 04 | [HRA Adapters](04-hra-adapters.md) | the 18 rank-256 attention-path adapters (+ the separate injected retrofit path) |
+| 05 | [Recursion](05-recursion.md) | depth recurrence, loop embeddings, loop dropout, per-loop aux heads |
+| 06 | [Heads & Losses](06-heads-and-losses.md) | tied LM head, per-loop aux losses, MTP heads, router losses, the total loss |
+| 07 | [Optimizer (Muon)](07-optimizer.md) | Muon + Newton-Schulz, the Muon/AdamW split, decoupled weight decay |
+| 08 | [Inference & KV Cache](08-inference-kv-cache.md) | prefill/decode, the latent-only cache, preallocated decode, speculative decoding |
+| 09 | [Quantization & Deployment](09-quantization-deployment.md) | int4 KV (implemented), AlphaQ FP4 experts (planned), the memory budget |
 
 ## How these docs relate to the other files
 

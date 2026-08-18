@@ -45,7 +45,6 @@ BASE = dict(
 
 VARIANTS = {
     "baseline (all off)": {},
-    "+mHC": dict(use_mhc=True, n_hc=4),
     "+sqrt_softplus": dict(router_affinity="sqrt_softplus"),
     "+attn_sink": dict(attention_sink=True),
     "+swiglu_clamp": dict(swiglu_clamp=10.0),

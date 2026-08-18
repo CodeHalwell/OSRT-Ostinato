@@ -3,7 +3,7 @@
 Replaces the hand-derived tables in README.md / ARCHITECTURE.md with numbers
 generated from the real model on a meta device (no memory allocated).
 
-IMPORTANT: by default this reports the canonical preset OSRT_605M_A288M, which
+IMPORTANT: by default this reports the canonical preset OSRT_V7, which
 is the config that actually trains. Do NOT trust loose CLI overrides to
 reproduce the preset — the CLI only exposes a handful of knobs and everything
 else falls back to OSRTConfig defaults (e.g. num_kv_heads=None => MHA, not the
@@ -23,7 +23,7 @@ import torch
 
 from osrt.config import OSRTConfig
 from osrt.model import OSRTForCausalLM
-from osrt.presets import OSRT_605M_A288M
+from osrt.presets import OSRT_V7
 
 # Map a parameter name to a budget category. Ordered: first match wins.
 _CATEGORIES = [
@@ -31,7 +31,6 @@ _CATEGORIES = [
     ("attention", lambda n: any(k in n for k in (
         "q_proj", "kv_down", "v_from_k", "out_proj",
         "norm_q", "norm_k", "norm_attn"))),
-    ("mhc", lambda n: "mhc" in n),
     ("shared_expert", lambda n: "shared_expert" in n),
     ("routed_experts", lambda n: ".experts." in n),
     ("router", lambda n: "router" in n or "moe_gate" in n),
@@ -86,10 +85,10 @@ def report(cfg: OSRTConfig) -> tuple[int, int]:
         f"loops={cfg.recursive_loops} kv_heads={cfg.num_kv_heads} "
         f"experts={cfg.num_routed_experts} top_k={cfg.top_k_experts} "
         f"h_routed={cfg.expert_hidden} h_shared={cfg.shared_expert_hidden} "
-        f"rank={cfg.adapter_rank} mtp={cfg.mtp_heads} mhc={cfg.use_mhc}"
+        f"rank={cfg.adapter_rank} mtp={cfg.mtp_heads}"
     )
     print("-" * 64)
-    for cat in ("embedding", "attention", "mhc", "shared_expert",
+    for cat in ("embedding", "attention", "shared_expert",
                 "routed_experts", "router", "adapters", "mtp_heads",
                 "loop_emb", "norms_misc"):
         if cat in cats:
@@ -127,7 +126,7 @@ def main() -> None:
     # Start from the REAL canonical preset, not loose defaults. This is the
     # config that trains; reporting anything else silently misleads (the
     # old CLI fell back to MHA + no-MTP defaults and over-reported by ~6M).
-    preset = dict(OSRT_605M_A288M)
+    preset = dict(OSRT_V7)
     for kv in args.override:
         k, _, v = kv.partition("=")
         # int-ify where possible, else leave as string/bool

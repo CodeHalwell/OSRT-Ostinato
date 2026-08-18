@@ -1,12 +1,20 @@
 # Inference, KV Cache & Speculative Decoding
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the trained model actually turns a prompt into text: the two phases of
 > generation (prefill and decode), the unusual *latent-only* KV cache (KDV,
 > Key-Derived Value), the CPU-GPU-sync-aware standard decode loop, sampling,
 > and a **greedy-only** speculative-decode accelerator. It cross-references
 > `docs/02-attention.md` (the attention sub-block / MLA latent),
-> `docs/06-recursion.md` (the 3-blocks-×-6-loops depth recurrence),
+> `docs/05-recursion.md` (the 3-blocks-×-6-loops depth recurrence),
 > `ARCHITECTURE.md` §12 (inference) and §13 (KV cache), and the shipping
 > implementation in `src/osrt/model.py`.
 
@@ -45,7 +53,7 @@ transformer, and both get their own section below:
    `Linear(512→512)+bias` (`v_from_k`) reading the cached latent and producing
    V. That is ~half a normal GQA cache.
 2. **Depth comes from recursion, not distinct layers.** The model runs 3
-   physical decoder blocks 6 times (`docs/06-recursion.md`). Each
+   physical decoder blocks 6 times (`docs/05-recursion.md`). Each
    *(loop, block)* pair is an **effective layer** with its own cache slot, so the
    cache has `num_blocks × recursive_loops = 3 × 6 = 18` slots — and the variable
    loop-count knob (§8) changes how many of those slots exist.
@@ -144,7 +152,7 @@ With `num_blocks = 3` and `recursive_loops = 6` that is 18 slots: `(loop 0,
 block 0) → 0`, `(loop 0, block 1) → 1`, …, `(loop 5, block 2) → 17`. Each loop
 genuinely recomputes a fresh latent — the input to loop *r* is loop *r-1*'s
 output, so the 18 latents are 18 different representations, not 6 copies (see
-`ARCHITECTURE.md` §13.4 and `docs/06-recursion.md`). If `num_loops=K` is set
+`ARCHITECTURE.md` §13.4 and `docs/05-recursion.md`). If `num_loops=K` is set
 (§8), only the first `K × num_blocks` slots exist, and that is exactly what
 `forward()` validates the incoming cache against
 (`src/osrt/model.py:1361`, `expected_past_layers = num_blocks * n_loops_to_run`).
@@ -420,7 +428,7 @@ padding ids in the embedding table can never be emitted.
 (`src/osrt/model.py:1901-1910`, `2075`). The idea exploits OSRT's recursion: a
 *cheap draft* is produced by running only the first `spec_draft_loops` loops
 (3 by default, config `spec_draft_loops=3`), and the *expensive verifier* runs
-the full loop count. The per-loop aux LM-head training (`docs/06-recursion.md`,
+the full loop count. The per-loop aux LM-head training (`docs/05-recursion.md`,
 `ARCHITECTURE.md` §9.2) is what makes the low-loop draft predictive of the
 full-loop output, so the draft and verifier agree often.
 
@@ -524,7 +532,7 @@ shipped routine is explicitly greedy-only, as its banner states.
 ## 8. `num_loops` — variable test-time compute
 
 `num_loops` is an inference knob (`ARCHITECTURE.md` §12.2;
-`docs/06-recursion.md`) that runs fewer than the trained 6 loops at every step
+`docs/05-recursion.md`) that runs fewer than the trained 6 loops at every step
 for a speed/quality trade-off. It is validated by `_resolve_num_loops()`
 (`src/osrt/model.py:1293-1310`): `None` → `config.recursive_loops` (full
 quality, the default, bit-identical to before); otherwise `K` must lie in
@@ -618,7 +626,7 @@ text as greedy decode, fewer expensive forwards.
 ### Cross-references
 
 - `docs/02-attention.md` — GQA + MLA latent, KDV (Key-Derived Value), RoPE, attention sink.
-- `docs/06-recursion.md` — 3 blocks × 6 loops, loop embeddings, per-loop aux head.
+- `docs/05-recursion.md` — 3 blocks × 6 loops, loop embeddings, per-loop aux head.
 - `ARCHITECTURE.md` §6 (attention), §12 (inference), §13 (KV cache).
 - `src/osrt/model.py` — `generate()` (1841), `_generate_speculative()` (2075),
   `_attention()` (979), `OSRTModel.forward()` cache loop (1461).

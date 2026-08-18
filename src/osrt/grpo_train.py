@@ -15,7 +15,7 @@ an H100: **~5.5 minutes per step**, so 900 steps would be ~75 hours.
 
 That is not a small inefficiency, it is the dominant cost, and it is the same
 lesson this model has taught three times now: decode here is LAUNCH-BOUND
-(18 effective layers of MoE plus 20 sequential Sinkhorn iterations means
+(18 effective layers of MoE means
 thousands of kernel launches per token, a cost that is fixed regardless of
 batch size). Measured throughput by batch:
 

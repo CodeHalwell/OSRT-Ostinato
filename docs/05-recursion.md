@@ -1,5 +1,13 @@
 # Recursion: Depth Recurrence, Loop Embeddings & Loop Aux
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the model gets deep without getting big: it runs **3 physical decoder blocks
 > 6 times** (recursive depth recurrence), how it keeps the six iterations from
@@ -213,8 +221,7 @@ objective. Two pieces cooperate.
 
 ```python
 if capture_aux and loop < n_loops_to_run - 1:
-    # Collapse the mHC stream to a single vector for the aux head
-    intermediate_hiddens.append(self._collapse(x) if self.use_mhc else x)
+    intermediate_hiddens.append(x)
 
 loop_rms.append(x.float().pow(2).mean().sqrt())
 if loop < n_loops_to_run - 1:
@@ -223,10 +230,8 @@ if loop < n_loops_to_run - 1:
 
 The intermediate hidden is captured at the **end of each non-final loop**, after
 the 3 blocks but **before `norm_loop`** (the `norm_loop` is applied on the *next*
-line, only for non-final loops). It uses the dedicated learnable collapse head
-`mhc_collapse` via `_collapse(...)` (`src/osrt/model.py:1288-1291`) — never a
-stale dynamic mixing matrix — to mix the multi-channel residual stream down to a
-single `dim`-vector. `capture_aux` is on only when
+line, only for non-final loops). The residual stream is a single `dim`-vector
+per token, so the hidden is captured directly. `capture_aux` is on only when
 `aux_loop_loss_weight > 0 and self.training` (`src/osrt/model.py:1423-1426`), so
 this entire path is **train-only**.
 

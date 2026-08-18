@@ -1,12 +1,20 @@
 # Optimizer: Muon + AdamW Hybrid
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains the
 > optimizer that trains the model: a **hybrid** that runs *Muon* (momentum
 > orthogonalised by Newton-Schulz) on 2D hidden weight matrices and *AdamW* on
 > everything else. Ground truth is `src/osrt/muon.py` (the whole file) and the
 > optimizer wiring in `src/osrt/train.py:740-828`; default hyper-parameters live
 > in `src/osrt/train_config.py`. Cross-refs: `docs/02-attention.md` (QK-Norm),
-> `docs/04-mhc.md`, `docs/06-recursion.md`.
+> `docs/05-recursion.md`.
 
 ---
 
@@ -230,7 +238,6 @@ them contradict the "obvious" description — read these carefully.
 |---|---|---|
 | Attention projections (q / kv / v / out) | `Linear.weight` in the attn block | **Muon** |
 | MoE expert SwiGLU (gate / up / down) | per-expert projections | **Muon** |
-| mHC matrices (`W_pre` / `W_res` / `W_post`) | `src/osrt/mhc.py` | **Muon** |
 | HRA adapter weights | `src/osrt/hra.py` | **Muon** |
 | Token embedding (and tied LM head) | `nn.Embedding` | **AdamW**, wd=0 |
 | RMSNorm gains, incl. QK-Norm | 1D scales | **AdamW**, wd=0 |
@@ -238,7 +245,7 @@ them contradict the "obvious" description — read these carefully.
 | `loop_embeddings` | `nn.Embedding`, `model.py:213` | **AdamW**, wd=0 |
 | `router_balance_bias` | registered buffer, `model.py:237` | **no optimizer** (heuristic) |
 
-This matches `ARCHITECTURE.md` §16.7 (Muon = attention / experts / HRA / mHC;
+This matches `ARCHITECTURE.md` §16.7 (Muon = attention / experts / HRA;
 AdamW = embedding, LM head, norms, biases; router bias = heuristic only).
 
 ### Two surprises worth flagging (code beats the docstring)
@@ -259,7 +266,7 @@ point: `router_balance_bias` is a *buffer* updated by a heuristic EMA rule at
 **(b) `loop_embeddings` is grouped with the router, not with the embedding rule.**
 It is caught by the `is_router_like` branch (`src/osrt/muon.py:274`) and gets
 AdamW wd=0, matching the Lion config carve-out so the depth-conditioning table
-isn't decayed (cross-ref `docs/06-recursion.md`).
+isn't decayed (cross-ref `docs/05-recursion.md`).
 
 ---
 
@@ -359,7 +366,7 @@ Muon is fast and FLOP-efficient, but it is *aggressive*: its equal-singular-valu
 update can rotate a weight matrix's representation substantially in a single
 step. In a plain transformer that is tolerable. In OSRT it is amplified by
 **recursion** — the same 3 physical blocks run 6 times
-(`docs/06-recursion.md`) — so a representation shift propagates through six passes
+(`docs/05-recursion.md`) — so a representation shift propagates through six passes
 per token. Muon + recursion can change representations *too fast per loop* if
 nothing bounds it. Two architectural features are what make Muon viable here:
 
@@ -373,17 +380,18 @@ nothing bounds it. Two architectural features are what make Muon viable here:
   on top — OSRT relies on QK-Norm plus Muon's own stability). QK-Norm gains are
   1D, so they themselves are trained by **AdamW**, not Muon.
 
-- **mHC** — manifold-constrained hyper-connections (`docs/04-mhc.md`). mHC
-  controls how each sub-block's contribution is folded back into the residual
-  stream, keeping the mixing on a constrained manifold. That bounds how much a
+- **Sandwich RMSNorm, per-loop aux losses and loop dropout** bound how much a
   fast Muon update to one block can perturb the shared residual that all six
-  loops read and write. mHC's own `W_pre`/`W_res`/`W_post` matrices are 2D, so
-  they are trained by **Muon** — the stabiliser and the thing it stabilises are
-  both on Muon, with mHC's manifold constraint doing the bounding.
+  loops read and write.
 
-The takeaway: Muon is not a drop-in replacement you can enable in isolation. Its
-viability in OSRT is *contingent* on QK-Norm bounding the logits and mHC bounding
-the residual mixing. Turn those off and Muon's speed becomes instability.
+> **Corrected in v7.** Earlier revisions of this chapter claimed Muon's
+> viability was *contingent* on mHC bounding the residual mixing. That was an
+> assertion, never a measurement. mHC's benefit against a plain residual stream
+> was never established at any scale (roadmap §12.1-C2 — the paper's headline
+> +2.1 BBH is mHC-vs-HC, not mHC-vs-plain), and v5 ran Muon over 18 effective
+> layers on a plain residual stream without loop collapse. mHC was removed in
+> v7 (§12.3). Muon's real preconditions here are QK-Norm on the logits and the
+> sandwich-norm / aux-loss / loop-dropout stack on the recursion.
 
 ---
 
@@ -455,7 +463,7 @@ in lockstep.
   in bf16 (`coeffs (3.4445, -4.7750, 2.0315)`), projecting onto the Stiefel
   manifold so every singular direction gets an equal step. ~2× compute
   efficiency, < 1 % FLOP overhead.
-- The hybrid sends 2D hidden matrices (attention, experts, mHC, HRA) to Muon and
+- The hybrid sends 2D hidden matrices (attention, experts, HRA) to Muon and
   everything else to AdamW. **Two code-vs-docstring surprises:** the router
   *weight* is 2D but routed to AdamW (wd=0), and the AdamW "decay" group is dead
   code so all real weight decay comes from Muon's decoupled term.
@@ -463,6 +471,7 @@ in lockstep.
   scales weights down on its own — without it spectral norms drift.
 - The momentum buffer is forced fp32 (a fix for it inheriting bf16 from grads);
   NS runs bf16, the EMA stays fp32.
-- Muon is only viable in OSRT because QK-Norm bounds the logits and mHC bounds
-  the residual mixing under recursion (`docs/02-attention.md`, `docs/04-mhc.md`,
-  `docs/06-recursion.md`).
+- Muon's preconditions here are QK-Norm bounding the logits and the
+  sandwich-norm / aux-loss / loop-dropout stack bounding the recursion
+  (`docs/02-attention.md`, `docs/05-recursion.md`). The older claim that mHC was
+  required is corrected above.

@@ -1,5 +1,21 @@
 # ARCHITECTURE.md — OSRT-600M technical specification
 
+> ## ⚠ v6 spec — superseded in the specifics
+>
+> This document was written against **v6** and its numbers are v6 numbers:
+> 8 routed experts, 65,536 vocab, mHC enabled. v7 changes all three
+> (28 x h2112 top-4; 49,280/49,184 SmolLM2-based vocab; mHC removed).
+>
+> It is kept in place, at its original section numbering, because `src/osrt/`
+> comments cite `ARCHITECTURE.md §N` throughout — moving or renumbering it
+> would invalidate those references. §8 is a tombstone for exactly that reason.
+>
+> **Current sources of truth:** `docs/specs/2026-08-11-v7-roadmap.md` for the
+> committed shape and every open gate; `scripts/compute_budget.py` for any
+> parameter count; `src/osrt/` for behaviour. Where this file disagrees with
+> the code, the code wins.
+
+
 **Scope:** the technical specification of the OSRT-600M model — every
 layer, dimension, formula, and connection. The model is **implemented**
 in `src/osrt/`; this doc describes that implementation. Where a number
@@ -94,7 +110,6 @@ Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
      + v_from_k (512×512 +b) + out_proj (1536×1536) + QK/attn norms
   -- ~5.77M/block; the KDV (Key-Derived Value) latent is what makes attention this lean
 
-mHC mixers (Sinkhorn/Birkhoff, §8)                  921,766        921,766
   -- per-sub-block A/B/C generators; shared across loop iterations
 
 Shared experts × 3 (SwiGLU, h=2,816)             38,928,384     38,928,384
@@ -148,7 +163,7 @@ is ~283M; the 278M headline is the inference forward.)
   - 8 (not 12) for denser routing — see §2.5
 - **HRA adapter rank**: 256 (real high-rank, not LoRA-style 16)
 - **HRA injection points**: 18 (implementation-defined; see §2.4)
-- **mHC expansion**: 4× residual stream width (enabled in canonical
+- ~~**mHC expansion**~~ (REMOVED in v7, §8): 4× residual stream width in v6,
   preset; pending GPU-phase stability test)
 - **Position encoding**: Partial RoPE (last 64 dims of Q and K)
 - **Activation**: SwiGLU (FFN), Sqrt(Softplus) (routing affinity)
@@ -165,7 +180,7 @@ active MAC). Per effective layer (one block × one loop):
   + shared expert (~12.98M params)                      : ~2 × 12.98M = ~26M FLOPs
   + routed top-2 (2 × 17.69M/8 experts ≈ 4.42M active)  : ~2 × 4.42M  = ~8.8M FLOPs
   + HRA adapter (786K params)                           : ~2 × 0.79M  = ~1.6M FLOPs
-  + mHC + norms                                         : ~1M FLOPs
+  + norms                                               : ~1M FLOPs
 )  ≈ 18 × ~49M  = ~880M FLOPs
 + embedding lookup (negligible) + tied LM head (~2 × 100.7M = ~200M)
 
@@ -754,105 +769,24 @@ output = w_down @ (SiLU(gate_clamped) ⊙ linear_clamped)
 
 ---
 
-## 8. Manifold-Constrained Hyper-Connections (mHC)
+## 8. Manifold-Constrained Hyper-Connections (mHC) — REMOVED IN v7
 
-### 8.1 Residual stream expansion
+> Section number retained deliberately: `src/osrt/` comments cite
+> `ARCHITECTURE.md §N` throughout, so renumbering §9–§18 would invalidate
+> them. The content is gone; the anchor stays.
 
-Standard transformers: residual stream is `[batch, seq, d_model]`
-(1536 channels).
+mHC was removed in v7. See `docs/specs/2026-08-11-v7-roadmap.md` §12.3 for the
+decision and §12.1-C2 for the evidence: the mHC paper's headline results are
+**mHC-versus-HC**, not mHC-versus-a-plain-residual-stream, so the comparison
+v7 actually needed was never published. Against that unmeasured benefit sat a
+measured, threefold cost — 36 Sinkhorn projections per forward, a residual
+stream 4x wider in activation memory at every one of 18 effective layers, and
+an unresolved NaN/gradient-amplification warning that shipped enabled in the
+v6 preset. Under the v7 requirement of fastest achievable inference (§13.1)
+the decision could not have gone the other way, so no ablation was bought.
 
-mHC expands by factor `n_hc = 4`:
-```
-X ∈ ℝ^(batch × seq × n_hc × d_model)    # 4 channels × 1,536 = 6,144 total
-```
-
-Per channel still operates on `d_model=1536`; the inner layers
-(attention, MoE) consume one 1,536-dim view and produce one 1,536-dim
-output. The 4× expansion is in the **residual** stream only.
-
-### 8.2 Mixing matrices (dynamic)
-
-Per mHC application (one per attention sub-block, one per MoE
-sub-block), three mixing matrices:
-
-```
-A_l ∈ ℝ^(1 × 4)       # input mapping: residual → layer input
-B_l ∈ ℝ^(4 × 4)       # residual transformation (the constrained matrix)
-C_l ∈ ℝ^(4 × 1)       # output mapping: layer output → residual
-```
-
-Update rule:
-```
-X_{l+1} = B_l @ X_l + C_l @ F_l(A_l @ X_l)
-        = (residual mixing) + (layer contribution)
-```
-
-Where `F_l` is either Attention or MoE depending on which sub-block.
-
-### 8.3 Birkhoff polytope constraint on B_l
-
-`B_l` is constrained to be **doubly stochastic** (rows and columns
-sum to 1, all entries ≥ 0). This is the Birkhoff polytope of n×n
-matrices.
-
-Constraint enforcement:
-```
-# Start with unconstrained ~B_l (computed as in §8.4)
-# Project onto manifold via Sinkhorn-Knopp iteration
-M_0 = exp(~B_l)
-for t in range(t_max=20):
-    M = T_r(T_c(M))     # alternating row/column normalization
-B_l = M
-```
-
-The doubly-stochastic constraint guarantees `||B_l||_2 ≤ 1` (spectral
-norm bounded). This means the residual transformation is
-**non-expansive** — guaranteed numerical stability across the
-forward pass and backprop. Closed under multiplication, so deep stacks
-(our 18 effective layers) stay stable.
-
-### 8.4 Dynamic parameter generation
-
-`A_l`, `B_l`, `C_l` are dynamically generated per token:
-
-```
-# Flatten + normalize the residual stream
-X_flat = vec(X_l) ∈ ℝ^(1 × (4 × 1536))      # (1 × 6144)
-X_normed = RMSNorm(X_flat)
-
-# Generate raw (unconstrained) parameters
-~A_l = α_pre × (X_normed @ W_pre) + S_pre        # (1 × 4)
-~B_l = α_res × Mat(X_normed @ W_res) + S_res     # (4 × 4)
-~C_l = α_post × (X_normed @ W_post)^T + S_post   # (4 × 1)
-```
-
-Where:
-- `W_pre ∈ ℝ^(6144 × 4)` (dynamic component for A_l)
-- `W_res ∈ ℝ^(6144 × 16)` (dynamic component for B_l, reshaped to 4×4)
-- `W_post ∈ ℝ^(6144 × 4)` (dynamic component for C_l)
-- `S_pre, S_res, S_post`: static learnable biases
-- `α_pre, α_res, α_post`: learnable gating factors, initialized small
-
-### 8.5 Sigmoid bounds on A_l and C_l
-
-```
-A_l = σ(~A_l)         # bounded [0, 1]
-C_l = 2σ(~C_l)        # bounded [0, 2]
-```
-
-Prevents signal cancellation. The factor 2 on C_l preserves the
-ability to scale layer contributions.
-
-### 8.6 Cost (~720K params, ~6.7% overhead)
-
-Total mHC params per injection point (one for attn, one for FFN, per
-block, per loop ITERATION):
-- 18 effective layers × 2 sub-blocks = 36 mHC applications
-- But the dynamic generation matrices are SHARED across the loop
-  iterations (per physical block)
-- Net added: ~720K trainable params + ~6.7% wall-clock overhead
-
----
+v5 ran Muon over 18 effective layers on a plain residual stream without loop
+collapse, which is the closest thing to a control that exists.
 
 ## 9. LM head and auxiliary heads
 

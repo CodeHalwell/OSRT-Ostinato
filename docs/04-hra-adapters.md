@@ -1,5 +1,13 @@
 # HRA — High-Rank Adapters
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Part of the `docs/` OSRT-605M architecture series.*
 
 This document explains the **HRA (High-Rank Adapter)** block of OSRT-605M:

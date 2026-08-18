@@ -1,89 +1,80 @@
-"""Canonical model presets for osrt.
+"""Canonical model preset for OSRT.
 
-Generated/validated by `scripts/compute_budget.py`. The headline preset
-`OSRT_605M_A288M` is the locked target for the $350 build:
+`OSRT_V7` is the committed v7 shape — see
+`docs/specs/2026-08-11-v7-roadmap.md` §14 (shape), §16 (tokenizer) and §12.3
+(mHC removed).
 
-    8 routed experts (Mixtral-style, top-2 = 25% routing density), shared
-    expert shrunk and routed experts widened so the model is ~607M physical
-    / ~288M active (47.5%). 8 experts (not the original 12) trades sparsity
-    for per-token capacity: each token sees a larger fraction of the routed
-    knowledge base, less risk of expert under-utilization at this scale.
+**No parameter counts appear in this file, or in any name.** The v6 lineage
+carried four mutually inconsistent stale counts simultaneously; regenerate with
+`scripts/compute_budget.py`, which instantiates the real model on a `meta`
+device and is the only trusted source.
 
-    Hitting both physical AND a tighter active number (e.g. 269M) with
-    rank=256 HRA all-active is infeasible without dropping shared expert
-    width below ~1k — so we accept 288M active as the floor.
+Assumption on record (roadmap §14.8), still open at gate G3a:
+
+    v7 assumes the compute-optimal token requirement tracks ACTIVE parameters,
+    not total. This follows from C = 6ND with N set by active FLOPs. It is
+    FALSIFIED if loss-per-token degrades as total params rise at fixed active,
+    or if the trunk run trails a smaller control at matched tokens.
 """
 
 from __future__ import annotations
 
 from osrt.config import OSRTConfig
 
-# Locked $350-run target. See compute_budget.py: ~606.8M physical / 288.3M active.
-OSRT_605M_A288M: dict = dict(
+OSRT_V7: dict = dict(
     dim=1536,
     heads=24,
     head_dim=64,
-    num_kv_heads=8,            # GQA 24/8 + MLA-style compressed-latent KV cache
-    vocab_size=65536,
-    real_vocab_size=65536,
+    num_kv_heads=8,             # GQA 24/8 + MLA-style compressed-latent KV cache
+    # SmolLM2 base (49,152) + 32 OSRT special tokens = 49,184 real, padded to
+    # a multiple of 128 for tensor cores. Chosen at G2 for single-digit number
+    # tokenization: 100% context consistency and true place-value alignment,
+    # where the v6 65,536 BPE made 1-3 digit numbers ATOMIC (roadmap §16).
+    vocab_size=49280,
+    real_vocab_size=49184,
     num_blocks=3,
-    recursive_loops=6,
-    num_routed_experts=8,       # less sparse than 12 → more capacity per token
-    top_k_experts=2,            # 2/8 = 25% routing density
-    expert_hidden=3840,         # solved via compute_budget.py at rank=256
-    shared_expert_hidden=2816,  # trial-and-error to fit budget; revisit at GPU phase
+    recursive_loops=6,          # 3 x 6 = 18 effective layers
+    # Fine-grained re-grain (§14.3). Iso-active with 14 x h4224 top-2, but
+    # satisfies the "more, smaller experts" requirement rather than reversing
+    # it. h2112 = 33 x 64, so it survives the model.py tensor-core round-up.
+    num_routed_experts=28,
+    top_k_experts=4,            # 4/28 = 14.3% density
+    expert_hidden=2112,
+    shared_expert_hidden=2816,
     adapter_rank=256,           # real HRA capacity (NOT LoRA-style 16)
     adapter_alpha=256.0,        # match rank so scale = 1.0
-    # Manifold-Constrained Hyper-Connections (ARCHITECTURE.md §8): 4-channel
-    # residual stream, Birkhoff/Sinkhorn doubly-stochastic mixing. Enabled for
-    # GPU-phase testing — CPU pre-flight (scripts/ablate_features.py) showed
-    # gradient amplification + NaN under sustained training, needs profiling on
-    # real hardware to see if it's a CPU-precision artifact or a real bug.
-    # See ARCHITECTURE.md §8 + LEARNINGS.md when v6 GPU runs begin.
-    use_mhc=True,
-    n_hc=4,
-    mhc_sinkhorn_iters=20,
-    swiglu_clamp=10.0,         # DeepSeek-style SwiGLU stability clamp (§7.8)
-    # Attention sink DROPPED (was True). The manual sink path materialises a
-    # (B,H,S,S) score matrix; at the seq-8192 instruction phase that is ~12GB
-    # recomputed in the checkpointed backward — measured OOM (>85GB) at batch 2.
-    # attention_sink=False routes through F.scaled_dot_product_attention (flash),
-    # which never builds the score matrix: the SAME footprint fits at 35.9GB.
-    # v5's proven path; scales to every phase. The sink had no demonstrated
-    # benefit (kept only because it happened to fit at seq 2048).
+    swiglu_clamp=10.0,          # DeepSeek-style SwiGLU stability clamp
+    # Attention sink DROPPED in v6 and stays dropped. The manual sink path
+    # materialises a (B,H,S,S) score matrix — measured OOM (>85GB) at batch 2,
+    # seq 8192 — against 35.9GB through flash SDPA, with no demonstrated
+    # benefit.
     attention_sink=False,
-    # B4: grouped-GEMM MoE dispatch. Removes the per-expert .nonzero() — the
-    # only torch.compile graph break — so the model compiles fullgraph.
-    # Validated on H100: loss tracks the loop path, dropless, ~9-12% faster
-    # steady-state (gated by gradient-checkpointing recompute). Weights are
-    # identical to the loop path, so checkpoints load under either dispatch.
+    # Grouped-GEMM MoE dispatch: removes the per-expert .nonzero(), the only
+    # torch.compile graph break, so the model compiles fullgraph. NOTE: this
+    # was validated at E=8/h3840; gate G7 re-benchmarks it at E=28/h2112 and
+    # settles whether the expert path gets FP8/NVFP4 kernels on Blackwell.
     moe_grouped_gemm=True,
-    # lean-v6 training stack (all already supported by the v5 model code)
-    aux_loop_loss_weight=0.05,   # on from step 1 — anti loop-collapse
-    # Multi-Token Prediction heads (§9.3, §11.4): 2 extra heads predicting +2/+3
-    # from the final hidden state. Training-time only (droppable at deploy);
-    # densifies the signal à la DeepSeek-V3/V4. beta = 0.3 per §11.4.
+    aux_loop_loss_weight=0.05,  # on from step 1 — anti loop-collapse
+    # Multi-Token Prediction. The head COUNT is deliberately NOT slimmed to 1:
+    # roadmap §15 shows DeepSeek ran MTP-1 in production only because static
+    # multi-token drafters degrade aggregate throughput under HIGH CONCURRENCY,
+    # a constraint absent at the batch-1 decode this model targets. More draft
+    # positions plus a lightweight sequential head is the right shape here.
     mtp_heads=2,
     mtp_loss_weight=0.3,
-    router_aux_loss_coeff=0.10,  # v5-proven balance pressure
+    router_aux_loss_coeff=0.10,
     router_z_loss_coeff=1e-3,
     router_balance_bias_enabled=True,
-    # sqrt(softplus) routing affinity (ARCHITECTURE.md §7.4, §16.3): the
-    # balance bias steers TOP-K selection on the non-negative affinity, gating
-    # weights renormalise the selected balanced affinities. Hash routing stays
-    # off (hash_routing_blocks default 0) — reserved for later A/B testing.
+    # sqrt(softplus) routing affinity: the balance bias steers TOP-K selection
+    # on the non-negative affinity; gating weights renormalise the selected
+    # balanced affinities. NOTE: §14.6 makes Quantile Balancing REQUIRED for
+    # v7 — at E=28 one dead expert is 3.6% of block capacity and the current
+    # +/-gamma heuristic was tuned at E=8. Not yet implemented.
     router_affinity="sqrt_softplus",
     max_position_embeddings=4096,
 )
 
 
-def build_config(preset: dict = OSRT_605M_A288M, **overrides) -> OSRTConfig:
-    """Build a OSRTConfig from a preset, with optional overrides."""
+def build_config(preset: dict = OSRT_V7, **overrides) -> OSRTConfig:
+    """Build an OSRTConfig from a preset, with optional overrides."""
     return OSRTConfig(**{**preset, **overrides})
-
-
-# Back-compat alias — old code (app.py, sft_train.py) imports OSRT_605M_A279M.
-# Resolve to the corrected preset until call sites are updated. The "A279M"
-# number was based on a stale compute_budget run; the locked active count is
-# 288M after restoring HRA rank=256.
-OSRT_605M_A279M = OSRT_605M_A288M

@@ -56,6 +56,6 @@ rule from `LEARNINGS.md` still governs.
 ## Reading order
 
 1. [`docs/specs/2026-08-11-v7-roadmap.md`](docs/specs/2026-08-11-v7-roadmap.md) — the plan, its independent citation audit (§12), the north star (§13), the committed shape (§14)
-2. [`docs/00-overview.md`](docs/00-overview.md) — architecture, chapters 01–10
+2. [`docs/00-overview.md`](docs/00-overview.md) — architecture, chapters 01–09
 3. [`LEARNINGS.md`](LEARNINGS.md) — v5's failure modes, and why the design looks like this
 4. [`RESEARCH.md`](RESEARCH.md) — the papers behind each technique

@@ -1,5 +1,13 @@
 # Output Heads & Training Losses
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
 > the model turns its final hidden state into token predictions, and the full
 > stack of training losses that shape it: the tied LM head and its
@@ -82,10 +90,8 @@ physical budget. An untied LM head would *double* that to ~200M for no quality
 gain at this scale. Tying also couples "what a token means as input" to "what
 predicting that token requires," which is a mild but real inductive prior.
 
-The hidden state fed in (`hidden`) is the final loop's residual stream after the
-dedicated mHC collapse and `norm_out` (`src/osrt/model.py:1533-1535`); see
-chapter 04 for the mHC collapse and chapter 06 for the recursion that produces
-it.
+The hidden state fed in (`hidden`) is the final loop's residual stream after
+`norm_out`; see chapter 05 for the recursion that produces it.
 
 ### 2.2 The main task loss (next-token cross-entropy)
 
@@ -142,8 +148,7 @@ each non-final loop:
 ```python
 # src/osrt/model.py:1524-1527
 if capture_aux and loop < n_loops_to_run - 1:
-    # Collapse the mHC stream to a single vector for the aux head
-    intermediate_hiddens.append(self._collapse(x) if self.use_mhc else x)
+    intermediate_hiddens.append(x)
 ```
 
 The LM wrapper then runs each captured hidden through `norm_out` + the **same
@@ -559,7 +564,7 @@ Takeaways:
 
 ## 10. Cross-references
 
-- **Tied embedding / mHC collapse producing `hidden`** — chapter 04 (mHC).
+- **Tied embedding producing `hidden`** — chapter 01.
 - **Recursion, loop dropout, why aux heads exist** — chapter 06 (recursion); the
   normalization-by-actual-loops fix (§6 here) is referenced from there.
 - **The aux-loss-free balance-bias controller** (the non-gradient heuristic that

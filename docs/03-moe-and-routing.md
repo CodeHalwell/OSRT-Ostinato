@@ -1,5 +1,13 @@
 # MoE & Routing
 
+> **v7 status.** The architecture this chapter describes is current, but its
+> **`file:line` citations, parameter tables and config values were written
+> against v6** and have not been regenerated. mHC references have been removed
+> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
+> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
+> truth where they disagree.
+
+
 *Part of the OSRT-605M `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
 
 This document explains the **mixture-of-experts (MoE)** sub-block of the
@@ -658,11 +666,10 @@ truth. Running it on the canonical preset (`OSRT_605M_A288M`) reports:
 
 ```
 cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
-     experts=8 top_k=2 h_routed=3840 h_shared=2816 rank=256 mtp=2 mhc=True
+     experts=28 top_k=4 h_routed=2112 h_shared=2816 rank=256 mtp=2
 ----------------------------------------------------------------
   embedding           100,690,944
   attention            17,308,032
-  mhc                     921,766
   shared_expert        38,928,384
   routed_experts      424,673,280
   router                   36,867

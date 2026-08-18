@@ -190,7 +190,7 @@ class OSRTLMEval(LM):
         print("[lm_eval] Constructing model "
               f"(hra_native={hra_native})...", flush=True)
         if hra_native:
-            # v6 lane: build the FULL preset architecture (recursive MoE, mHC,
+            # build the FULL preset architecture (recursive MoE,
             # MTP, native rank-256 HRA already in the config). A bare
             # OSRTConfig defaults to the wrong (v5-class) shape and would
             # silently mis-load a v6 checkpoint — the exact correctness bug

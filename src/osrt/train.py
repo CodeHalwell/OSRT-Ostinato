@@ -1836,7 +1836,7 @@ def run_pretrain_extend(
     print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
 
     # Activation checkpointing: foundation needs it at seq 2048 (39.5GB);
-    # the v6 model (MTP + mHC 4-stream + 8 experts) is heavier than the v5
+    # the v6 model (MTP + 8 experts) was heavier than the v5
     # extend model this loop was written for. Drive from the config when
     # set, else trigger at seq>=4096 (was 8192 — too high for v6).
     # NB: the model's ONLY checkpointing gate is _osrt_grad_ckpt (model.py

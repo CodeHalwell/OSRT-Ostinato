@@ -96,7 +96,7 @@ CI runs lint, format check, tests and the budget script on every push and PR.
 
 - **`docs/specs/2026-08-11-v7-roadmap.md`** — the plan, its audit (§12), the
   north star (§13), the committed shape (§14), and DSpark (§15). Start here.
-- `docs/00-overview.md` → chapters 01–10 — architecture deep-dive.
+- `docs/00-overview.md` → chapters 01–09 — architecture deep-dive.
 - `LEARNINGS.md` — what went wrong in v5, and why the design is shaped this way.
 - `RESEARCH.md` — the papers behind each technique.
 - `ARCHITECTURE.md` — config-value spec.
