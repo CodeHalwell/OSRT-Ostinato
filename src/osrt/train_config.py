@@ -197,8 +197,10 @@ class PretrainConfig:
     # Per-head Muon (Kimi K3 §2.5): orthogonalise each attention head's block
     # of q_proj / kv_down / v_from_k separately instead of the full matrix, so
     # no single head dominates the shared update. Adds no params and the update
-    # magnitude is held constant, so it's a clean A/B toggle. Default off.
-    per_head_muon: bool = False
+    # magnitude is held constant, so it's a clean A/B toggle. Default ON per
+    # the §14.1 committed shape (graduated; GLM-5's ablation credits it for
+    # Muon+MLA ≥ GQA); the G3 ladder still A/Bs it off.
+    per_head_muon: bool = True
 
     # Weights & Biases
     wandb_log: bool = True

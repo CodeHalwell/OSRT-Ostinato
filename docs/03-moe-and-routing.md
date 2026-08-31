@@ -137,7 +137,10 @@ A few things worth teaching here:
   harmless. The `up` path is clamped on **both** sides because it enters the
   product *linearly* and a large magnitude of either sign is dangerous. This
   is a DeepSeek-V4-style stability measure (`ARCHITECTURE.md §7.8`); for a
-  healthy model it is a no-op that only caps the tails.
+  healthy model it is a no-op that only caps the tails. **Since 2026-08-31
+  `OSRT_V7` sets `situ_glu=True`** (roadmap §14.1), whose param-free smooth
+  cap *replaces* SwiGLU + this hard clamp; the clamp value stays in the
+  preset as the fallback for the G3 ladder's SiTU-vs-clamp A/B.
 - **`hidden` is rounded up to a multiple of 64** (`model.py:101`) for
   tensor-core alignment. Both preset widths (3,840 and 2,816) are already
   multiples of 64, so nothing changes for OSRT-605M.
@@ -352,9 +355,9 @@ logits so it disciplines the learned router, not the controller or the noise.
 
 There is also a per-sequence Switch loss (`model.py:665-683`) that penalises
 imbalance *inside* a single sequence — useful at long context where one
-document can dominate a micro-batch. It is **off in the preset**:
-`router_seq_balance_loss_coeff` defaults to `0.0` (`config.py:122`) and the
-preset does not enable it. Opt-in only.
+document can dominate a micro-batch. `router_seq_balance_loss_coeff`
+defaults to `0.0` in `OSRTConfig`, but since 2026-08-31 `OSRT_V7` sets it
+to `1e-4` per the roadmap's §14.1 committed router line.
 
 ---
 

@@ -136,3 +136,40 @@ first GPU session, not with training the trunk.
    cheapest real experiment, blocks nothing.
 6. Short smoke via the notebook's 200-step run before any real spend, per
    the standing rule.
+
+---
+
+## 4. Addendum, 2026-08-31 (same day) — fixes applied on this branch
+
+Everything fixable without new information was fixed in the follow-up
+commit; findings 2.2–2.5 above are therefore **resolved except as noted**:
+
+- **2.1 upgraded from "verify" to "confirmed absent":** an authenticated
+  listing of *all* the account's HF model and dataset repos (private
+  included) contains **no OSRT repo at all** — `HallD/osrt-v6-ckpt` is gone
+  from HF, not just unresolvable. `docs/v6/colab_midtrain3.md` shows the
+  base was originally seeded *from the Mac*, so local copies may survive
+  there. Until the frozen v6 checkpoint is located, **G8 is blocked** (gate
+  board updated) and no v6-control comparison can run. This is the one
+  finding only the user can resolve.
+- **2.2 resolved in the committed direction, minus one item:** `OSRT_V7` now
+  ships `situ_glu=True` (param-free — budget numbers unchanged) and
+  `router_seq_balance_loss_coeff=1e-4`; `PretrainConfig` ships
+  `per_head_muon=True`. Rationale: §14.6's own precedent — QB "graduated"
+  and was then implemented in the preset; these follow it. The G3 ladder
+  still A/Bs SiTU-vs-clamp and per-head on/off. The **V4 Muon recipe
+  (item 1.3) remains unimplemented** — real optimizer work, now explicitly
+  tracked in §14.1's amendment and CLAUDE.md rather than silently absent.
+- **2.3 resolved:** CLAUDE.md gate board and committed-shape summary
+  unstaled (G2 resolved, G8 blocked, mHC wording aligned with the §12.3
+  amendment); `Environment & commands` filled with the real toolchain.
+- **2.4 stands** (harness-building is tomorrow's work, not a defect).
+- **2.5 resolved:** `presets.py` truncated comment completed;
+  `sanity_overfit.py` de-staled and its proxy switched to the v7 path
+  (quantile balancing + SiTU-GLU), re-run green; roadmap §14 intro's
+  self-reference fixed (§14.9 → §14.8) and the §8/§14.1 tokenizer lines
+  corrected per §16.1's instruction.
+
+Re-verified after the changes: ruff clean, full suite green,
+`compute_budget.py` still reports **968,468,355 / 263,035,779** (SiTU adds
+no parameters), `sanity_overfit.py` still overfits.

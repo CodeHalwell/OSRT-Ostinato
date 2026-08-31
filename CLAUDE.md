@@ -39,21 +39,24 @@ See `docs/specs/2026-08-11-v7-roadmap.md` §14. Summary:
 - 1 × h2816 shared expert per block
 - GQA 24q/8kv, KDV compressed-latent cache, QK-norm
 - HRA rank 256, native, per effective layer
-- **mHC: OFF** — decided permanently (roadmap §12.3)
+- Tokenizer: **SmolLM2-based, 49,280 padded / 49,184 real** — G2 resolved (§16)
+- **mHC: OFF** — decision stands (§12.3; its 2026-08-18 amendment keeps one
+  G3 ladder slot as cheap insurance, so "off" is settled, not unrevisitable)
 - Quantile Balancing router bias — **required**, not optional (§14.6)
+- SiTU-GLU experts, per-head Muon, seq-balance 1e-4 — set in code per §14.1;
+  the **V4 Muon recipe (item 1.3) is the one §14.1 line not yet implemented**
 
-Open: tokenizer (G2), MTP head count (§15 — do **not** slim to 1),
-loops × blocks (G4).
+Open: MTP head count (§15 — do **not** slim to 1), loops × blocks (G4).
 
 ## Gate board — measure before you build
 
 | gate | question | status |
 |---|---|---|
-| G8 | drafter accepted length on frozen v6 | **runs now, blocks nothing** |
-| G7 | do routed experts get FP8/NVFP4 kernels via grouped-GEMM? | before G3/G4 |
-| G3a | does the token requirement track active or total params? | blocks the trunk run |
-| G2 | tokenizer bake-off | open |
-| G3/G4 | expert re-grain; loops × blocks | open |
+| G8 | drafter accepted length on frozen v6 | **blocked**: `HallD/osrt-v6-ckpt` was absent from an authenticated HF listing on 2026-08-31 — locate the frozen v6 ckpt (Mac?) or G8 is dead |
+| G7 | do routed experts get FP8/NVFP4 kernels via grouped-GEMM? | before G3/G4; `probe_gpu.py` ready, needs the GPU box |
+| G3a | does the token requirement track active or total params? | blocks the trunk run; no harness yet |
+| G2 | tokenizer bake-off | **resolved** — SmolLM2 + 32 OSRT specials (§16), shipped in `tokenizer/` |
+| G3/G4 | expert re-grain; loops × blocks | open; no ladder harness yet |
 
 The roadmap's §12 is an independent citation audit of §§4–6 — **read it before
 citing any external claim from this repo.** Three material errors were found.
@@ -85,6 +88,26 @@ GRPO reward because it was measurably harmful.
 roadmap cites them, labelled so nobody mistakes them for current.
 
 ## Environment & commands
+
+Python 3.11, managed with `uv` (`uv.lock` is the source of truth; CI runs
+`uv sync --frozen`). CI = ruff + pytest + `compute_budget.py`; keep all three
+green locally before pushing:
+
+```bash
+uv sync                                                   # install (frozen in CI)
+uv run ruff check .                                       # lint (format not enforced yet — see ci.yml)
+uv run pytest -q                                          # CPU suite, ~3 min
+PYTHONPATH=src uv run python scripts/compute_budget.py    # canonical param counts
+PYTHONPATH=src uv run python scripts/sanity_overfit.py    # overfit-one-batch sanity
+python scripts/build_tokenizer_v7.py --out tokenizer      # rebuild the v7 tokenizer
+PYTHONPATH=src uv run python -m osrt.train_main --help    # pretrain entry point (GPU)
+```
+
+GPU work runs on Colab (RTX PRO 6000 Blackwell) via
+`notebooks/v7_pretrain_colab.ipynb` — probe first (`scripts/probe_gpu.py`),
+cross-session checkpoints via `--hf-repo`. Needs `HF_TOKEN` and
+`WANDB_API_KEY` in Colab Secrets.
+
 ## Conventions & gotchas
 
 - **`src/osrt/` is ground truth.** When docs and code disagree, the code wins;

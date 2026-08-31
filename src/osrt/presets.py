@@ -43,7 +43,12 @@ OSRT_V7: dict = dict(
     shared_expert_hidden=2816,
     adapter_rank=256,           # real HRA capacity (NOT LoRA-style 16)
     adapter_alpha=256.0,        # match rank so scale = 1.0
-    swiglu_clamp=10.0,          # DeepSeek-style SwiGLU stability clamp
+    # SiTU-GLU (graduated, §14.1): param-free smooth cap that REPLACES
+    # SwiGLU + the hard clamp — no parameter change, so the budget numbers
+    # are untouched and a checkpoint loads under either setting. The clamp
+    # value is kept as the fallback for the G3 ladder's SiTU-vs-clamp A/B.
+    situ_glu=True,
+    swiglu_clamp=10.0,          # DeepSeek-style clamp; inert while situ_glu=True
     # Attention sink DROPPED in v6 and stays dropped. The manual sink path
     # materialises a (B,H,S,S) score matrix — measured OOM (>85GB) at batch 2,
     # seq 8192 — against 35.9GB through flash SDPA, with no demonstrated
@@ -64,13 +69,17 @@ OSRT_V7: dict = dict(
     mtp_loss_weight=0.3,
     router_aux_loss_coeff=0.10,
     router_z_loss_coeff=1e-3,
-    # Quantile Balancing — REQUIRED at v7's granularity (roadmap §14.6).
+    # Per-sequence balance loss (§14.1 router line; V4 runs exactly this).
+    # OSRTConfig ships 0.0 so v6-reproduction runs are untouched.
+    router_seq_balance_loss_coeff=1e-4,
+    # Quantile Balancing — REQUIRED at v7's granularity (roadmap §14.6): at
+    # E=28 one dead expert costs 3.6% of block capacity, and the ±γ heuristic
+    # controller was tuned at E=8.
     router_balance_mode="quantile",
     router_balance_bias_enabled=True,
     # sqrt(softplus) routing affinity: the balance bias steers TOP-K selection
     # on the non-negative affinity; gating weights renormalise the selected
-    # balanced affinities. NOTE: §14.6 makes Quantile Balancing REQUIRED for
-
+    # balanced affinities.
     router_affinity="sqrt_softplus",
     max_position_embeddings=4096,
 )

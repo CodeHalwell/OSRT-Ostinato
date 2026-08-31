@@ -1,8 +1,9 @@
-"""Overfit-one-batch sanity: prove the lean-v6 training path actually learns.
+"""Overfit-one-batch sanity: prove the training path actually learns.
 
-Exercises the real stack on a small proxy of the OSRT-605M architecture:
-recursive MoE (8 experts, top-2), aux-loop LM-head loss ON, Muon+AdamW split
-optimizer. A correct training loop drives the loss on a fixed batch toward ~0.
+Exercises the real stack on a small proxy of the OSRT architecture:
+recursive MoE, quantile-balanced routing and SiTU-GLU experts (the v7
+path), aux-loop LM-head loss ON, Muon+AdamW split optimizer. A correct
+training loop drives the loss on a fixed batch toward ~0.
 
     PYTHONPATH=src python scripts/sanity_overfit.py
 """
@@ -28,6 +29,8 @@ def main() -> None:
         max_position_embeddings=64,
         aux_loop_loss_weight=0.05,      # the anti-collapse fix, ON
         router_balance_bias_enabled=True,
+        router_balance_mode="quantile",  # the v7 controller (roadmap §14.6)
+        situ_glu=True,                   # the v7 expert activation (§14.1)
     )
     model = OSRTForCausalLM(cfg)
     model.train()
@@ -44,7 +47,7 @@ def main() -> None:
     # NOTE: Muon's orthogonalized update is finicky on a ~2M-param toy (its
     # effective step is large relative to these tiny matrices), so we only
     # assert it runs FINITE for a few steps here, not that it converges on the
-    # toy. Muon is validated at the real 605M scale with a tuned LR; that's the
+    # toy. Muon is validated at the real scale with a tuned LR; that's the
     # GPU sanity run's job. The architecture's learn-ability is proven in Part 2.
     muon = Muon(muon_params, lr=2e-3)
     adamw = torch.optim.AdamW(adamw_groups, lr=1e-3, betas=(0.9, 0.95))
