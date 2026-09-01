@@ -226,6 +226,10 @@ class OSRTConfig(PretrainedConfig):
         # v7 REQUIRES quantile (roadmap §14.6): at E=28 one dead expert is
         # 3.6% of block capacity, where the heuristic's tuning was done at 8.
         router_balance_mode: str = "heuristic",
+        # Quantile-Balancing histogram resolution. Sets threshold precision:
+        # the score range is bracketed in this many bins, so 2048 resolves a
+        # threshold to ~0.8% of the range. Numerical, not a tuning knob.
+        router_qb_histogram_bins: int = 2048,
         router_balance_bias_enabled: bool = True,
         router_balance_bias_update_rate: float = 0.10,
         router_balance_bias_ema_rate: float = 0.05,
@@ -346,6 +350,7 @@ class OSRTConfig(PretrainedConfig):
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.router_balance_mode = router_balance_mode
+        self.router_qb_histogram_bins = router_qb_histogram_bins
         self.router_balance_bias_enabled = router_balance_bias_enabled
         self.router_balance_bias_update_rate = router_balance_bias_update_rate
         self.router_balance_bias_ema_rate = router_balance_bias_ema_rate
@@ -458,6 +463,11 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"router_seq_balance_loss_coeff must be >= 0, got "
                 f"{self.router_seq_balance_loss_coeff}"
+            )
+        if self.router_qb_histogram_bins < 16:
+            raise ValueError(
+                f"router_qb_histogram_bins must be >= 16, got "
+                f"{self.router_qb_histogram_bins}"
             )
         if self.router_balance_mode not in ("heuristic", "quantile"):
             raise ValueError(

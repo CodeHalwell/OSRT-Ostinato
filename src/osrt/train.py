@@ -146,13 +146,96 @@ def get_phase(step: int, cfg: PretrainConfig) -> tuple[str, dict]:
     return last_name, cfg.phases[last_name]
 
 
+# Training semantics that must not silently change across a resume. A v7 trunk
+# run is months of drip-funded sessions; if a resumed session quietly uses a
+# different schedule, batch or Muon recipe than the one that produced the
+# checkpoint, the loss curve is a splice of two experiments and nothing
+# downstream is interpretable. Checked fail-closed on resume.
+_STRICT_TRAIN_RECIPE_KEYS = (
+    "batch_size", "grad_accum_steps", "total_steps", "warmup_steps",
+    "lr_schedule", "wsd_decay_frac", "peak_lr", "min_lr",
+    "weight_decay", "grad_clip",
+    "per_head_muon", "muon_ns_steps", "muon_ns_stable_steps",
+    "muon_update_rms", "dataloader_num_workers",
+)
+
+
+def _training_recipe_metadata(cfg) -> dict:
+    """Serialisable training semantics stamped into every checkpoint."""
+    return {k: getattr(cfg, k, None) for k in _STRICT_TRAIN_RECIPE_KEYS}
+
+
+def _model_shape_metadata(cfg) -> dict:
+    """Shape identity. A checkpoint cannot load into a different vocab or
+    expert layout, and v7 changed BOTH against v6 — so record them rather
+    than discovering the mismatch as a shape error mid-load."""
+    return {
+        "vocab_size": cfg.vocab_size,
+        "real_vocab_size": cfg.real_vocab_size,
+        "dim": cfg.dim,
+        "num_blocks": cfg.num_blocks,
+        "recursive_loops": cfg.recursive_loops,
+        "num_routed_experts": cfg.num_routed_experts,
+        "top_k_experts": cfg.top_k_experts,
+        "expert_hidden": cfg.expert_hidden,
+    }
+
+
+def assert_no_resume_drift(
+    ckpt: dict,
+    *,
+    model_config=None,
+    train_cfg=None,
+    stage: str | None = None,
+    path: str = "<checkpoint>",
+) -> None:
+    """Fail closed if a checkpoint was produced by a different experiment.
+
+    Silence here is the expensive failure: the run continues, the numbers look
+    plausible, and the drift is only discovered when a result cannot be
+    reproduced.
+    """
+    def _diff(saved: dict | None, current: dict, label: str) -> None:
+        if not saved:
+            return                       # pre-metadata checkpoint; nothing to check
+        bad = {k: (saved.get(k), v) for k, v in current.items()
+               if k in saved and saved.get(k) != v}
+        if bad:
+            lines = "\n".join(
+                f"    {k}: checkpoint={a!r} current={b!r}" for k, (a, b) in bad.items())
+            raise RuntimeError(
+                f"{label} drift in {path}:\n{lines}\n"
+                f"  Resuming would splice two different experiments. Either point at "
+                f"a fresh --ckpt-dir, or restore the config that produced this file."
+            )
+
+    if model_config is not None:
+        _diff(ckpt.get("model_shape"), _model_shape_metadata(model_config),
+              "MODEL SHAPE")
+    if train_cfg is not None:
+        _diff(ckpt.get("training_recipe"), _training_recipe_metadata(train_cfg),
+              "TRAINING RECIPE")
+    saved_stage = ckpt.get("training_stage")
+    if stage is not None and saved_stage is not None and saved_stage != stage:
+        raise RuntimeError(
+            f"STAGE drift in {path}: checkpoint={saved_stage!r} current={stage!r}."
+        )
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     step: int,
     path: str,
+    model_config=None,
+    train_cfg=None,
+    stage: str = "pretrain_v7",
 ) -> None:
-    """Save a training checkpoint (v5 format)."""
+    """Save a training checkpoint.
+
+    Stamps model-shape and training-recipe metadata so a later resume can fail
+    closed on drift (`assert_no_resume_drift`) instead of silently splicing two
+    experiments together."""
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     # Atomic save: serialize to a temp file, then os.replace onto the final
     # name. torch.save writes directly, and a ~4.9GB checkpoint takes several
@@ -166,7 +249,11 @@ def save_checkpoint(
             "step": step,
             "model_state_dict": inner.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "training_stage": "pretrain_v5",
+            "training_stage": stage,
+            "model_shape": (
+                _model_shape_metadata(model_config) if model_config else None),
+            "training_recipe": (
+                _training_recipe_metadata(train_cfg) if train_cfg else None),
         },
         tmp_path,
     )
@@ -871,11 +958,18 @@ def run_training(
         # Newton-Schulz update is normalised. Keep it as a separate
         # config knob so users can A/B without nuking the Lion peak_lr.
         muon_lr = getattr(train_cfg, "muon_lr", train_cfg.peak_lr)
+        # DeepSeek-V4 Muon recipe (roadmap §14.1 item 1.3): hybrid
+        # Newton-Schulz — fast iterations for convergence, then stabilising
+        # (2.0, -1.5, 0.5) passes — with the update RMS rescaled rather than
+        # left to the shape heuristic.
         muon = Muon(
             muon_params,
             lr=muon_lr,
-            momentum=0.95,
+            momentum=getattr(train_cfg, "muon_momentum", 0.95),
             nesterov=True,
+            ns_steps=getattr(train_cfg, "muon_ns_steps", 5),
+            ns_stable_steps=getattr(train_cfg, "muon_ns_stable_steps", 0),
+            update_rms=getattr(train_cfg, "muon_update_rms", None),
             weight_decay=train_cfg.weight_decay,
         )
         adamw = torch.optim.AdamW(
@@ -993,6 +1087,15 @@ def run_training(
     start_step = 0
     if best_step > 0 and best_ckpt is not None:
         print(f"Found checkpoint at step {best_step}: {best_ckpt}")
+        # Fail closed BEFORE loading: a months-long drip run resumes many
+        # times, and a silent config change makes the loss curve a splice of
+        # two experiments rather than one result.
+        assert_no_resume_drift(
+            torch.load(best_ckpt, map_location="cpu", weights_only=False),
+            model_config=model_config,
+            train_cfg=train_cfg,
+            path=best_ckpt,
+        )
         start_step = load_checkpoint(model, optimizer, best_ckpt, device)
 
     # ------------------------------------------------------------------
@@ -1347,7 +1450,9 @@ def run_training(
                     flush=True,
                 )
                 failed_path = f"{ckpt_dir}/osrt_failed_step_{step}.pt"
-                save_checkpoint(model, optimizer, step, failed_path)
+                save_checkpoint(model, optimizer, step, failed_path,
+                            model_config=model_config,
+                            train_cfg=train_cfg)
                 vol.commit()
                 early_stop_triggered = True
                 break
@@ -1363,7 +1468,9 @@ def run_training(
         # step_N.pt that would bypass the gate on resume.
         if step > 0 and step % train_cfg.ckpt_interval == 0:
             path = f"{ckpt_dir}/osrt_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, path)
+            save_checkpoint(model, optimizer, step, path,
+                            model_config=model_config,
+                            train_cfg=train_cfg)
             vol.commit()
 
         # --- 23h Modal safety (rescue checkpoint + clean exit) ---
@@ -1371,7 +1478,9 @@ def run_training(
         # against numbered checkpoints.
         if time.time() - start_time > 82_800:
             rescue_path = f"{ckpt_dir}/osrt_rescue_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, rescue_path)
+            save_checkpoint(model, optimizer, step, rescue_path,
+                            model_config=model_config,
+                            train_cfg=train_cfg)
             vol.commit()
             print(
                 f"\n23h boundary reached at step {step}. "
@@ -1397,7 +1506,9 @@ def run_training(
         # osrt_final.pt that would clobber a real run's final on the volume.
         if getattr(train_cfg, "save_final_checkpoint", True):
             final_path = f"{ckpt_dir}/osrt_final.pt"
-            save_checkpoint(model, optimizer, step, final_path)
+            save_checkpoint(model, optimizer, step, final_path,
+                            model_config=model_config,
+                            train_cfg=train_cfg)
             vol.commit()
             print(f"Final checkpoint: {final_path}", flush=True)
         else:

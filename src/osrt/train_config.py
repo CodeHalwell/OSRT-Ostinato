@@ -201,6 +201,14 @@ class PretrainConfig:
     # the §14.1 committed shape (graduated; GLM-5's ablation credits it for
     # Muon+MLA ≥ GQA); the G3 ladder still A/Bs it off.
     per_head_muon: bool = True
+    # DeepSeek-V4 Muon recipe (roadmap §14.1 item 1.3 — the one graduated line
+    # that was still absent). Hybrid Newton-Schulz: 8 fast iterations for
+    # convergence then 2 stabilising (2.0, -1.5, 0.5) passes, with the update
+    # RMS rescaled to 0.18 rather than the shape-heuristic default. V4 runs
+    # exactly this at 1.6T params (roadmap §12.2, verified against the report).
+    muon_ns_steps: int = 8
+    muon_ns_stable_steps: int = 2
+    muon_update_rms: float = 0.18
 
     # Weights & Biases
     wandb_log: bool = True

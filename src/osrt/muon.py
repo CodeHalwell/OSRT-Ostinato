@@ -49,7 +49,37 @@ from torch import Tensor
 # modded-NanoGPT speedrun). Increasing to ten gives marginally cleaner
 # orthogonality at twice the cost.
 _NS_COEFFS = (3.4445, -4.7750, 2.0315)
+_NS_STABLE_COEFFS = (2.0, -1.5, 0.5)
 _DEFAULT_NS_STEPS = 5
+
+
+def _newton_schulz(
+    g: Tensor,
+    *,
+    fast_steps: int,
+    stable_steps: int = 0,
+) -> Tensor:
+    """Apply fast NS iterations followed by optional stabilising iterations."""
+    if g.ndim != 2:
+        raise ValueError(f"Newton-Schulz expects 2D input, got shape {tuple(g.shape)}")
+
+    x = g.to(dtype=torch.bfloat16)
+    x = x / (x.norm() + 1e-7)
+    transposed = x.size(0) > x.size(1)
+    if transposed:
+        x = x.T
+
+    for steps, (a, b, c) in (
+        (fast_steps, _NS_COEFFS),
+        (stable_steps, _NS_STABLE_COEFFS),
+    ):
+        for _ in range(steps):
+            gram = x @ x.T
+            x = a * x + (b * gram + c * (gram @ gram)) @ x
+
+    if transposed:
+        x = x.T
+    return x.to(dtype=g.dtype)
 
 
 def newton_schulz5(g: Tensor, steps: int = _DEFAULT_NS_STEPS) -> Tensor:
@@ -60,32 +90,27 @@ def newton_schulz5(g: Tensor, steps: int = _DEFAULT_NS_STEPS) -> Tensor:
     original shape and dtype with approximately orthogonal columns
     (or rows, if g is fat).
     """
-    if g.ndim != 2:
-        raise ValueError(
-            f"newton_schulz5 expects 2D input, got shape {tuple(g.shape)}"
-        )
-    a, b, c = _NS_COEFFS
-    # Cast to bf16 — NS converges fine and bf16 matmuls are ~2× the
-    # throughput of fp32 on H100 tensor cores.
-    x = g.to(dtype=torch.bfloat16)
-    # Normalise so the spectral norm is close to 1; otherwise NS can
-    # diverge in the first iteration.
-    x = x / (x.norm() + 1e-7)
-    # Operate on the squarer side: if rows > cols, transpose so the
-    # X X^T product is the smaller of the two possible Gram matrices.
-    transposed = x.size(0) > x.size(1)
-    if transposed:
-        x = x.T
-    for _ in range(steps):
-        gram = x @ x.T
-        x = a * x + (b * gram + c * (gram @ gram)) @ x
-    if transposed:
-        x = x.T
-    return x.to(dtype=g.dtype)
+    return _newton_schulz(g, fast_steps=steps)
+
+
+def newton_schulz_v4(
+    g: Tensor,
+    fast_steps: int = 8,
+    stable_steps: int = 2,
+) -> Tensor:
+    """DeepSeek-V4 NS recipe: fast convergence, then stable refinement."""
+    return _newton_schulz(
+        g,
+        fast_steps=fast_steps,
+        stable_steps=stable_steps,
+    )
 
 
 def newton_schulz5_perhead(
-    g: Tensor, head_dim: int, steps: int = _DEFAULT_NS_STEPS,
+    g: Tensor,
+    head_dim: int,
+    steps: int = _DEFAULT_NS_STEPS,
+    stable_steps: int = 0,
 ) -> Tensor:
     """Per-head Muon orthogonalisation (Kimi K3 §2.5).
 
@@ -107,7 +132,14 @@ def newton_schulz5_perhead(
     n_heads = out // head_dim
     blocks = g.reshape(n_heads, head_dim, cols)
     ortho = torch.stack(
-        [newton_schulz5(blocks[h], steps=steps) for h in range(n_heads)]
+        [
+            _newton_schulz(
+                blocks[h],
+                fast_steps=steps,
+                stable_steps=stable_steps,
+            )
+            for h in range(n_heads)
+        ]
     )
     return ortho.reshape(out, cols)
 
@@ -138,6 +170,8 @@ class Muon(torch.optim.Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = _DEFAULT_NS_STEPS,
+        ns_stable_steps: int = 0,
+        update_rms: float | None = None,
         weight_decay: float = 0.0,
     ) -> None:
         if lr < 0:
@@ -146,11 +180,17 @@ class Muon(torch.optim.Optimizer):
             raise ValueError(f"momentum must be in [0, 1), got {momentum}")
         if ns_steps < 1:
             raise ValueError(f"ns_steps must be >= 1, got {ns_steps}")
+        if ns_stable_steps < 0:
+            raise ValueError(f"ns_stable_steps must be >= 0, got {ns_stable_steps}")
+        if update_rms is not None and update_rms <= 0:
+            raise ValueError(f"update_rms must be > 0, got {update_rms}")
         defaults = dict(
             lr=lr,
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
+            ns_stable_steps=ns_stable_steps,
+            update_rms=update_rms,
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
@@ -177,6 +217,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
+            ns_stable_steps = group["ns_stable_steps"]
+            update_rms = group["update_rms"]
             wd = group["weight_decay"]
 
             for p in group["params"]:
@@ -207,19 +249,31 @@ class Muon(torch.optim.Optimizer):
                 head_dim = group.get("head_dim")
                 if head_dim and rows % head_dim == 0 and rows > head_dim:
                     ortho = newton_schulz5_perhead(
-                        update, head_dim, steps=ns_steps,
+                        update,
+                        head_dim,
+                        steps=ns_steps,
+                        stable_steps=ns_stable_steps,
                     ).to(dtype=p.dtype)
                     # Per-BLOCK shape scale so the per-head update magnitude
                     # matches the full-matrix path — keeps the effective LR the
                     # same, isolating the per-head effect for a clean A/B.
-                    shape_scale = max(1.0, head_dim / cols) ** 0.5
+                    if update_rms is None:
+                        shape_scale = max(1.0, head_dim / cols) ** 0.5
+                    else:
+                        shape_scale = max(head_dim, cols) ** 0.5 * update_rms
                 else:
-                    ortho = newton_schulz5(update, steps=ns_steps).to(
-                        dtype=p.dtype)
+                    ortho = _newton_schulz(
+                        update,
+                        fast_steps=ns_steps,
+                        stable_steps=ns_stable_steps,
+                    ).to(dtype=p.dtype)
                     # Shape-aware scale. For fat matrices (rows < cols, e.g.
                     # SwiGLU's w_down) we shrink the update so the per-element
                     # variance matches what Adam-scale optimisers produce.
-                    shape_scale = max(1.0, rows / cols) ** 0.5
+                    if update_rms is None:
+                        shape_scale = max(1.0, rows / cols) ** 0.5
+                    else:
+                        shape_scale = max(rows, cols) ** 0.5 * update_rms
 
                 # Decoupled weight decay (AdamW-style — applied to the
                 # parameter, not added to the gradient).

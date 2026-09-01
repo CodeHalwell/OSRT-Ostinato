@@ -98,9 +98,94 @@ def ladder_arm(arm: str, total_steps: int, seq_len: int) -> dict:
     return {"arm": arm, "experts": cfg.num_routed_experts, "total_params": n_total}
 
 
+@app.function(
+    gpu=GPU,
+    timeout=45 * 60,
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("osrt-secrets")],
+)
+def v7_sanity(steps: int = 30) -> dict:
+    """The launch gate: a hard-capped run of the REAL committed v7 shape.
+
+    Distinct from a ladder arm — those are ~123M-active proxies, this is the
+    968M shape itself. It answers the questions a proxy cannot: does the real
+    config build, fit, compile, and step on an H100 with loss going down.
+
+    Capped deliberately. There is NO full-trunk stage in this file, so no
+    invocation here can start a paid multi-month run by accident; the trunk is
+    launched explicitly, on a box, after G3a reports.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    import torch
+    from transformers import AutoTokenizer
+
+    from osrt.model import OSRTForCausalLM
+    from osrt.presets import OSRT_V7, build_config
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
+
+    steps = min(steps, 100)          # hard ceiling, not a default
+
+    tok = AutoTokenizer.from_pretrained("/root/tokenizer")
+    real = len(tok)
+    padded = ((real + 127) // 128) * 128
+    if real != OSRT_V7["real_vocab_size"]:
+        raise SystemExit(
+            f"tokenizer has {real} tokens, preset expects "
+            f"{OSRT_V7['real_vocab_size']}. Refusing: a shape mismatch here "
+            f"means the sanity run does not test the committed model."
+        )
+
+    cfg = build_config(
+        vocab_size=padded,           # padded rows...
+        real_vocab_size=real,        # ...but logits sliced to the true vocab
+        bos_token_id=tok.bos_token_id,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+        fused_cross_entropy_chunks=8,
+    )
+    with torch.device("meta"):
+        n = sum(p.numel() for p in OSRTForCausalLM(cfg).parameters())
+    print(f"[v7_sanity] {steps} steps | {n:,} params | vocab {real}->{padded} | "
+          f"E={cfg.num_routed_experts} top-{cfg.top_k_experts} "
+          f"situ_glu={cfg.situ_glu} balance={cfg.router_balance_mode}", flush=True)
+
+    train_cfg = PretrainConfig()
+    train_cfg.total_steps = steps
+    train_cfg.warmup_steps = max(steps // 5, 2)
+    train_cfg.dataloader_num_workers = 2
+    train_cfg.wandb_log = False       # a 30-step gate is not a run worth logging
+    ckpt_dir = "/vol/v7_sanity"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    class _Vol:
+        def commit(self) -> None:
+            vol.commit()
+
+    run_training(
+        model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
+        tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir,
+    )
+    vol.commit()
+    return {"stage": "v7_sanity", "steps": steps, "params": n}
+
+
 @app.local_entrypoint()
 def main(arm: str = "a", total_steps: int = 4000, seq_len: int = 2048,
-         spawn: bool = False) -> None:
+         spawn: bool = False, sanity: bool = False) -> None:
+    """Two stages only: the launch gate, and one ladder arm.
+
+    There is deliberately no trunk stage — the paid multi-month run is not
+    reachable from this file.
+    """
+    if sanity:
+        print(v7_sanity.remote(min(total_steps, 100) if total_steps < 4000 else 30))
+        return
     if spawn:
         call = ladder_arm.spawn(arm, total_steps, seq_len)
         print(f"spawned ladder arm {arm}: {call.object_id}")

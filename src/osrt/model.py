@@ -131,10 +131,9 @@ def _glu_combine(
     return F.silu(gate) * up
 
 
-# Quantile-Balancing histogram resolution. These are numerical parameters, not
-# tuning knobs: the range brackets both router-score conventions and the bin
-# count sets threshold precision (16/1000 of the range).
-QB_BINS = 512
+# Quantile-Balancing score range. Brackets both router-score conventions
+# (sqrt(softplus) affinity >= 0, and raw logits). Bin COUNT is configurable
+# via config.router_qb_histogram_bins.
 QB_LO = -8.0
 QB_HI = 8.0
 
@@ -347,11 +346,11 @@ class MoELayer(nn.Module):
         # distribution above the selection threshold. Deterministic: no update
         # rate, no EMA, no clamp target to tune. QB_LO/HI bracket both score
         # conventions (sqrt(softplus) affinity >= 0, and raw logits).
-        self.qb_bins = QB_BINS
+        self.qb_bins = config.router_qb_histogram_bins
         self.qb_lo, self.qb_hi = QB_LO, QB_HI
         self.register_buffer(
             "qb_hist",
-            torch.zeros(self.num_loops, self.num_routed, QB_BINS,
+            torch.zeros(self.num_loops, self.num_routed, self.qb_bins,
                         dtype=torch.float32),
             persistent=False,
         )
