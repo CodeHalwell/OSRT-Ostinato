@@ -4,5 +4,19 @@
   "special_added": 32,
   "real_vocab_size": 49184,
   "vocab_size": 49280,
-  "pad_to_multiple": 128
+  "pad_to_multiple": 128,
+  "name": "OSRT-Ostinato tokenizer",
+  "derived_from": "HuggingFaceTB/SmolLM2-1.7B",
+  "base_licence": "Apache-2.0",
+  "kd_teacher": "HuggingFaceTB/SmolLM2-1.7B",
+  "kd_aligned_rows": [
+    0,
+    49151
+  ],
+  "free_slots": {
+    "padding_rows": 96,
+    "reserved_placeholders": 11,
+    "note": "extendable at zero parameter cost; must be frozen before the trunk run"
+  },
+  "resolved_by": "roadmap gate G2, docs/specs/2026-08-11-v7-roadmap.md \u00a716"
 }

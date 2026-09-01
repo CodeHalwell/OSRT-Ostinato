@@ -29,6 +29,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 BASE = "HuggingFaceTB/SmolLM2-1.7B"
+NAME = "OSRT-Ostinato"
 PAD_TO_MULTIPLE = 128  # tensor-core friendly embedding rows
 
 CORE = {
@@ -63,9 +64,13 @@ def main() -> None:
     padded = ((real + PAD_TO_MULTIPLE - 1) // PAD_TO_MULTIPLE) * PAD_TO_MULTIPLE
 
     out = Path(args.out)
+    tk.name_or_path = NAME
     tk.save_pretrained(out)
     (out / "osrt_vocab.json").write_text(json.dumps({
+        "name": f"{NAME} tokenizer",
         "base": BASE,
+        "base_licence": "Apache-2.0",
+        "kd_teacher": BASE,
         "base_vocab": before,
         "special_added": added,
         "real_vocab_size": real,

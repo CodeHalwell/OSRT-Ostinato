@@ -40,5 +40,6 @@
   "pad_token": "<|padding|>",
   "tokenizer_class": "GPT2Tokenizer",
   "unk_token": "<|unknown|>",
-  "vocab_size": 49152
+  "vocab_size": 49152,
+  "name_or_path": "OSRT-Ostinato"
 }
