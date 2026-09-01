@@ -113,7 +113,7 @@ def ladder_arm(arm: str, total_steps: int, seq_len: int) -> dict:
     # COMPLETE short run, not a chunk of a longer one — so it should anneal.
     train_cfg.lr_schedule = "wsd"
     train_cfg.wsd_decay_frac = 0.3
-    train_cfg.dataloader_num_workers = 2
+    train_cfg.dataloader_num_workers = 0  # workers SIGABRT at the phase-switch loader rebuild (ladder arm a, step 400)
     train_cfg.wandb_run_name = f"osrt-v7-ladder-{arm}"
     for phase in getattr(train_cfg, "phases", {}).values():
         if isinstance(phase, dict) and "seq_len" in phase:
@@ -198,7 +198,7 @@ def v7_sanity(steps: int = 30) -> dict:
     train_cfg = PretrainConfig()
     train_cfg.total_steps = steps
     train_cfg.warmup_steps = max(steps // 5, 2)
-    train_cfg.dataloader_num_workers = 2
+    train_cfg.dataloader_num_workers = 0  # workers SIGABRT at the phase-switch loader rebuild (ladder arm a, step 400)
     train_cfg.wandb_log = False       # a 30-step gate is not a run worth logging
     ckpt_dir = "/vol/v7_sanity"
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -258,7 +258,7 @@ def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
     train_cfg = PretrainConfig()
     if total_steps is not None:
         train_cfg.total_steps = total_steps
-    train_cfg.dataloader_num_workers = 2
+    train_cfg.dataloader_num_workers = 0  # workers SIGABRT at the phase-switch loader rebuild (ladder arm a, step 400)
     train_cfg.wandb_run_name = "osrt-v7-trunk"
     print(f"[trunk] {train_cfg.total_steps} steps ≈ "
           f"{train_cfg.total_tokens()/1e9:.2f}B tokens | "
