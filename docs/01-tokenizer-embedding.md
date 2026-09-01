@@ -1,11 +1,12 @@
 # Tokenizer & Embedding
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 *Chapter 1 of the `docs/` architecture series. Read [`00-overview.md`](00-overview.md)
@@ -37,209 +38,128 @@ the front, vectors → ID-logits at the back. Everything in between (attention,
 MoE, recursion) operates purely on continuous vectors.
 
 > ### The one fact that organizes this chapter
-> The model's embedding matrix has **65,536 rows** (one per ID `0…65535`), but
-> the tokenizer **currently shipped on disk only defines 32,768 tokens**
+> The model's embedding matrix has **49,280 rows** (one per ID `0…49279`), of which
+> the tokenizer **defines 49,184 real tokens**; the last 96 rows are tensor-core padding
 > (IDs `0…32767`). These are two different artifacts that *do not yet agree*:
 > the network is built for a 64K vocabulary, the trained tokenizer is 32K. Keep
 > this split in mind throughout — most of the surprises below flow from it.
 
 ---
 
-## 2. Byte-level BPE and the vocabulary size
+## 2. The OSRT-Ostinato tokenizer
+
+v7 does not use a custom-trained vocabulary. It uses **SmolLM2's 49,152-token
+byte-level BPE** (HuggingFaceTB, Apache-2.0) extended with the 32 OSRT special
+tokens below — **49,184 real tokens**, padded to **49,280 embedding rows** (a
+multiple of 128 for tensor cores). The build is reproducible:
+`scripts/build_tokenizer_v7.py`; the lineage is in `tokenizer/README.md` and
+`tokenizer/osrt_vocab.json`.
+
+### Why this one — the digit finding (roadmap §16)
+
+The decision was made on measurement, not reputation, and the measurement
+inverted the obvious guess. v6's custom 65,536 BPE did not *over-split*
+numbers — it made them **atomic**:
+
+| property | v6 custom 65,536 | Ostinato (SmolLM2 base) |
+|---|---|---|
+| 1 / 2 / 3-digit numbers | **100 / 100 / 96.7% single-token** | one token per digit |
+| context consistency (11 contexts) | 75% | **100%** |
+| place value | frequency-merged: `1234567 → 123·4567` | `1·2·3·4·5·6·7` |
+| tied embedding @ dim 1536 | 100.7M | **75.7M** — and it is *active* |
+
+Atomic numbers meant the model had to memorise ~1000 unrelated symbols rather
+than compose digits — and GSM8K arithmetic lives almost entirely in that 1–3
+digit range. Cost of the swap, measured on the real pretraining mix
+(`scripts/probe_tokenizer_fertility.py`): **+6.0% tokens**, concentrated in the
+math slice at +10.4%. A synthetic number-dense sample gives +36%; that figure
+is a worst case and should not be quoted.
+
+Alternatives measured: SmolLM3 and DeepSeek-V3 (128K, 3-digit **left-to-right**
+groups — consistent but misaligned, `34567 → 345·67`), Qwen3 (151K,
+single-digit but +132M active), Mistral (32K). SmolLM2 was the only candidate
+that won on arithmetic, parameter count *and* decode cost at once.
 
 ### What "byte-level BPE" means
 
-The tokenizer is **byte-level Byte-Pair Encoding (BPE)**. Two ideas stacked:
+Bytes, not characters, are the atoms, so any UTF-8 string tokenizes with no
+`<unk>` fallback. Merges are learned pairs of byte sequences. The base 49,152
+merges are SmolLM2's, unchanged — which is what keeps **SmolLM2-1.7B a
+same-tokenizer teacher** (rows `0…49,151` align byte-for-byte). That alignment
+survives *adding* tokens; it does not survive retraining the merges. The
+tokenizer is **extend-only**.
 
-- **Byte-level**: the base alphabet is the 256 possible byte values, not
-  Unicode characters. Any input — English, Japanese, emoji, raw binary — is
-  first reduced to its UTF-8 bytes, so there is **no out-of-vocabulary
-  failure**: in the worst case a string falls back to its individual bytes. The
-  pre-tokenizer is configured as `ByteLevel` with `add_prefix_space=false`,
-  `use_regex=true` (`tokenizer/tokenizer.json:134-139`) — the GPT-2-style regex
-  splits on word/number/punctuation boundaries before merging.
-- **BPE**: starting from bytes, the trainer greedily merges the most frequent
-  adjacent pair, over and over, until the vocabulary reaches the target size.
-  Frequent sequences (`" the"`, `"def "`, `"tion"`) become single tokens;
-  rare ones stay fragmented. The learned merge list lives under `"merges"`
-  (`tokenizer/tokenizer.json:33006`).
+### The 107 free slots
 
-The trainer is in `scripts/train_tokenizer.py`: it builds a
-`Tokenizer(models.BPE())` with a `ByteLevel` pre-tokenizer and decoder
-(`scripts/train_tokenizer.py:233-237`), trained on a ~2 GB sample of the
-pre-training mix — 45 % FineWeb-Edu, 20 % OpenWebMath, 20 % CodeParrot-clean,
-15 % Wikipedia (`scripts/train_tokenizer.py:83-108`). Training the tokenizer on
-the *same* distribution the model will see keeps the merges optimal for that
-data; the math-dense OpenWebMath share is deliberate — the model is math-first,
-so LaTeX/symbols/numerics must tokenize well rather than fall back to near
-byte-level (`train_tokenizer.py:76-82`). Note this is the **tokenizer's own**
-training corpus, which is distinct from (and frozen relative to) the model's
-pre-training data mix; the latter is configured in `train_config.py`
-(`PretrainConfig.phases`) and has since moved to a FineWeb-Edu + NVIDIA Nemotron
-(math/code/STEM, gated) + Cosmopedia blend.
-
-### Why 65,536 (and why the on-disk 32,768 is a discrepancy)
-
-The model's declared vocabulary is **65,536 = 2¹⁶** (`vocab_size=65536`,
-`src/osrt/presets.py:27`). A power of two keeps the embedding/LM-head GEMMs
-hardware-aligned, and 64K is a deliberate **middle-ground** vocabulary:
-
-- Big enough that common words/code idioms are single tokens (good
-  *compression* → fewer tokens per document → more text per training step and
-  per context window).
-- Small enough that the embedding matrix does not dominate the parameter
-  budget. This is the **"embedding tax"** lesson (see §7): for a small model,
-  every parameter spent on vocabulary is a parameter *not* spent on the
-  reasoning blocks.
-
-**Discrepancy — the shipped tokenizer is 32K, not 64K.** The actual
-`tokenizer/tokenizer.json` tops out at ID `32767` — its highest three entries
-are `"Ġcaching": 32765, "Ġhubs": 32766, "Ġhometown": 32767`
-(`tokenizer/tokenizer.json:33002-33004`). That is a **32,768-token** vocabulary.
-Consistently, `scripts/train_tokenizer.py` defaults to `--vocab-size 32768`
-(`scripts/train_tokenizer.py:432`) and its docstring calls it a "32K BPE
-tokenizer." So:
-
-| artifact | declared vocab |
-|---|---|
-| model preset (`presets.py:27`) | **65,536** |
-| `OSRTConfig` default (`config.py:46`) | 32,768 |
-| **tokenizer on disk** (`tokenizer.json`) | **32,768** |
-| `train_tokenizer.py` default (`:432`) | 32,768 |
-
-The network will happily run with the 32K tokenizer — every ID it emits is
-`< 32768 < 65536`, so it indexes a valid embedding row — but **IDs 32768…65535
-of the embedding are dead weight** (never produced by the tokenizer, never a
-training label). The 64K-vs-32K gap is the natural home for the *missing*
-special tokens discussed in §4. The 64K embedding must be retained (the model is
-sized for it), but to actually *use* a 64K vocabulary the tokenizer would need to
-be retrained at `--vocab-size 65536`.
-
----
+96 padding rows (49,184 → 49,280) plus 11 `<|reserved_N|>` placeholders can be
+filled at **zero parameter cost**. Whether they buy measurable fertility on this
+mix is unmeasured. **Freeze before the trunk run** — vocabulary added after
+training begins leaves untrained rows in a checkpoint worth months of compute.
 
 ## 3. Special tokens
 
-"Special tokens" are reserved IDs that don't come from BPE merges — they carry
-structural meaning (turn boundaries, reasoning markers, padding). They are
-stored as `added_tokens` with `special: true`
-(`tokenizer/tokenizer.json:5-132`).
+All 32 are present and pinned. `src/osrt/tokenizer_contract.py` hard-validates
+the real size (49,184) and every structural id at launch — a swapped or
+half-built tokenizer cannot start a run, because a checkpoint trained at one
+vocabulary cannot load at another.
 
-### What is *actually* on disk
+| token | id | role |
+|---|---|---|
+| `<\|begin_of_text\|>` | 49152 | bos |
+| `<\|end_of_text\|>` | 49153 | eos |
+| `<\|padding\|>` | 49154 | pad |
+| `<\|unknown\|>` | 49155 | unk |
+| `<\|fim_prefix\|>` | 49156 | fill-in-middle |
+| `<\|fim_middle\|>` | 49157 | fill-in-middle |
+| `<\|fim_suffix\|>` | 49158 | fill-in-middle |
+| `<\|think\|>` | 49159 | opens reasoning |
+| `<\|/think\|>` | 49160 | closes reasoning |
+| `<\|answer\|>` | 49161 | opens the final answer |
+| `<\|/answer\|>` | 49162 | closes the final answer |
+| `<\|user\|>` | 49163 | role |
+| `<\|assistant\|>` | 49164 | role |
+| `<\|system\|>` | 49165 | role |
+| `<\|end_turn\|>` | 49166 | turn boundary |
+| `<\|tool_call\|>` | 49167 | tool use |
+| `<\|/tool_call\|>` | 49168 | tool use |
+| `<\|tool_result\|>` | 49169 | tool use |
+| `<\|/tool_result\|>` | 49170 | tool use |
+| `<\|image\|>` | 49171 | reserved modality |
+| `<\|audio\|>` | 49172 | reserved modality |
+| `<\|reserved_21\|>` | 49173 | reserved slot |
+| `<\|reserved_22\|>` | 49174 | reserved slot |
+| `<\|reserved_23\|>` | 49175 | reserved slot |
+| `<\|reserved_24\|>` | 49176 | reserved slot |
+| `<\|reserved_25\|>` | 49177 | reserved slot |
+| `<\|reserved_26\|>` | 49178 | reserved slot |
+| `<\|reserved_27\|>` | 49179 | reserved slot |
+| `<\|reserved_28\|>` | 49180 | reserved slot |
+| `<\|reserved_29\|>` | 49181 | reserved slot |
+| `<\|reserved_30\|>` | 49182 | reserved slot |
+| `<\|reserved_31\|>` | 49183 | reserved slot |
 
-Inspecting `tokenizer/tokenizer.json`, the `added_tokens` array contains exactly
-**14 entries, IDs 0–13** (`tokenizer.json:6-131`). The on-disk order — note that
-**`unk` is ID 3**, *before* the FIM tokens, and the order is verified against the
-file, not assumed:
+IDs are contiguous from 49,152 because the specials are appended to the
+SmolLM2 base in the order above. `eos` is 49,153 and `pad` is 49,154; both are
+wired as the tokenizer's designated tokens and picked up by `train_main`.
 
-| token | id | role | on disk? |
-|---|---|---|---|
-| `<\|padding\|>` | 0 | PAD — fills batched sequences to equal length; masked in loss | ✓ |
-| `<\|begin_of_text\|>` | 1 | BOS — prepended to every sequence (`add_bos_token=true`, `tokenizer_config.json:8`) | ✓ |
-| `<\|end_of_text\|>` | 2 | EOS — end of sequence / generation stop | ✓ |
-| `<\|unknown\|>` | 3 | unk — fallback (rarely hit; byte-level BPE almost never needs it) | ✓ |
-| `<\|fim_prefix\|>` | 4 | FIM prefix marker (fill-in-the-middle, for code infilling) | ✓ |
-| `<\|fim_middle\|>` | 5 | FIM middle marker | ✓ |
-| `<\|fim_suffix\|>` | 6 | FIM suffix marker | ✓ |
-| `<\|think\|>` | 7 | reasoning block **open** | ✓ |
-| `<\|/think\|>` | 8 | reasoning block **close** | ✓ |
-| `<\|answer\|>` | 9 | answer block **open** | ✓ |
-| `<\|/answer\|>` | 10 | answer block **close** | ✓ |
-| `<\|user\|>` | 11 | user turn | ✓ |
-| `<\|assistant\|>` | 12 | assistant turn | ✓ |
-| `<\|system\|>` | 13 | system prompt | ✓ |
-| `<\|end_turn\|>` | 14 | turn separator (ChatML-style) | ✗ **not on disk** |
-| `<\|tool_call\|>` | 15 | tool invocation open | ✗ **not on disk** |
-| `<\|/tool_call\|>` | 16 | tool invocation close | ✗ **not on disk** |
-| `<\|tool_result\|>` | 17 | tool result open | ✗ **not on disk** |
-| `<\|/tool_result\|>` | 18 | tool result close | ✗ **not on disk** |
-| `<\|image\|>` | 19 | reserved for vision retrofit | ✗ **not on disk** |
-| `<\|audio\|>` | 20 | reserved for future audio | ✗ **not on disk** |
-
-The first 14 also appear at the top of the `"vocab"` map with the same IDs
-(`tokenizer.json:236-250`), and the HF config wires the four scalar roles:
-`bos=<\|begin_of_text\|>`, `eos=<\|end_of_text\|>`, `pad=<\|padding\|>`,
-`unk=<\|unknown\|>` (`tokenizer_config.json:4-7`), with the rest declared as
-`additional_special_tokens` (`special_tokens_map.json:6-17`). This matches the
-hard-coded `special_tokens` list the trainer writes
-(`scripts/train_tokenizer.py:240-255`).
-
-### What the role tokens do
-
-- **FIM (4–6)** — *fill-in-the-middle*. For code training, a file is rearranged
-  as `prefix · suffix · middle` so the model learns to infill a hole given both
-  sides, not just left-to-right. The three markers delimit the spans.
-- **think / answer (7–10)** — the reasoning contract. The model is trained to
-  emit a private chain-of-thought between `<\|think\|>…<\|/think\|>` and the
-  user-facing answer between `<\|answer\|>…<\|/answer\|>`. Separating the two as
-  *tokens* lets training and decoding treat reasoning and answer differently
-  (e.g. score only the answer span).
-- **user / assistant / system (11–13)** — conversational role markers.
-
-### The chat template (open-only-tag convention)
-
-This project uses an **open-only-tag** style for role markers — a role tag opens
-a turn, and the *next* role tag (or `<\|end_turn\|>`) implicitly closes it. There
-are no `<\|/user\|>` / `<\|/assistant\|>` closers. The reasoning/answer blocks,
-by contrast, *do* have explicit close tags (`<\|/think\|>`, `<\|/answer\|>`),
-because their spans must be unambiguous. A single turn:
+### The chat contract (open-only-tag convention)
 
 ```
-<|system|>{system_message}
-<|user|>{user_question}
-<|assistant|><|think|>{reasoning}<|/think|><|answer|>{final_answer}<|/answer|>
+<|system|>{persona}<|user|>{question}<|assistant|><|think|>…<|/think|><|answer|>N<|/answer|><|end_turn|>
 ```
 
-This is the project's documented convention (`ARCHITECTURE.md:264-271`). The
-`<|think|>…<|/think|><|answer|>…<|/answer|>` structure is verified by the
-tokenizer's own round-trip self-test, which encodes exactly this string
-(`scripts/train_tokenizer.py:398-401`).
+Round-trips byte-identically through the tokenizer, and numbers inside the
+answer tags split per digit: `<|answer|>391<|/answer|>` →
+`<|answer|>·3·9·1·<|/answer|>`. That is the property the reward extraction
+and the arithmetic both depend on.
 
-> **Discrepancy — ARCHITECTURE.md §3.2 claims "IDs 21-31 reserved, real vocab
-> begins at id 32."** That is **false against the file**. On disk, ID 14 is the
-> literal character `"!"`, ID 15 is `"\""`, … the printable-ASCII run starts
-> *immediately* after the 14 special tokens (`tokenizer.json:251-298`). There is
-> **no gap of reserved IDs** at 14–20 or 21–31; ordinary byte/character tokens
-> occupy those slots. Trust the file: the real (non-special) vocabulary begins at
-> **ID 14**, not 32.
+## 4. Consequence for the model
 
----
-
-## 4. Consequence of the missing tokens (a real gotcha)
-
-IDs 14–20 in the table above — `end_turn`, `tool_call`/`/tool_call`,
-`tool_result`/`/tool_result`, `image`, `audio` — are the **v6 contract** the
-architecture *intends* to support, but they are **not in `tokenizer.json`**. This
-is not a cosmetic gap; it changes behavior:
-
-- A special token is atomic only if the tokenizer knows it. Because the string
-  `<|tool_call|>` is **not** a registered token, `tok.encode("<|tool_call|>")`
-  does **not** return a single ID — it falls through to byte-level BPE and gets
-  **shredded into fragments** (`<`, `|`, `tool`, `_`, `call`, `|`, `>`, or
-  similar). The model then sees a meaningless splatter of subwords instead of one
-  clean structural marker.
-- **Tool-use and multimodal training/inference will silently mis-tokenize**
-  until 14–20 are added. "Silently" is the dangerous part: nothing errors; the
-  tokens just don't mean what the data pipeline assumes, and the model can't
-  learn a crisp tool-call boundary.
-- Basic chat (`system`/`user`/`assistant`/`think`/`answer`) is unaffected —
-  those tokens (7–13) *are* on disk.
-
-There's a second wrinkle from §2's 32K/64K split. On disk, IDs 14–20 are
-**already occupied** by printable-ASCII tokens (`"!"`, `"\""`, …). So the seven
-contract tokens **cannot simply be slotted in at 14–20** without renumbering the
-entire vocabulary. Their natural home is the **currently-unused 32768–65535
-range** — exactly the dead band that exists because the embedding is 64K but the
-tokenizer is 32K. Adding them there would consume some of that headroom *and*
-keep every existing ID stable. (Whether the 32K/64K gap was left deliberately as
-that headroom is not documented in the code; this chapter only states what the
-files show.)
-
-**Practical guard:** before any tool-use or vision training, retrain/extend the
-tokenizer to register 14–20 (or place them in the 32768+ range) and add a
-contract test asserting e.g. `tok("<|end_turn|>")` returns a single ID
-(`ARCHITECTURE.md:229-230` recommends exactly this).
-
----
+There is no "missing tokens" gotcha in v7 — that section described v6's 32K
+on-disk artefact and is retired. What remains true: **the embedding matrix has
+49,280 rows, the tokenizer defines 49,184.** Rows 49,184–49,279 are padding —
+never looked up by any input, and sliced out of every logit before the loss
+(`real_vocab_size`). They sit at init forever and cost nothing but memory.
 
 ## 5. The embedding matrix
 
@@ -249,10 +169,10 @@ The embedding is a plain `nn.Embedding`:
 
 ```python
 # src/osrt/model.py:1237
-self.embedding = nn.Embedding(config.vocab_size, config.dim)   # 65536 × 1536
+self.embedding = nn.Embedding(config.vocab_size, config.dim)   # 49280 × 1536
 ```
 
-So the matrix is **65,536 × 1,536** (`vocab_size × dim`). The forward pass uses
+So the matrix is **49,280 × 1,536** (`vocab_size × dim`). The forward pass uses
 it as a lookup — one row per input token — to produce the loop-0 hidden state
 (`src/osrt/model.py:1351`, `x = self.embedding(input_ids)`).
 
@@ -266,7 +186,7 @@ logits = F.linear(hidden, self.model.embedding.weight)
 ```
 
 `F.linear(x, W)` computes `x @ Wᵀ`, so this projects the final `dim`-vector onto
-all 65,536 rows of the embedding and yields one logit per token — the inverse of
+all 49,280 rows of the embedding and yields one logit per row (sliced to 49,184 real tokens) — the inverse of
 the lookup, using the very same numbers. The class docstring states the intent
 plainly: *"LM head is weight-tied to embeddings (via `F.linear` with
 `embedding.weight`)"* (`src/osrt/model.py:1569`).
@@ -274,8 +194,8 @@ plainly: *"LM head is weight-tied to embeddings (via `F.linear` with
 #### Why tie, and the parameter saving
 
 If the input embedding and the output projection were **untied**, you would store
-**two** `65,536 × 1,536` matrices ≈ **201 M** parameters. Tying stores **one** and
-reuses it, **saving ≈ 100 M parameters** (`65,536 × 1,536 = 100,663,296`). For a
+**two** `49,280 × 1,536` matrices ≈ **151 M** parameters. Tying stores **one** and
+reuses it, **saving ≈ 76 M parameters** (`49,280 × 1,536 = 75,694,080`). For a
 ~601 M-parameter model that is the difference between spending ~16.6 % vs ~33 % of
 the budget on the I/O interface alone — params that are far better spent on the
 recursive MoE blocks.
@@ -302,7 +222,7 @@ before cross-entropy:
 shift_logits = logits[..., :-1, :self.config.real_vocab_size]
 ```
 
-`real_vocab_size` is also `65536` in the preset (`presets.py:28`). This slice is
+`real_vocab_size` is `49184` in the preset — 96 below `vocab_size`. This slice is
 the hook that *would* let you compute logits over the full padded vocab but only
 score the "real" prefix of it — useful if the embedding were padded beyond the
 true vocabulary for alignment. Here they are equal, so the slice is a no-op, but
@@ -374,7 +294,7 @@ Counts come from `scripts/compute_budget.py`, which instantiates the canonical
 
 ### The exact numbers
 
-- **Token-embedding matrix**: `65,536 × 1,536 = 100,663,296` parameters. This is
+- **Token-embedding matrix**: `49,280 × 1,536 = 75,694,080` parameters (`compute_budget.py` reports 75,721,728 for the category, which also catches 18 small per-layer vectors). This is
   the one tensor that serves both the input lookup and (tied) the LM head.
 - **`compute_budget.py` "embedding" line**: **100,690,944**. This is *slightly
   larger* than the matrix itself — by exactly **27,648 = 3 × 6 × 1,536**.
@@ -398,14 +318,15 @@ the vocabulary — the actual token-embedding matrix is exactly **100,663,296**.
 > Take-away: cite **100,663,296** for the token-embedding/tied-LM-head matrix.
 > The **100,690,944** figure is `compute_budget.py`'s embedding line, which also
 > sweeps in the 3× loop embeddings (`+27,648`). The product in some notes that
-> reads "65,536 × 1,536 = 100,690,944" is arithmetically wrong; the true product
+> (v6 history — the v7 matrix is 49,280 × 1,536 = 75,694,080.) The v6 note that
+> read "65,536 × 1,536 = 100,690,944" was arithmetically wrong; the true product
 > is 100,663,296.
 
 ### Share of the model — the embedding tax
 
 Against the preset's **~601M physical** parameters
 ([`00-overview.md`](00-overview.md), from `compute_budget.py`), the token
-embedding is **≈ 16.6 %** of the model (`100,663,296 / 601,444,393`). (The
+embedding is **≈ 7.8 %** of the model (`75,694,080 / 968,468,355`) — down from 16.6% in v6, because the vocab shrank while the experts grew. (The
 "embedding" *budget line*, 100,690,944, is ~16.7 %; ARCHITECTURE.md §4.1 quotes
 16.9 % against an older total. The spread is just numerator/denominator choice.)
 
@@ -434,7 +355,7 @@ choice of a 64K (not 128K+) vocabulary is the other half of the same bet.
 ## Summary
 
 - The **tokenizer** is byte-level BPE (`train_tokenizer.py:233-237`); the
-  **embedding** is a single `65,536 × 1,536` matrix (`model.py:1237`),
+  **embedding** is a single `49,280 × 1,536` matrix,
   **weight-tied** as the LM head (`model.py:1658`), saving ~100M params.
 - **Embedding tax ≈ 16.6 %** of ~601M physical — the LFM2 "params into blocks"
   regime, far from Gemma-3-270M's ~63 % embedding catastrophe.

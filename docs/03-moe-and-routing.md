@@ -1,11 +1,12 @@
 # MoE & Routing
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 *Part of the OSRT-605M `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
@@ -36,7 +37,7 @@ them. The parameter *count* grows (you store all experts), but the per-token
 *compute* stays small because each token touches only a few.
 
 OSRT takes the **DeepSeekMoE hybrid** shape: one *shared* expert that every
-token always runs, plus a pool of *routed* experts of which only the top-2
+token always runs, plus a pool of *routed* experts of which only the top-4
 fire per token.
 
 ```python
@@ -64,7 +65,7 @@ For the OSRT-605M preset (`presets.py:22-64`) the numbers are:
 | Component       | Count | Hidden (`h`) | Active per token        |
 |-----------------|-------|--------------|-------------------------|
 | Shared expert   | 1     | 2,816        | always                  |
-| Routed experts  | 8     | 3,840        | top-2 (25% of the pool) |
+| Routed experts  | 28    | 2,112        | top-4 (14.3% of the pool) |
 
 ---
 
@@ -82,7 +83,9 @@ unconditionally. The routed experts are then free to specialise on what's
 left, and the model always has a dense backbone to fall back on.
 
 In OSRT the shared expert is *narrower* than each routed expert
-(`h=2,816` vs `h=3,840`). That is a budget decision — the 8 wide routed
+(`h=2,816` vs `h=2,112` in v7 — note the **inversion**: the shared expert is now
+*wider* than any single routed expert, where in v6 it was narrower than the
+8 × h3,840 routed pool). That was a v6 budget decision — the 8 wide routed
 experts are where the parameters (and the specialisation capacity) live; the
 shared expert is a lean always-on floor.
 
@@ -90,7 +93,7 @@ shared expert is a lean always-on floor.
 > `expert_hidden=2048` and `shared_expert_hidden=4096`
 > (`config.py:80-81`) — i.e. the shared expert is *wider*. That is **not**
 > the trained model. The preset overrides both
-> (`expert_hidden=3840`, `shared_expert_hidden=2816`,
+> (`expert_hidden=2112`, `shared_expert_hidden=2816`,
 > `presets.py:33-34`), making the routed experts wider, as intended.
 
 The shared/routed split also maps onto a two-level gating scheme (§11): the
@@ -100,7 +103,16 @@ a real OSRT failure mode (§12).
 
 ---
 
-## 3. The expert FFN: SwiGLU with a stability clamp
+## 3. The expert FFN: SiTU-GLU (v7 default) over SwiGLU-with-clamp
+
+> **v7:** `OSRT_V7` sets `situ_glu=True`. SiTU-GLU (Kimi K3 §2.3.2) applies the
+> smooth cap `β·tanh(x/β)` to the linear factor of the Swish gate and
+> independently to the up branch — bounding the same tails the hard clamp
+> bounds, but with nonzero gradient past the cap, and no parameters. The
+> `situ` branch **returns before** the clamp is reached, so `swiglu_clamp=10.0`
+> stays in the preset as the G3 ladder's SiTU-vs-clamp fallback and is inert
+> in the shipped model. The SwiGLU-plus-clamp description below is that
+> fallback path and v6's behaviour.
 
 Both kinds of expert are the same module, `ExpertFFN` — a standard SwiGLU
 feed-forward block with an optional clamp:
@@ -145,12 +157,13 @@ A few things worth teaching here:
   tensor-core alignment. Both preset widths (3,840 and 2,816) are already
   multiples of 64, so nothing changes for OSRT-605M.
 
-Shapes per routed expert (preset): `w_gate, w_up ∈ ℝ^(1536×3840)`,
-`w_down ∈ ℝ^(3840×1536)`.
+Shapes per routed expert (preset): `w_gate, w_up ∈ ℝ^(1536×2112)`,
+`w_down ∈ ℝ^(2112×1536)` — 9,732,096 params per expert; `h2112 = 33 × 64`
+so it survives the tensor-core round-up in `ExpertFFN` unchanged.
 
 ---
 
-## 4. The router: `sqrt(softplus)` affinity, top-2, gate renormalisation
+## 4. The router: `sqrt(softplus)` affinity, top-4, gate renormalisation
 
 The router is a single bias-free linear layer that turns a hidden state into
 one score per routed expert. Before projecting, OSRT adds a **per-loop
@@ -192,7 +205,7 @@ Why `sqrt(softplus(·))` instead of a plain `softmax`?
 
 **Top-2 selection and gate renormalisation.** The selection scores
 (`probs`, the bias+Gumbel affinity normalised to sum to 1) are sorted and the
-top-2 are taken. The chosen gates are then **renormalised to sum to 1**:
+top-4 are taken. The chosen gates are then **renormalised to sum to 1**:
 
 ```python
 # model.py:599-616
@@ -202,7 +215,7 @@ top_probs = raw_top_probs / raw_top_probs.sum(dim=-1, keepdim=True).clamp_min(1e
 ```
 
 This renormalisation matters. Without it, the MoE branch magnitude would
-depend on how confident the router happened to be: a token whose top-2
+depend on how confident the router happened to be: a token whose top-4
 affinities summed to 0.4 would get a weaker FFN contribution than one summing
 to 0.9, for no good reason. Forcing the `k` chosen gates to sum to 1 keeps the
 routed branch at a consistent scale regardless of `k` or router sharpness
@@ -210,13 +223,41 @@ routed branch at a consistent scale regardless of `k` or router sharpness
 
 ---
 
-## 5. Load balancing: a non-learned bias + Switch loss + z-loss
+## 5. Load balancing: Quantile Balancing (v7) + Switch loss + z-loss
+
+### 5.0 Quantile Balancing — the v7 controller
+
+`router_balance_mode="quantile"` (Kimi K3). For target selection fraction
+`p = top_k / num_routed = 4/28`, every eval interval the controller finds, per
+(loop, expert), the score threshold `t_e` with exactly `p` of *that expert's
+own* score mass above it, then sets
+
+    bias_e = mean(t) − t_e
+
+so every expert presents the same share of its distribution above the common
+selection threshold and load equalises **in one solve**. Deterministic: no
+update rate, no EMA, no clamp target to tune. The biases are centred so they
+cannot drift.
+
+Why it is *required* at v7's granularity, not optional (roadmap §14.6): the
+±γ heuristic below was tuned at E=8. At E=28 it has 3.5× as many biases to
+move with 3.5× less load signal per expert, and one dead expert is 3.6% of
+block capacity — small enough to hide in the loss curve. QB is a solve, not an
+integrator: a repeat with the same evidence reproduces itself (tested).
+
+Implementation: a histogram of the **pre-bias** router score per (loop,
+expert), `router_qb_histogram_bins=2048` over `[−8, 8]`, accumulated during
+training steps and read off at the balance update. Telemetry logs
+`moe/b*/loop*/bias_std`, `bias_range` and `bias_loop_spread` — a per-loop
+spread that keeps growing is the routing analogue of residual explosion
+(roadmap §17.3, §18.2).
+
+### 5.1 The v6 heuristic bias (retained as `router_balance_mode="heuristic"`)
 
 Left alone, a top-k router collapses: a few lucky experts win early, get more
 gradient, win more, and the rest go cold. OSRT fights this on **three**
 fronts.
 
-### 5.1 The aux-loss-free balance bias
 
 A persistent additive **bias buffer**, shaped `[num_loops, num_routed]`,
 steers *which* experts get selected without touching the router's gradient:
@@ -351,7 +392,11 @@ retain gradient through LR warm-up. Coefficient `router_z_loss_coeff=1e-3`
 (`presets.py:56`). Like the balance loss, it is computed on the **raw**
 logits so it disciplines the learned router, not the controller or the noise.
 
-### 5.5 Sequence-wise balance loss (off by default)
+### 5.5 Sequence-wise balance loss (on at 1e-4 in v7)
+
+> `OSRT_V7` sets `router_seq_balance_loss_coeff=1e-4` — DeepSeek-V4 runs
+> exactly this beside its aux-loss-free bias (roadmap §12.2). `OSRTConfig`
+> still defaults to 0.0 for v6 reproduction.
 
 There is also a per-sequence Switch loss (`model.py:665-683`) that penalises
 imbalance *inside* a single sequence — useful at long context where one
@@ -401,7 +446,7 @@ deterministic router (`model.py:585-588`). Two consequences:
 
 ## 7. Dispatch: grouped-GEMM (default) vs the per-expert loop (fallback)
 
-Once the top-2 experts and their renormalised gates are chosen, the tokens
+Once the top-4 experts and their renormalised gates are chosen, the tokens
 have to actually be *run through* the chosen experts. OSRT ships **two
 numerically-equivalent dispatch implementations**, selected by the
 `moe_grouped_gemm` flag (`config.py:88`). The canonical preset turns the
@@ -648,7 +693,7 @@ def effective_moe_gate(self):
 
 So there are **two levels of gating**:
 
-1. *Inside* `MoELayer`: per-token, renormalised top-2 gates that mix the
+1. *Inside* `MoELayer`: per-token, renormalised top-4 gates that mix the
    chosen routed experts (§4).
 2. *Outside*, in the `Block`: a per-block scalar that scales the whole routed
    contribution relative to the always-full-weight shared branch.
@@ -677,14 +722,14 @@ cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
   routed_experts      424,673,280
   router                   36,867
   ...
-  TOTAL PHYSICAL      601,444,393  (~601M)
-  ACTIVE / TOKEN      278,217,769  (~278M, 46.3% of physical, excl. MTP)
+  TOTAL PHYSICAL      968,468,355  (~968M)
+  ACTIVE / TOKEN      263,035,779  (~263M, 27.2% of physical, excl. MTP)
 ```
 
 Takeaways:
 
 - **Routed experts (424.67M) are ~71% of the physical model** — the dominant
-  term — yet only **top-2 of 8 = 25% of them** are active per token. That is
+  term — yet only **top-4 of 28 = 14.3% of them** are active per token. That is
   the whole MoE bargain: store a lot, compute a little.
 - The **shared expert is 38.93M** and the **router is tiny (36,867 params)** —
   routing is nearly free; the cost is in the experts.
@@ -716,7 +761,7 @@ The MoE block is shaped by hard lessons from earlier OSRT iterations
 - **Expert starvation / under-utilisation** (cold experts that never learn).
   Guarded by Gumbel exploration keeping losers warm (§6), orthogonal init
   giving each expert a distinct starting subspace (§9), and the choice of
-  **8 routed experts instead of 12** so top-2 yields denser routing (25% vs
+  **28 routed experts at h2112, top-4** (the §14 re-grain; v6 had 8 × h3840 top-2). Chosen over 14 × h4224 top-2 — identical params and active — because 14 larger experts would *reverse* the fine-graining requirement, and over 56 × h1088 top-8 because that doubles the GEMMs per token at batch-1 decode for the same bytes. MoEUT (roadmap §17.2) finds the smallest expert size wins at fixed active compute, so the finer slice remains a live ladder question. The recursion makes fine-graining unusually affordable here: weight reuse means each expert sees the token stream six times, so per-expert exposure only halves (2.80B → 1.60B tokens over a 5.6B run) despite 3.5× the experts. (Original v6 note follows:) 8 routed experts instead of 12 so top-2 yields denser routing (25% vs
   16.7%) — more capacity per token, less idle capacity at 601M scale
   (`presets.py:31`, `ARCHITECTURE.md §7.1`).
 

@@ -1,11 +1,12 @@
 # Quantization & Deployment
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how a
@@ -26,7 +27,7 @@ is labelled IMPLEMENTED or PLANNED, and section 7 has the full table. Where the
 code and the spec disagree, the code wins and the discrepancy is flagged.
 
 A naming note. The `docs/` series brands the model **OSRT-605M**;
-`compute_budget.py` reports **601,444,393 physical parameters** ("~601M"); and
+`compute_budget.py` reports **968,468,355 physical parameters** ("~968M"); and
 `ARCHITECTURE.md §2.5` brands it "OSRT-600M". These are the same model — the
 suffix is a round marketing label, not a precise count. This document uses the
 exact figure **601M physical** for all memory math.
@@ -37,12 +38,12 @@ exact figure **601M physical** for all memory math.
 
 OSRT is a mixture-of-experts model. Its *physical* parameter count (601M) is
 large because it stores many routed experts, but only a fraction
-(~278M, 46%) is *active* per token — the router picks the top-2 of 8 experts per
-MoE block (`compute_budget.py` reports `ACTIVE / TOKEN 278,217,769`). That gap
+(~263M, 27%) is *active* per token — the router picks the top-4 of 28 experts per
+MoE block (`compute_budget.py` reports `ACTIVE / TOKEN 263,035,779`). That gap
 is the whole point of MoE: lots of stored knowledge, cheap per-token compute.
 
 But "cheap compute" does not mean "cheap memory". On a phone or a Pi, **every
-stored weight has to live in RAM** (you cannot fault a top-2 expert in from disk
+stored weight has to live in RAM** (you cannot fault a top-4 expert in from disk
 at decode latency without an inference system that explicitly pages — see §6).
 At bf16, 601M params is ~1.2 GB of weights alone, before the KV cache and
 activations. That is too big for a comfortable mobile resident set.
@@ -75,8 +76,8 @@ The real per-component parameter breakdown, straight from
   mtp_heads             4,721,664    ( 0.8%)   ← DROPPED at deploy
   norms_misc                7,680
   ----------------------------------------------
-  TOTAL PHYSICAL      601,444,393    (~601M)
-  ACTIVE / TOKEN      278,217,769    (~278M, 46.3% of physical, excl. MTP)
+  TOTAL PHYSICAL      968,468,355    (~968M)
+  ACTIVE / TOKEN      263,035,779    (~263M, 27.2% of physical, excl. MTP)
 ```
 
 Two things to read off this table.
@@ -377,7 +378,7 @@ footprint of `ARCHITECTURE.md §15.3`, pull these levers in priority order
    tuning.
 
 A fourth, *system-level* lever: **active-only resident loading.** Load just the
-top-2 routed experts per layer into RAM and page the rest from disk/CPU. This is
+top-4 routed experts per layer into RAM and page the rest from disk/CPU. This is
 an *inference-system* choice, not a *weight* choice — it changes the resident
 set, not the file size — so state the assumption explicitly when you quote a
 number that depends on it (`ARCHITECTURE.md §14.2`).
@@ -476,3 +477,31 @@ imports (`fused_ce`, `hra`, `muon`) are **not auto-copied** by
   `ARCHITECTURE.md §2.1`; HRA adapters `docs/04-hra-adapters.md`; routed experts
   `docs/03-moe-and-routing.md`.
 - **Full memory math at inference:** `ARCHITECTURE.md §15.3`.
+
+## Precision on Blackwell — what stock PyTorch actually offers (v7, roadmap §17.1)
+
+The deployment target is the **RTX PRO 6000 Blackwell** (GB202, sm_120, 96GB),
+occasionally B200. Its FP4/FP8 tensor cores are the reason the roadmap
+un-rejected low-precision pretraining (§13.3). Three primary sources settle
+what that buys for *this* model in stock PyTorch:
+
+| path | dtype available | source |
+|---|---|---|
+| `torch.nn.functional.grouped_mm` — the routed-expert path, **84% of params** | **bf16 only** ("expected to be `torch.bfloat16` … SM≥80") | PyTorch docs |
+| FP8 grouped (`_scaled_grouped_mm`) on Blackwell | open issue since June 2025, scoped to SM100, **no sm_120** | pytorch#156238 |
+| NVFP4 grouped | **explicitly unsupported**; workaround is one `_scaled_mm` per expert at ~3.1× overhead | pytorch#187095 |
+
+So the expert path is bf16 on the target card unless a third-party grouped
+kernel is adopted (CUTLASS block-scaled grouped NVFP4; FlashInfer's
+Blackwell-only FP8 grouped GEMM; DeepGEMM). The NVFP4 throughput case survives
+for attention and the dense paths only. `grouped_mm` becoming a *public* API
+does retire the "private `_grouped_mm`" portability risk the July review
+flagged.
+
+**Decode is not bandwidth-bound anyway.** At 263M active in bf16 a decode step
+moves ~0.53 GB; on a ~1.8 TB/s card that is a ~3,400 tok/s ceiling against
+~136 measured (§13.4) — about 4% of roofline. FP4 *weights* therefore do not
+speed decode much; their value is footprint and training throughput. What
+binds decode is sequential depth (18 effective layers) and launch count, which
+is why the loop-count recommender (ch.08) and a persistent megakernel outrank
+weight quantization on the §13.5 lever list.

@@ -1,11 +1,12 @@
 # Recursion: Depth Recurrence, Loop Embeddings & Loop Aux
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
@@ -551,3 +552,40 @@ surviving many iterations without blowing up.
   `aux_loop_loss_weight = 0`, the architecture has nothing forcing intermediate
   loops to work, and `ARCHITECTURE.md §16.1` explicitly mandates monitoring for
   collapse in that regime. The 0.05 operating value is load-bearing.
+
+## Prior art, and what the recursion is actually up against (v7)
+
+Two 2024–2026 papers bear directly on this chapter and neither was known when
+v6 was designed. Both are read in full in roadmap §17.
+
+**MoEUT** (Csordás et al., NeurIPS 2024) is shared-layer recurrence plus sparse
+MoE — this architecture's family — at 44M to 1.04B. It does *not* share a
+single layer; it groups: *"G=2 below 300M, G=3 at 319M, G=4 for larger."*
+OSRT's 3 physical blocks are G=3, MoEUT's choice at 319M. At 968M their schedule
+says **G=4**, which is why ladder arm `g4` (4 blocks × 5 loops, matched total
+and compute within 2%) exists. Their stacking result also matters: the
+alternating *"ABAB…"* pattern *"dramatically outperforms"* *"AABB…"* — OSRT's
+per-loop ABC·ABC·… is the good pattern. MoEUT differentiates loops by
+grouping alone; OSRT adds per-loop HRA adapters (ch.04). Whether the adapters
+add anything *given* grouping is ladder arm `nohra`.
+
+**Fully Looped Transformer** (Fu et al., May 2026) trains looped models with
+Muon at OSRT's exact lr/momentum and finds **residual explosion** that grows
+with loop count — and the line that matters: *"Despite all models already
+incorporating RMSNorm in each layer to regulate output residual states,
+residual explosion still occurs."* Per-layer norm alone is insufficient.
+MoEUT's peri-layernorm targets the same mechanism (*"conflicting learning
+targets for shared weights"* under pre-LN). Three groups, one failure mode.
+
+**What v7 does about it.** Two fail-closed early-stop criteria run at every
+eval: `min_loop_update_norm` (a deep loop whose `‖Δx‖/‖x‖ → 0` has collapsed
+to a no-op) and `max_loop_hidden_norm_ratio` (the residual stream growing
+across the recursion — explosion). Plus the QB bias-spread telemetry, which
+is the *routing* analogue. Defaults are loose because OSRT's own cross-loop
+probe measured a **contracting** iteration (CKA movement 0.30 → 0.17 → 0.07 →
+0.05 → 0.05), the opposite of explosion — so the existing stack (sandwich norm
++ aux loop losses + loop dropout + HRA) may already suffice at 6 loops. It is
+watched, not assumed. Peri-layernorm and attention injection are the next
+ladder arms if it fires (roadmap §18.2).
+
+**How many loops at inference** is now a tool, not a guess — see ch.08.

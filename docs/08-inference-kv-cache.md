@@ -1,11 +1,12 @@
 # Inference, KV Cache & Speculative Decoding
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
@@ -73,7 +74,7 @@ past_key_values = cast("PastKV | None", out.past_key_values)
 ```
 (`src/osrt/model.py:1917-1919`)
 
-Note the prompt is left-truncated to `max_position_embeddings` (4096 in the
+Note the prompt is left-truncated to `max_position_embeddings` (**8192** in v7 — raised from 4096 because the anneal phase trains at seq 8192 and RoPE tables are built to this length; the *deployment* target is still 4K,
 shipped `configs/osrt-605m-a279m/config.json`) before prefill. Prefill is the
 expensive, parallel phase: all prompt positions are processed at once, and it
 seeds the cache for every effective layer. The logits at the *last* prompt
@@ -214,7 +215,7 @@ exactly **half**. `ARCHITECTURE.md` §13.2-13.3 works the numbers: at BF16 the
 K-only baseline is 18 layers × 512 × 2 bytes = **18 KB/token**, vs ~36 KB/token
 for K+V. (`ARCHITECTURE.md` §13.2's worked examples quote an 8K context and an
 `eos_token_id` of 1 from an earlier draft; the shipped 605M config uses
-`max_position_embeddings=4096` and `eos_token_id=2`, so treat those §13.2/§12.1
+`max_position_embeddings=8192` and `eos_token_id=49153` in v7, so treat the §13.2/§12.1
 constants as illustrative, not as the deployed values.)
 
 ---
@@ -630,3 +631,25 @@ text as greedy decode, fewer expensive forwards.
 - `ARCHITECTURE.md` §6 (attention), §12 (inference), §13 (KV cache).
 - `src/osrt/model.py` — `generate()` (1841), `_generate_speculative()` (2075),
   `_attention()` (979), `OSRTModel.forward()` cache loop (1461).
+
+## How many loops at decode? — the three-signal recommender (v7)
+
+Decode is depth-bound, not bandwidth-bound (roadmap §13.4: ~4% of the
+weight-bandwidth roofline), so the loop count is the largest single latency
+lever. `scripts/recommend_loop_count.py` reads the cross-loop probe's JSON and
+recommends the smallest K such that every loop beyond K is idle on **three
+independent signals from the same forward**:
+
+1. KV move `1 − CKA(k, k+1)` — the latent stopped rotating
+2. residual write `‖Δx‖/‖x‖` — the layer stopped writing
+3. routing-entropy drift — the router stopped re-deciding
+
+All three are required. On v6's own probe data the tool said **do not trim**:
+KV move contracted 0.24 → 0.03, but the residual write stayed at 0.3–0.5
+through loops 4–6. CKA alone had suggested loops 5–6 were idle; the layer was
+still writing. That correction is the reason the design uses three signals,
+and it landed on the tool's first use (roadmap §18.3). Run it on any v7
+checkpoint:
+
+    PYTHONPATH=src python scripts/probe_cross_loop_kv.py --ckpt <ckpt> --out probe.json
+    python scripts/recommend_loop_count.py probe.json

@@ -53,7 +53,7 @@ deliberately quotes no number that the script does not generate.
 ## Status
 
 The **architecture is implemented** in `src/osrt/`. 144 unit tests pass,
-and the `dummy_train` / `sanity_overfit` CPU smoke tests confirm the full
+and the CPU suite (239 tests) plus `sanity_overfit` / `dummy_train` confirm the full
 stack trains and learns without MoE/loop collapse. GPU bring-up has begun:
 the attention sink was **dropped** in favour of flash
 `F.scaled_dot_product_attention` (the manual sink path OOMed at seq 8192;
@@ -61,6 +61,43 @@ flash fits — `presets.py:47-54`), and **grouped-GEMM MoE** is on
 (`moe_grouped_gemm=True`, validated on H100 to track the loop path,
 dropless, ~9-12% faster — `presets.py:55-60`). Fused cross-entropy and
 gradient checkpointing are wired and mandatory for the fit.
+
+## Where v7 stands (2026-09-01)
+
+**Design committed, run pending, gates deliberately skipped.** Every choice
+and the alternative declined is in
+[`specs/2026-08-11-v7-roadmap.md` §19](specs/2026-08-11-v7-roadmap.md); every
+bet has a named falsifier there. Read results against §19, not against a story
+assembled afterwards.
+
+| decided | value | where |
+|---|---|---|
+| shape | 28 × h2112 routed, top-4, 3 blocks × 6 loops | §14 |
+| tokenizer | OSRT-Ostinato — SmolLM2 base + 32 specials, 49,184 real / 49,280 rows | §16 |
+| residual stream | plain; mHC removed | §12.3 |
+| balance controller | Quantile Balancing (one-shot, per-loop) | §14.6, ch.03 |
+| expert activation | SiTU-GLU (smooth cap; hard clamp inert) | ch.03 |
+| optimizer | Muon, V4 recipe: 8 fast + 2 stabilising NS, update-RMS 0.18, per-head | ch.07 |
+| schedule | WSD, 15% decay aligned to the anneal phase | ch.07 |
+| budget | 17,500 steps ≈ 5.28B tokens, sized on **active** params | §14.8 — the bet |
+| precision | bf16 throughout — grouped GEMM is bf16-only in stock PyTorch | §17.1 |
+| context | 4K deployment target, 8K capability (anneal phase trains at 8192) | ch.08 |
+
+| still open | status | instrument |
+|---|---|---|
+| G3a — does the token requirement track active or total? | unrun; MoEUT prior says total helps with diminishing returns | ladder arms a/b/c/dense |
+| G4 — 3×6 vs 4×5 blocks | unrun; MoEUT prior says G=4 at this scale | arm g4 |
+| E1 — do per-loop adapters beat grouping? | unrun; iso-compute to the parameter | arm nohra |
+| E2 — Muon + QB stability under recurrence | instrumented on every run | telemetry, §18.2 |
+| E3 — how many loops at decode? | tool built; on v6 it said "do not trim" | `scripts/recommend_loop_count.py` |
+
+**To run:** [`../RUNBOOK.md`](../RUNBOOK.md). One command per venue; the collapse
+detectors are the sanity checks and run during the run.
+
+**Prior art, stated plainly:** MoE + depth recurrence is
+[MoEUT](https://arxiv.org/abs/2405.16039) (NeurIPS 2024). OSRT's three-way
+combination with Muon is an engineering conjunction, not an architectural
+novelty (§17.2). The three experiments above are what it can actually own.
 
 ## How a token flows through the model
 

@@ -1,11 +1,12 @@
 # Optimizer: Muon + AdamW Hybrid
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains the
@@ -130,12 +131,38 @@ _NS_COEFFS = (3.4445, -4.7750, 2.0315)   # (a, b, c)
 _DEFAULT_NS_STEPS = 5
 ```
 
-So `a = 3.4445`, `b = -4.7750`, `c = 2.0315`, and **five** iterations by default.
+So `a = 3.4445`, `b = -4.7750`, `c = 2.0315`, and **five** iterations in v6 (**eight, then two stabilising**, in v7 — see below).
 Note `a > 1` and `b < 0`: this is *not* a contraction toward zero — it is a
 carefully shaped map whose fixed point is "all singular values = 1". The file
 notes five steps is enough for bf16 gradients in practice (matches the
 modded-nanoGPT speedrun); ten steps gives marginally cleaner orthogonality at
 twice the cost (`src/osrt/muon.py:48-50`).
+
+### The V4 recipe — v7's default (8 fast + 2 stabilising, update-RMS 0.18)
+
+`PretrainConfig` now ships DeepSeek-V4's Muon recipe (roadmap §12.2, verified
+against the V4 report; §14.1 item 1.3):
+
+| field | v6 | **v7** | what it does |
+|---|---|---|---|
+| `muon_ns_steps` | 5 | **8** | fast quintic iterations with `(3.4445, −4.7750, 2.0315)` |
+| `muon_ns_stable_steps` | 0 | **2** | trailing passes with `(2.0, −1.5, 0.5)` — a contraction that polishes orthogonality without the fast coefficients' overshoot |
+| `muon_update_rms` | shape heuristic | **0.18** | rescale the orthogonalised step to a fixed RMS, replacing `max(1, rows/cols)^0.5` |
+| `per_head_muon` | off | **on** | orthogonalise each attention head's block separately (Kimi K3 §2.5; GLM-5's "Muon Split" credits this for Muon+MLA matching GQA) |
+
+Two independent validations at OSRT-adjacent scale: the Fully Looped
+Transformer (roadmap §17.3) trains a *looped* model with Muon at exactly this
+lr 0.02 / momentum 0.95 split, and QK-Normed MLA (§12.2) shows QK-norm — OSRT's
+choice — beating QK-clipping at 400M / 100B tokens. Muon is `newton_schulz_v4`
+in `muon.py`; the 5-step path is retained as `newton_schulz5` for reproducing
+v6.
+
+**Telemetry (roadmap §18.2).** Every step the optimizer records
+`muon/update_rms_pre` (the momentum-blended update Muon receives) and
+`muon/update_rms_post` (after Newton–Schulz, before scaling); on logged steps
+it also computes `muon/ortho_err = ‖O Oᵀ − I‖_F / √k` — whether 8+2 iterations
+actually converge. A rising `ortho_err` is the first sign the recipe is
+mis-sized for a matrix shape.
 
 ### Two preconditions before iterating
 
@@ -412,7 +439,16 @@ adamw = torch.optim.AdamW(adamw_groups, lr=train_cfg.peak_lr,
 optimizer = HybridMuonAdamW(muon, adamw)
 ```
 
-### Two learning rates, one schedule
+### Two learning rates, one schedule — now WSD, not cosine
+
+> **v7 (roadmap item 0.2):** `lr_schedule="wsd"` — warmup, a flat stable phase,
+> then linear decay over the last `wsd_decay_frac=0.15` of the run. The stable
+> phase is the point: this project trains in drip-funded chunks, and under
+> cosine every extension either re-warmed or reshaped the curve mid-run. WSD
+> lets a run stop and resume anywhere in the trunk at zero cost; only the
+> release branch pays the decay. The decay is asserted to start exactly where
+> the *anneal* data phase starts — LR decay and high-quality data both belong
+> to the branch (§7.5.2). Cosine is retained for reproducing v6 runs.
 
 Muon's effective step is much smaller-magnitude than AdamW's per-parameter scale
 (the NS update is normalised), so **Muon uses a much larger LR** — roughly 30–50×
@@ -428,7 +464,7 @@ knobs so you can A/B Muon without touching the AdamW/Lion peak. Pretrain default
 | AdamW `betas` / `eps` | `(0.9, 0.95)` / `1e-8` | `train.py:772-773` |
 | Muon `momentum` / `nesterov` | `0.95` / `True` | `train.py:765-766` |
 
-Both LRs ride the **same cosine-with-warmup shape** but to their own
+Both LRs ride the **same schedule** (WSD in v7, cosine in v6) but to their own
 peak/floor. Each group is tagged with `_peak_lr` / `_min_lr` at construction
 (`src/osrt/train.py:776-782`), and `_set_param_group_lrs`
 (`src/osrt/train_config.py:57-93`) writes the per-group LR each step, honouring
@@ -459,7 +495,7 @@ in lockstep.
 
 ## Summary
 
-- Muon orthogonalises the SGD-momentum update via a 5-step Newton-Schulz quintic
+- Muon orthogonalises the SGD-momentum update via Newton-Schulz — 5 fast steps in v6; 8 fast + 2 stabilising with update-RMS 0.18 in v7 (the V4 recipe)
   in bf16 (`coeffs (3.4445, -4.7750, 2.0315)`), projecting onto the Stiefel
   manifold so every singular direction gets an equal step. ~2× compute
   efficiency, < 1 % FLOP overhead.

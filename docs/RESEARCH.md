@@ -30,6 +30,11 @@ and what we adopted (vs deferred or rejected).
 15. [Other named references](#15-other-named-references)
 
 ---
+- [6. MoEUT — Mixture-of-Experts Universal Transformers](#6-moeut--mixture-of-experts-universal-transformers-csordás-et-al-neurips-2024)
+- [7. Fully Looped Transformer](#7-fully-looped-transformer-fu-et-al-may-2026)
+- [8. Scaling Laws for Fine-Grained MoE](#8-scaling-laws-for-fine-grained-moe-krajewski-et-al-icml-2024)
+- [9. DSpark — speculative decoding](#9-dspark--confidence-scheduled-speculative-decoding-deepseek-july-2026)
+- [10. GLM-5.3-Flash](#10-glm-53-flash-zhipu-announcement-aug-2026)
 
 ## 1. Muon optimizer
 
@@ -814,3 +819,126 @@ summarized:
 - **2026-06-09** — §12 updated to the implemented math-first
   Nemotron/Cosmopedia pretrain mix (`train_config.py`); recorded the
   drop of codeparrot-clean + Wikipedia from the v6 base mix
+
+## 6. MoEUT — Mixture-of-Experts Universal Transformers (Csordás et al., NeurIPS 2024)
+
+arXiv:2405.16039. Shared-layer recurrence + sparse MoE, 44M–1.04B. **The
+closest prior art to OSRT that exists**, and it predates v6 by eighteen months.
+
+### Key idea
+Recover the parameter count that layer-sharing loses by making the shared
+layers MoE (σ-MoE, d_expert=128, hundreds of experts) in both FFN and
+attention; group layers (G=2–4) rather than share a single one; **peri-
+layernorm** — norm only before linear layers feeding a sigmoid/softmax.
+
+### Findings
+- Beats dense at every scale on fewer MACs (C4 ppl 1.04B: 10.90 vs 11.15).
+- Fig. 14: *"Increasing the number of experts always helps, but the returns
+  diminish"* at fixed active compute. Fig. 13: *"The smallest expert size
+  performs the best."*
+- G=1 (single shared layer) underperforms; G=2 <300M, G=3 at 319M, G=4 above.
+  Alternating ABAB stacking *"dramatically outperforms"* AABB.
+- Pre-LN fails for shared weights: later layers must emit larger outputs to
+  offset residual growth — *"conflicting learning targets for shared weights."*
+- σ-MoE's regulariser *"sometimes causes loss explosion"* until applied
+  within-sequence.
+
+### What we adopted / what it changed
+- Withdrew the "no released model combines MoE + recurrence" claim (roadmap
+  §17.2). OSRT's novelty is the three-way conjunction with Muon — engineering,
+  not architecture.
+- Strong prior for G3a (total helps, diminishing); literature prior for G4
+  (G=4 → ladder arm `g4`, 4 × 5); evidence for finer experts.
+- Ladder arm `nohra`: does per-loop HRA add anything *given* grouping?
+
+### What we deferred
+Peri-layernorm (a ladder arm if residual explosion fires); σ-MoE routing.
+
+## 7. Fully Looped Transformer (Fu et al., May 2026)
+
+arXiv:2605.18797. 127M / 318M, 200B tokens FineWeb-Edu, **Muon at lr 0.02 /
+momentum 0.95 + AdamW for embeddings and head — OSRT's optimizer split, on a
+looped model.**
+
+### Findings
+- **Residual explosion** grows with loop count; *"despite RMSNorm in each
+  layer … residual explosion still occurs."* Per-layer norm is insufficient.
+- **Gradient oscillation** from loop-wise accumulation (the BPTT analogy).
+- Fixes are parameter-free: *Fully Looped* (every layer sees the previous
+  loop's output) and *Attention Injection* (attention reused as cross-
+  attention with the previous loop state as query). Stable to 12 loops.
+- Trapezoidal schedule — 80% constant, 20% linear decay — i.e. WSD.
+
+### What we adopted
+Validation of Muon on recurrence at OSRT's hyperparameters; the
+`loop_hidden_norm_ratio` early-stop and the E2 telemetry (roadmap §18.2).
+Caveat recorded: OSRT's own probe measured a *contracting* iteration.
+
+### What we deferred
+Fully Looped and Attention Injection — ladder arms if `loop_hidden_norm_ratio`
+rises.
+
+## 8. Scaling Laws for Fine-Grained MoE (Krajewski et al., ICML 2024)
+
+arXiv:2402.07871. 129M–3.7B params, **16B–130B tokens**, expansion rate E=64
+fixed.
+
+    L(N, D, G) = 0.47 + (2.1 / G^0.58 + 18.1) · N^-0.115 + 30.8 · D^-0.147
+
+with N = **total** non-embedding params and G = granularity.
+
+### Findings
+- D's exponent (0.147) exceeds N's (0.115): loss is more sensitive to tokens
+  than parameters — the "tokens are the bottleneck" thesis with a coefficient.
+- MoE *"require[s] longer training than dense at matched active initially,
+  but scale[s] better after"* — a **crossover**.
+
+### What it changed
+- OSRT's 5.3B-token budget is a third of their fitted floor: predictions are
+  extrapolation. Ladder arm `dense` exists because, without a same-active dense
+  control, "sparsity hurts" and "we are before the crossover" are
+  indistinguishable.
+- E fixed at 64 means it cannot separate total from active — G3a still runs.
+
+## 9. DSpark — Confidence-Scheduled Speculative Decoding (DeepSeek, July 2026)
+
+arXiv:2607.05147. Semi-autoregressive drafter (parallel backbone + lightweight
+Markov/RNN head) with confidence-scheduled verification. Trained against a
+**frozen** target.
+
+### Findings
+- Accepted length τ on GSM8K: 6.11 / 6.17 / 6.21 at Qwen3-4B / 8B / 14B —
+  flat across scale; math is the best domain (~5.7–6.2), chat worst (~3.5).
+- Beats the autoregressive SOTA (Eagle3) at every scale and domain.
+- Displaced **MTP-1** in DeepSeek-V4 production: 60–85% faster per-user
+  generation at matched throughput. MTP-1 had been kept only because static
+  multi-token drafters *"strictly degrade aggregate throughput under high
+  concurrency"* — a constraint absent at batch-1 decode.
+
+### What it changed (roadmap §15)
+- Reopened the MTP head count — do **not** slim to one head.
+- Retired §7.7's autoregressive loop-3 draft: it backed the losing family.
+- Gate G8 (drafter τ on a frozen checkpoint). The v6 target was lost with the
+  HF repo; runs on the first v7 checkpoint instead.
+
+### Deferred
+The confidence scheduler — a high-concurrency serving result that does not
+transfer to batch-1.
+
+## 10. GLM-5.3-Flash (Zhipu, announcement, Aug 2026)
+
+Blog + architecture diagram, not a tech report. 320B / 18B active, **45 layers
+(halved from 92)**, hybrid 3:1 linear:sparse attention, IndexPool.
+
+### What it changed
+- **mHC gates every sub-block** in a model built for ultra-low-cost
+  inference — an existence proof against the "under a fast-inference
+  requirement mHC cannot be justified" leg of §12.3. The other leg (no
+  published mHC-vs-plain-residual comparison) stands; the decision stands;
+  the ladder slot returned (§12.3 amendment).
+- Halving layer count for inference cost is a third independent line pointing
+  at sequential depth as the decode lever (with §13.4's roofline and the
+  cross-loop probe) — G4 moved up.
+
+Source caveat: read off a diagram; evidence that a lab *chose* mHC under a
+cost objective, not of what it bought them.

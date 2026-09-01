@@ -1,11 +1,12 @@
 # Output Heads & Training Losses
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 > Part of the OSRT-605M `docs/` architecture series. This chapter explains how
@@ -33,7 +34,7 @@ preset `OSRT_605M_A288M` on a meta device and counts real parameters.
 
 The body of the model (recursion + MoE + attention; see chapters 02–06)
 produces, for each position, a single `dim=1536` hidden vector. By itself that
-vector predicts nothing — it has to be projected into the 65,536-token
+vector predicts nothing — it has to be projected into the 49,184-token (49,280-row)
 vocabulary to become logits, and those logits have to be scored against the
 labels to produce a gradient. That is the job of the **heads** and **losses**.
 
@@ -80,7 +81,7 @@ logits = F.linear(hidden, self.model.embedding.weight)
 
 `F.linear(x, W)` computes `x @ W.T`. With `W = embedding.weight` of shape
 `(vocab=65536, dim=1536)`, this maps the `(B, S, 1536)` hidden state to
-`(B, S, 65536)` logits. The *same* `65536 × 1536` matrix that turns token IDs
+`(B, S, 49280)` logits, sliced to 49,184 real tokens. The *same* `49280 × 1536` matrix that turns token IDs
 into vectors at the input turns vectors back into token scores at the output.
 
 Why tie? The embedding matrix is the single largest tensor in the model —

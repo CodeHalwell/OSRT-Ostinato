@@ -1,19 +1,14 @@
 # ARCHITECTURE.md — OSRT-600M technical specification
 
-> ## ⚠ v6 spec — superseded in the specifics
+> ## Config-value spec — updated to v7 (2026-09-01)
 >
-> This document was written against **v6** and its numbers are v6 numbers:
-> 8 routed experts, 65,536 vocab, mHC enabled. v7 changes all three
-> (28 x h2112 top-4; 49,280/49,184 SmolLM2-based vocab; mHC removed).
->
-> It is kept in place, at its original section numbering, because `src/osrt/`
-> comments cite `ARCHITECTURE.md §N` throughout — moving or renumbering it
-> would invalidate those references. §8 is a tombstone for exactly that reason.
->
-> **Current sources of truth:** `docs/specs/2026-08-11-v7-roadmap.md` for the
-> committed shape and every open gate; `scripts/compute_budget.py` for any
-> parameter count; `src/osrt/` for behaviour. Where this file disagrees with
-> the code, the code wins.
+> Section numbering is **frozen**: `src/osrt/` comments cite `ARCHITECTURE.md
+> §N` throughout, so §9–§18 keep their numbers and §8 (mHC) is a tombstone.
+> Config values and parameter tables below are the **v7 committed shape**
+> (`OSRT_V7`); prose that explains v6-era choices is marked as such where it
+> survives. Where this file and the code disagree, **the code wins** —
+> `scripts/compute_budget.py` for any count, `docs/specs/2026-08-11-v7-roadmap.md`
+> §14/§16/§19 for the decisions.
 
 
 **Scope:** the technical specification of the OSRT-600M model — every
@@ -102,7 +97,7 @@ physical count.
 ```
 COMPONENT                                       PHYSICAL        ACTIVE / TOKEN (inference)
 ─────────────────────────────────────────────────────────────────────────────────────
-Embedding (65,536 × 1,536, tied with LM head)   100,690,944    100,690,944
+Embedding (49,280 × 1,536, tied with LM head)    75,721,728     75,721,728
   -- one row per token at lookup; full matrix touched at the tied LM head
 
 Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
@@ -115,9 +110,9 @@ Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
 Shared experts × 3 (SwiGLU, h=2,816)             38,928,384     38,928,384
   -- per block: 3 × 1,536 × 2,816 = 12,976,128; always active
 
-Routed experts: 3 × 8 × (SwiGLU, h=3,840)       424,673,280    106,168,320
-  -- per expert: 3 × 1,536 × 3,840 = 17,694,720
-  -- top-2 of 8 active per token → 2/8 = 25% routing density
+Routed experts: 3 × 28 × (SiTU-GLU, h=2,112)    817,496,064    116,785,152
+  -- per expert: 3 × 1,536 × 2,112 = 9,732,096
+  -- top-4 of 28 active per token → 4/28 = 14.3% routing density
 
 HRA adapters (rank 256, 18 injection points)     14,155,776     14,155,776
   -- adapter_a (1,536 × 256) + adapter_b (256 × 1,536) = 786,432 each
@@ -132,8 +127,8 @@ MTP heads × 2 (§9.3)                              4,721,664              0
 Router + loop embeddings + norms                    ~45,857        ~45,857
 
 ─────────────────────────────────────────────────────────────────────────────────────
-TOTAL PHYSICAL                                  601,444,393  →  ~601M
-ACTIVE / TOKEN (inference, excl. MTP)                          278,217,769  →  ~278M
+TOTAL PHYSICAL                                  968,468,355  →  ~968M
+ACTIVE / TOKEN (inference, excl. MTP)                          263,035,779  →  ~263M
 ACTIVE FRACTION                                                    ≈ 46.3%
 ```
 
@@ -155,11 +150,11 @@ is ~283M; the 278M headline is the inference forward.)
 ### 2.2 At-a-glance
 
 - **Hidden dimension `d_model`**: 1,536
-- **Vocab size**: 65,536 (BPE)
+- **Vocab size**: 49,280 rows / 49,184 real (OSRT-Ostinato: SmolLM2 base + 32 specials)
 - **Physical transformer blocks**: 3
 - **Recursive loops**: 6 → 18 effective layers
 - **Attention**: GQA 24 query heads / 8 KV heads / head_dim 64
-- **MoE**: 1 shared expert (h=2,816) + **8 routed (h=3,840)**, top-2
+- **MoE**: 1 shared expert (h=2,816) + **28 routed (h=2,112)**, top-4, Quantile Balancing, SiTU-GLU
   - 8 (not 12) for denser routing — see §2.5
 - **HRA adapter rank**: 256 (real high-rank, not LoRA-style 16)
 - **HRA injection points**: 18 (implementation-defined; see §2.4)
@@ -216,11 +211,11 @@ top-k masking of HRA.
 
 `OSRT` = **Optimized Sparse Recursive Transformer**:
 - **O**ptimized — Muon optimizer + AlphaQ + TurboQuant deployment stack
-- **S**parse — MoE (top-2 of 8 routed + 1 shared per block)
+- **S**parse — MoE (top-4 of 28 routed + 1 shared per block)
 - **R**ecursive — 3 physical blocks × 6 loops = 18 effective layers
 - **T**ransformer — standard pre-norm decoder backbone
 
-`600M` rounds the **physical** parameter count of **601,444,393**
+`600M` (in the old repo name) rounded v6's **601,444,393**; v7 is **968,468,355** and no count appears in any name, by rule (§19)
 (601M). Active per token at inference is **278M** (46.3%). (The count
 dropped by 72 from 601,444,465 when the per-head attention-sink logits
 were removed — see §2.1 / §6.6.)
@@ -243,7 +238,7 @@ imports — but **§2.1 is authoritative, not the names.** An alias
 
 - **Algorithm**: byte-level BPE (sentencepiece or HuggingFace
   tokenizers)
-- **Vocab size**: 65,536
+- **Vocab size**: 49,280 (49,184 real)
 - **Encoding focus**: English + 6 multilingual (Arabic, Japanese,
   Korean, Spanish, French, German) + code (Python, JS, Rust, C++)
 - **Pre-tokenization**: GPT-2 style regex (handles contractions,
@@ -323,7 +318,7 @@ Tool use:
 
 ### 4.1 Shape and tying
 
-- `embedding_matrix ∈ ℝ^(65536 × 1536)`
+- `embedding_matrix ∈ ℝ^(49280 × 1536)`
 - **Tied with LM head**: `lm_head.weight = embedding.weight`
 - Total params: 100,663,296 (16.9% of model)
 
@@ -605,8 +600,13 @@ HRA adapter applied to `W_O` output additively.
 
 Each MoE block has:
 - 1 always-active shared expert (h=2,816)
-- **8 routed experts** (h=3,840), top-2 active per token
+- **28 routed experts** (h=2,112), top-4 active per token
 - 1 router (linear projection + sqrt-softplus affinity)
+
+> **v7:** 28 routed × h2,112, top-4 = 14.3% density, Quantile Balancing,
+> SiTU-GLU. The re-grain holds active params while adding total; see
+> `docs/03-moe-and-routing.md` §12 and roadmap §14.3. The paragraph below is
+> the **v6** rationale, kept because it explains why 8 was chosen then.
 
 8 routed (not the 12 of an early draft): top-2 of 8 = 25% routing
 density vs 16.7% for top-2 of 12 — denser routing, more capacity per
@@ -631,9 +631,9 @@ target; revisit at GPU phase.)
 
 Per routed expert:
 ```
-w_gate ∈ ℝ^(1536 × 3840)       # 5.90M params
-w_up ∈ ℝ^(1536 × 3840)         # 5.90M params
-w_down ∈ ℝ^(3840 × 1536)       # 5.90M params
+w_gate ∈ ℝ^(1536 × 2112)       # 3.24M params
+w_up ∈ ℝ^(1536 × 2112)         # 3.24M params
+w_down ∈ ℝ^(2112 × 1536)       # 3.24M params
 ```
 
 Per expert: ~17.69M. Per block (8 experts): 141.56M. Across 3 blocks:
@@ -663,7 +663,7 @@ normalized_weights = softmax(balanced_affinity[top_2_indices])
 For physical blocks 0 and 1 (first 2 of 3), routing is HASH-based,
 not learned:
 ```
-expert_id = hash(token_id) mod 8     # mod num_routed_experts
+expert_id = hash(token_id) mod 28    # mod num_routed_experts
 # Always select this fixed expert, no learned router
 ```
 
@@ -795,7 +795,7 @@ collapse, which is the closest thing to a control that exists.
 Tied with embedding:
 ```
 logits = embedding.weight @ x_final.transpose(-1, -2)
-# Shape: [batch, seq, 65536]
+# Shape: [batch, seq, 49280] → sliced to 49184 real tokens before the loss
 ```
 
 Final hidden state `x_final` comes from the LAST physical block of
@@ -827,8 +827,8 @@ This is what enables:
 Per DeepSeek-V3 / V4: predict tokens at offsets +1, +2 via separate
 small heads on the FINAL loop output:
 ```
-MTP_head_1 ∈ ℝ^(1536 × 65536)     # tied with embedding
-MTP_head_2 ∈ ℝ^(1536 × 65536)     # tied with embedding
+MTP_head_1 ∈ ℝ^(1536 × 49280)     # tied with embedding
+MTP_head_2 ∈ ℝ^(1536 × 49280)     # tied with embedding
 ```
 
 (Heads are tied with embedding too — no separate params, just
@@ -923,7 +923,7 @@ def forward(input_ids, kv_cache=None, training=False):
     x_final = (A_l @ X.transpose(-1, -2)).squeeze(-1)    # [B, L, 1536]
 
     # Step 5: LM head (tied with embedding)
-    logits = x_final @ embedding.weight.T               # [B, L, 65536]
+    logits = x_final @ embedding.weight.T               # [B, L, 49280]
 
     return {
         'logits': logits,
@@ -1255,9 +1255,9 @@ Total per token per training step: ~2.4 BFLOPs
 cosine horizon is sized to a **~$100 Modal H100 run** (≈ $3.95/hr ≈ 25
 H100-hr):
 ```
-total_steps  = 3,500          # LR-anneal target; cosine self-terminates here
+total_steps  = 17,500         # ≈5.28B tokens; WSD decays over the last 15%
 warmup_steps = 400            # ~11% — spins up Muon + the MoE balance bias
-peak_lr      = 6e-4  →  min_lr = 6e-5    # one continuous cosine, no re-warm
+peak_lr      = 6e-4  →  min_lr = 6e-5    # WSD: flat trunk, linear decay branch
 ```
 At ~5k tok/s on the seq-2048 foundation phase (131K tok/step) that is
 **~455M tokens** by step 3,500, when the cosine has fully decayed

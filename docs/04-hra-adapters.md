@@ -1,11 +1,12 @@
 # HRA — High-Rank Adapters
 
-> **v7 status.** The architecture this chapter describes is current, but its
-> **`file:line` citations, parameter tables and config values were written
-> against v6** and have not been regenerated. mHC references have been removed
-> (roadmap §12.3); expert counts, vocab and param figures may still be stale.
-> Regenerate counts with `scripts/compute_budget.py`; `src/osrt/` is ground
-> truth where they disagree.
+> **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
+> layout, tokenizer and optimizer recipe below are the committed v7 shape
+> (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`
+> citations drift as the code moves — `src/osrt/` is ground truth and
+> `scripts/compute_budget.py` is the only source for any count. Passages that
+> explain a *v6* choice are marked as such where they survive. Decisions and
+> open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
 *Part of the `docs/` OSRT-605M architecture series.*
@@ -157,6 +158,20 @@ self.adapters_b = nn.ParameterList(
 self.adapter_scale = config.adapter_alpha / config.adapter_rank
 ```
 
+> **v7: `use_hra` toggle and the E1 ablation.** With `use_hra=False` the
+> ParameterLists are empty, every consumer receives `None`, and
+> `adapter_scale` is `0.0` — a pure shared layer. (`adapter_rank=0` could not do
+> this: it built zero-width tensors and divided `alpha` by zero.) This exists
+> because the adapters are OSRT's answer to a question MoEUT answers
+> differently: how do weight-tied blocks behave differently at different
+> depths? MoEUT uses *layer grouping* — G distinct blocks, no adapters — and
+> OSRT's 3 blocks already *are* G=3. So: given grouping, do the adapters earn
+> their FLOPs? Ladder arm `nohra` asks exactly that, **iso-compute to the
+> parameter** — the 7,077,888 adapter params are reinvested one-for-one into the
+> shared expert (1920 → 2688), both all-active. If `nohra` matches arm `a`
+> within 0.02 nats, the adapters are inert given grouping and v7 drops them
+> (roadmap §18.1).
+
 The decode loop picks the right pair by flattening `(loop, block)` into a
 single index and threading it into the block (`model.py:1463-1465`):
 
@@ -181,7 +196,7 @@ not what the 18 are.
 
 **Attention path, not the routed experts.** The adapter is added to the
 attention sub-block output (`model.py:996`, `model.py:1055`). That means it
-sits on the **always-run** part of the layer, *not* on the sparse top-2 MoE
+sits on the **always-run** part of the layer, *not* on the sparse top-4 MoE
 experts. There is no top-k masking of HRA: every token sees every adapter.
 
 ---
