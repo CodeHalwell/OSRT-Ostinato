@@ -40,6 +40,11 @@ counts at once; this one states none.
 
 ## Quick start
 
+To actually launch runs, follow [`RUNBOOK.md`](RUNBOOK.md) — it sequences the
+probe, the launch gate and the ladder, and says what each result means.
+
+### Local checks
+
 ```bash
 uv sync
 uv run pytest                                            # CPU suite

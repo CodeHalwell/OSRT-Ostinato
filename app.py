@@ -176,15 +176,16 @@ def v7_sanity(steps: int = 30) -> dict:
 
 
 @app.local_entrypoint()
-def main(arm: str = "a", total_steps: int = 4000, seq_len: int = 2048,
-         spawn: bool = False, sanity: bool = False) -> None:
+def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
+         spawn: bool = False, sanity: bool = False, sanity_steps: int = 30) -> None:
     """Two stages only: the launch gate, and one ladder arm.
 
-    There is deliberately no trunk stage — the paid multi-month run is not
-    reachable from this file.
+    total_steps=8000 at seq 2048 is ~1.07B tokens per arm (PretrainConfig
+    phase batches), ~2h on an H100. There is deliberately no trunk stage —
+    the paid multi-month run is not reachable from this file.
     """
     if sanity:
-        print(v7_sanity.remote(min(total_steps, 100) if total_steps < 4000 else 30))
+        print(v7_sanity.remote(sanity_steps))
         return
     if spawn:
         call = ladder_arm.spawn(arm, total_steps, seq_len)
