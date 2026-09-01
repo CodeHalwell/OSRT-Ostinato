@@ -28,8 +28,8 @@ newest checkpoint and continues. That is the whole resume story.
 **Modal — H100, metered, no session cap.**
 
 ```bash
-uv run modal run app.py --trunk-run                          # volume-resumable
-uv run modal run app.py --trunk-run --hf-repo HallD/osrt-v7-ckpt   # ...and mirrored to HF
+uv run modal run --detach app.py --trunk-run                 # volume-resumable
+uv run modal run --detach app.py --trunk-run --hf-repo HallD/osrt-v7-ckpt   # ...and mirrored to HF
 ```
 
 The two venues share the HF repo, so a run can move between them.

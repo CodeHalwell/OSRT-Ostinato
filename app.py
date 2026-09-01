@@ -5,10 +5,14 @@ Deliberately narrow. The v6 app.py dispatched a registry of ~20 stages
 survived into v7, so rebuilding that surface would be recreating debt. This
 runs the trunk, its 30-step gate, and the ladder arms.
 
-    modal run app.py --trunk-run                 # THE run, detached, resumable
-    modal run app.py --trunk-run --hf-repo u/r   # ...also mirrored to HF for Colab
+    modal run --detach app.py --trunk-run        # THE run, detached, resumable
+    modal run --detach app.py --trunk-run --hf-repo u/r   # ...also mirrored to HF
     modal run app.py --sanity                    # 30-step gate
-    modal run app.py --arm a --spawn             # one ladder arm
+    modal run --detach app.py --arm a --spawn    # one ladder arm
+
+    --detach is REQUIRED with --trunk-run / --spawn: without it the CLI stops the
+    ephemeral app the moment the entrypoint returns and cancels the spawned call
+    ("Stopping app - local entrypoint completed."). Bit the first ladder launch.
 
 Each arm is a separate invocation on purpose: with N x $30 workspaces the arms
 run in parallel, one per workspace, and a arm that dies takes only itself down.

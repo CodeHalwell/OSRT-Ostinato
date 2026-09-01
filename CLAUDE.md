@@ -91,7 +91,7 @@ roadmap cites them, labelled so nobody mistakes them for current.
 
 ## To run: read `RUNBOOK.md`
 
-The design is committed and the trunk is one command — `modal run app.py
+The design is committed and the trunk is one command — `modal run --detach app.py
 --trunk-run`, or the Colab notebook. Roadmap **§19** records every design bet
 and its falsifier; results are read against that. The collapse detectors run
 during the run. The ladder (`scripts/launch_ladder.sh`) is for explaining

@@ -56,7 +56,7 @@ echo
 # 2. launch, detached
 for arm in "${ARMS[@]}"; do
   ws="${WS[$arm]}"
-  cmd=(uv run modal run app.py --arm "$arm" --total-steps "$STEPS" --spawn)
+  cmd=(uv run modal run --detach app.py --arm "$arm" --total-steps "$STEPS" --spawn)
   if [ "$DRY" -eq 1 ]; then
     echo "  [dry] MODAL_PROFILE=$ws ${cmd[*]}"
   else
