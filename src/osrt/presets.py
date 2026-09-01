@@ -79,3 +79,40 @@ OSRT_V7: dict = dict(
 def build_config(preset: dict = OSRT_V7, **overrides) -> OSRTConfig:
     """Build an OSRTConfig from a preset, with optional overrides."""
     return OSRTConfig(**{**preset, **overrides})
+
+
+# ── G3a ladder ────────────────────────────────────────────────────────────
+# The one gate that blocks the trunk run (roadmap §14.7): does the
+# compute-optimal token requirement track ACTIVE parameters or TOTAL?
+#
+# Design: hold active fixed, sweep total by varying the expert COUNT at fixed
+# top_k x expert_hidden. Every arm therefore does identical per-token compute
+# and differs only in how much sparse capacity sits behind the router. If
+# loss-per-token is flat across the sweep, §14.8's assumption holds and the
+# committed 968M shape is safe; if it degrades with total, re-price before the
+# trunk run.
+#
+# The arms bracket v7's own ratio (3.68x): 1.83x / 2.98x / 5.26x.
+#
+# CAVEAT: the tied embedding is 41% of active here against 28.8% in v7 — the
+# vocab is fixed while dim shrinks, so it cannot be matched exactly at ladder
+# scale. Read the arms against each OTHER, not against v7's absolute numbers.
+_LADDER_BASE: dict = dict(
+    dim=1024, heads=16, head_dim=64, num_kv_heads=4,
+    vocab_size=49280, real_vocab_size=49184,
+    num_blocks=3, recursive_loops=6,
+    top_k_experts=4, expert_hidden=1056, shared_expert_hidden=1920,
+    adapter_rank=192, adapter_alpha=192.0,
+    swiglu_clamp=10.0, attention_sink=False, moe_grouped_gemm=True,
+    aux_loop_loss_weight=0.05, mtp_heads=2, mtp_loss_weight=0.3,
+    router_aux_loss_coeff=0.10, router_z_loss_coeff=1e-3,
+    router_balance_bias_enabled=True, router_balance_mode="quantile",
+    router_affinity="sqrt_softplus", max_position_embeddings=2048,
+)
+
+LADDER_ARMS: dict[str, dict] = {
+    # name: experts. Active is constant; only total moves.
+    "a": {**_LADDER_BASE, "num_routed_experts": 14},   # 225M total, 1.83x
+    "b": {**_LADDER_BASE, "num_routed_experts": 28},   # 365M total, 2.98x
+    "c": {**_LADDER_BASE, "num_routed_experts": 56},   # 646M total, 5.26x
+}
