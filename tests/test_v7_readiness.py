@@ -211,3 +211,34 @@ def test_relative_thresholds_scale_sanely_to_e28_top4():
     # entropy must drop the same FRACTION of its ceiling, not the same nats
     assert t["target_pte"] == pytest.approx(math.log(28) * (1 - 0.265), abs=0.01)
     assert t["min_prebias_expert"] == pytest.approx(0.08 / 28)
+
+
+def _healthy_summary(**over):
+    """A summary every non-loop criterion passes on; loop keys as given."""
+    base = {
+        "per_token_H": 1.0, "raw_max": 0.3, "top_margin": 0.05,
+        "marginal_H": 3.3, "prebias_marginal_H": 3.3,
+        "prebias_expert_min": 0.03, "bias_abs_max": 0.0,
+        "loop_update_norm_min": 0.5, "loop_hidden_norm_ratio": 2.0,
+    }
+    base.update(over)
+    return base
+
+
+def test_loop_guards_are_wired_into_the_early_stop_check():
+    from osrt.presets import build_v7_config
+    from osrt.train import _check_early_stop_criteria
+    from osrt.train_config import PretrainConfig
+
+    cfg, mcfg = PretrainConfig(), build_v7_config()
+    ok = _check_early_stop_criteria(1000, _healthy_summary(), cfg, mcfg)
+    assert not any(f.startswith("loop_") for f in ok)
+
+    dead = _check_early_stop_criteria(
+        1000, _healthy_summary(loop_update_norm_min=1e-5), cfg, mcfg)
+    assert any(f.startswith("loop_update_norm_min") for f in dead)
+
+    blown = _check_early_stop_criteria(
+        1000, _healthy_summary(loop_hidden_norm_ratio=600.0), cfg, mcfg)
+    assert any(f.startswith("loop_hidden_norm_ratio") for f in blown)
+

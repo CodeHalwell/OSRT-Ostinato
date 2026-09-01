@@ -820,6 +820,22 @@ def _check_early_stop_criteria(
                 f"{bias_limit:.3f} "
                 "(bias controller is near saturation and may be masking collapse)"
             )
+    # Recursive-loop health (roadmap §17.3). Both thresholds existed in
+    # PretrainConfig and both values were computed into the summary, but
+    # nothing compared them — the first ladder ran with these guards inert.
+    lu_min = summary.get("loop_update_norm_min")
+    if lu_min is not None and lu_min < cfg.min_loop_update_norm:
+        failures.append(
+            f"loop_update_norm_min {lu_min:.2e} < {cfg.min_loop_update_norm:.2e} "
+            "(a loop's residual write has vanished — loop collapse)"
+        )
+    hn_ratio = summary.get("loop_hidden_norm_ratio")
+    if hn_ratio is not None and hn_ratio > cfg.max_loop_hidden_norm_ratio:
+        failures.append(
+            f"loop_hidden_norm_ratio {hn_ratio:.1f} > "
+            f"{cfg.max_loop_hidden_norm_ratio:.1f} "
+            "(residual stream inflates across the recursion — FLT §17.3)"
+        )
     return failures
 
 
