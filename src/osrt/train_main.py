@@ -126,6 +126,12 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
             f"`python scripts/build_tokenizer_v7.py --out {tokenizer_path}`.",
         )
     tok = AutoTokenizer.from_pretrained(tokenizer_path)
+    # Fail closed on the tokenizer BEFORE building a model around it: pins
+    # the real vocab size and every structural token id, so a swapped or
+    # half-built tokenizer cannot start a run (a checkpoint trained at one
+    # vocab cannot load at another).
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+    validate_tokenizer_contract(tok)
     real = len(tok)
     padded = ((real + 127) // 128) * 128
     print(f"Tokenizer loaded: real_vocab_size={real} -> vocab_size={padded}",

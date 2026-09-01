@@ -804,6 +804,8 @@ def run_training(
             sanity/test runs should pass a distinct dir to avoid colliding
             with real checkpoints.
     """
+    # Fail closed on an inconsistent recipe before any compute is spent.
+    train_cfg.validate()
     device = torch.device("cuda")
 
     print("=" * 60)

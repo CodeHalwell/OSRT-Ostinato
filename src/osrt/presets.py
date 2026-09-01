@@ -85,6 +85,11 @@ OSRT_V7: dict = dict(
 )
 
 
+def build_v7_config(**overrides) -> OSRTConfig:
+    """The committed v7 shape. Alias kept so both repos read the same."""
+    return build_config(OSRT_V7, **overrides)
+
+
 def build_config(preset: dict = OSRT_V7, **overrides) -> OSRTConfig:
     """Build an OSRTConfig from a preset, with optional overrides."""
     return OSRTConfig(**{**preset, **overrides})

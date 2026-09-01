@@ -118,45 +118,44 @@ Sweep template (drop into app.py near the existing `sweep` stage)::
 
 
 class PretrainConfig:
-    """Pre-training hyperparameters for v5."""
+    """Pre-training hyperparameters for v7.
 
-    # Training
+    Budget and schedule are defined ONCE, here, and the phase table below is
+    expressed as FRACTIONS of total_steps — so the two cannot disagree. (v6
+    carried total_steps=3,500 beside a phase table hard-coded to 300,000
+    steps; a default launch trained ~458M tokens, ended inside phase 1, and
+    looked normal doing it.)
+
+    The step counter persists across resumes, so a drip-funded run toward a
+    FIXED total_steps is one continuous schedule. Change total_steps before the
+    first chunk and never mid-run.
+    """
+
+    # ── Budget ─────────────────────────────────────────────────────────
     batch_size: int = 8
     grad_accum_steps: int = 8
-    # Cosine horizon sized to the base-pretrain budget (~$100 on Modal H100,
-    # $3.95/hr ≈ 25 H100-hr ≈ ~3,500 steps at ~5k tok/s, seq-2048 foundation
-    # @ 131K tok/step ≈ ~455M tokens). total_steps is the LR-anneal target, and
-    # the step counter persists across resumes, so chunked runs toward a FIXED
-    # total_steps are one continuous cosine (no re-warm between chunks). The
-    # cosine fully decays peak→min_lr by step 3,500, so the run self-terminates
-    # at the budget with a clean, annealed base. Long-context (4096/8192) and
-    # math specialisation happen in the SEPARATE mid-training/extend stages,
-    # which re-warm from this checkpoint — so annealing the base to min here is
-    # correct. To train a longer base, raise this BEFORE the first chunk and
-    # keep it fixed across resumes (changing it mid-run reshapes the cosine).
-    # LR schedule. "cosine" is v6's; "wsd" is warmup-stable-decay
-    # (trunk-and-branch), adopted for v7 by roadmap item 0.2 and now the
-    # unanimous 2026 practice (Nemotron two-phase WSD, Kimi Linear).
-    #
-    # Why it matters here specifically: this project trains in ~$120/month
-    # drip chunks. Under cosine, every extension either re-warms (paying the
-    # tax again) or reshapes the curve mid-run — §2.2 records the token-budget
-    # arithmetic as the plan's weakest link, and re-warm waste comes straight
-    # off it. WSD holds LR flat through the trunk so a run can be stopped and
-    # resumed at no cost, and decays only on the branch that produces a
-    # release checkpoint.
-    # DataLoader workers for the streaming corpus. 0 is correct on Colab:
-    # HF streaming + BPE inside forked workers leaks semaphores and dies with
-    # "Bad file descriptor" once workers x streams gets large, and a dead
-    # worker on a session-capped runtime costs the whole session. On a
-    # dedicated box raise it.
-    dataloader_num_workers: int = 0
+    # Sized to ~1x Chinchilla on ACTIVE params (263M x 20 ≈ 5.3B tokens) at the
+    # per-phase batch economics below: 17,500 steps ≈ 5.28B tokens. This is the
+    # §14.8 assumption made operational — G3a decides whether the yardstick is
+    # active or total, and if it is total this number must roughly quadruple.
+    # `total_tokens()` reports the implied budget; check it, do not infer it.
+    _total_steps: int = 17_500
+    warmup_steps: int = 400          # ~2%; spins up Muon + the balance bias
+
+    # ── Schedule ───────────────────────────────────────────────────────
+    # "wsd" = warmup / stable / decay (roadmap item 0.2). The stable phase is
+    # the point: a drip-funded run can stop and resume anywhere in it at zero
+    # cost, and only the release branch pays the decay. "cosine" is retained
+    # to reproduce v6 runs.
     lr_schedule: str = "wsd"
-    # Fraction of total_steps spent in the final decay ramp. 0.2 is the
-    # common choice; the stable phase is everything between warmup and it.
-    wsd_decay_frac: float = 0.2
-    total_steps: int = 3_500
-    warmup_steps: int = 400          # ~11% — spins up Muon + the MoE balance bias
+    # Final decay occupies the last wsd_decay_frac of the run. It is aligned
+    # with the "anneal" data phase below on purpose: the LR decay and the
+    # high-quality data both belong to the branch, not the trunk (§7.5.2).
+    wsd_decay_frac: float = 0.15
+    # DataLoader workers. 0 is correct on Colab: HF streaming + BPE inside
+    # forked workers leaks semaphores, and on a session-capped runtime a dead
+    # worker costs the session. Raise on a dedicated box.
+    dataloader_num_workers: int = 0
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
@@ -252,10 +251,9 @@ class PretrainConfig:
     #   Phase 2 (knowledge, 240K steps):  4 × 16 × 4096 = 262K tok/step → ~63B
     #   Phase 3 (instruction, 50K steps): 2 × 32 × 8192 = 524K tok/step → ~26B
     # Total budget: ~90B tokens if the full 300K schedule completes.
-    phases: dict = {  # noqa: RUF012
+    _phase_spec: dict = {  # noqa: RUF012
         "foundation": {
-            "start": 0,
-            "end": 9_500,
+            "frac": 0.05,          # broad, short-seq warm-in
             "seq_len": 2048,
             "grad_accum_steps": 8,
             "datasets": [
@@ -285,8 +283,7 @@ class PretrainConfig:
             ],
         },
         "knowledge": {
-            "start": 9_500,
-            "end": 250_000,
+            "frac": 0.80,          # the trunk: stable LR, broad mix
             "seq_len": 4096,
             # Bumped from batch_size=4, grad_accum_steps=16 once the
             # grad-checkpointing threshold was raised (see train.py
@@ -345,9 +342,8 @@ class PretrainConfig:
                 },
             ],
         },
-        "instruction": {
-            "start": 250_000,
-            "end": 300_000,
+        "anneal": {
+            "frac": 0.15,          # the branch: high-quality data under LR decay
             "seq_len": 8192,
             "batch_size": 2,
             "grad_accum_steps": 32,
@@ -384,6 +380,94 @@ class PretrainConfig:
         },
     }
 
+    # ── Derived. Phase boundaries come from total_steps; do not hand-edit. ──
+    def __init__(self, **overrides) -> None:
+        import copy
+        # Instance-private copy: the spec is a class attribute, and resolving
+        # boundaries in place on a shared dict would leak between configs.
+        self.phases = copy.deepcopy(type(self)._phase_spec)
+        for k, v in overrides.items():
+            if not hasattr(type(self), k) and k != "total_steps":
+                raise TypeError(f"unknown PretrainConfig field {k!r}")
+            setattr(self, k, v)
+        self._resolve_phases()
+
+    @property
+    def total_steps(self) -> int:
+        return self._total_steps
+
+    @total_steps.setter
+    def total_steps(self, value: int) -> None:
+        """Changing the horizon re-derives every phase boundary, so a caller
+        that sets cfg.total_steps = N after construction still gets a
+        consistent table (the ladder and sanity stages do exactly this)."""
+        self._total_steps = int(value)
+        if hasattr(self, "phases"):
+            self._resolve_phases()
+
+    def _resolve_phases(self) -> None:
+        """Turn phase fractions into absolute step boundaries.
+
+        Fail closed on inconsistency: v6 shipped total_steps=3,500 beside a
+        phase table ending at 300,000, and nothing complained.
+        """
+        fracs = [ph.get("frac") for ph in self.phases.values()]
+        if any(f is None for f in fracs):
+            raise ValueError("every phase needs a 'frac' (fraction of total_steps)")
+        total = sum(fracs)
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"phase fractions must sum to 1.0, got {total:.6f}")
+        cursor = 0
+        names = list(self.phases)
+        for k, name in enumerate(names):
+            ph = self.phases[name]
+            end = (self.total_steps if k == len(names) - 1
+                   else cursor + round(ph["frac"] * self.total_steps))
+            ph["start"], ph["end"] = cursor, end
+            cursor = end
+
+    def validate(self) -> None:
+        """Cross-field checks, run once at train start rather than on every
+        setter so callers may assign total_steps and warmup_steps in any
+        order (the sanity and ladder stages set steps first)."""
+        # NOTE: no "warmup must end inside phase 1" check. Warmup is an LR
+        # concept and phases are a data/seq_len concept; they are orthogonal,
+        # and tying them makes every short run (sanity at 30-200 steps, where
+        # phase 1 is 2-10 steps) fail for no reason.
+        if self.warmup_steps >= self.total_steps:
+            raise ValueError(
+                f"warmup_steps ({self.warmup_steps}) >= total_steps "
+                f"({self.total_steps})")
+        decay_start = int(self.total_steps * (1 - self.wsd_decay_frac))
+        if self.lr_schedule == "wsd" and decay_start <= self.warmup_steps:
+            raise ValueError(
+                f"WSD decay would start at step {decay_start}, inside warmup "
+                f"({self.warmup_steps}) — no stable phase exists")
+
+    def total_tokens(self) -> int:
+        """Implied token budget: sum over phases of steps x batch x accum x seq."""
+        n = 0
+        for ph in self.phases.values():
+            bs = ph.get("batch_size", self.batch_size)
+            ga = ph.get("grad_accum_steps", self.grad_accum_steps)
+            n += (ph["end"] - ph["start"]) * bs * ga * ph["seq_len"]
+        return n
+
     # Budget note: the schedule is aspirational — the user runs in chunks as
     # Modal credits allow. Checkpoints every 1K steps keep stop/resume cheap.
     # Any early stopping still leaves a usable model for SFT.
+
+
+class V7SanityConfig(PretrainConfig):
+    """The launch gate: a hard-capped run of the real committed shape.
+
+    Exists as a class so it cannot be mistaken for a trunk recipe — nothing in
+    it is tuned, it just has to build, fit, compile and step with loss falling.
+    """
+    _total_steps: int = 30
+    warmup_steps: int = 5
+    wsd_decay_frac: float = 0.3
+    ckpt_interval: int = 10
+    eval_interval: int = 10_000        # never, inside 30 steps
+    save_final_checkpoint: bool = False
+    wandb_log: bool = False
