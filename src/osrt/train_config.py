@@ -235,15 +235,21 @@ class PretrainConfig:
     # high while per-token entropy also stayed high). All four must hold by
     # step `early_stop_check_step` or training is considered failed.
     early_stop_check_step: int = 5_000
-    min_per_token_entropy_drop: float = 0.55   # init 2.08 → 1.53 (ln 8 = 2.08)
-    min_raw_max_prob: float = 0.30             # well above uniform 1/8 = 0.125
-    min_top_margin: float = 0.10               # clear gap between rank 0 and 1
-    min_marginal_entropy: float = 1.80         # balanced across experts
-    # The four checks above use clean deployed routing (router + balance bias).
-    # These guardrails make sure the learned pre-bias router is not secretly
-    # collapsed while the non-gradient bias controller hides it.
-    min_prebias_marginal_entropy: float = 1.55
-    min_prebias_expert_fraction: float = 0.01
+    # ── Router-health early stop, expressed RELATIVE to the expert count ──
+    # These were absolutes tuned at E=8 (min_raw_max_prob=0.30 was "2.4x
+    # uniform 1/8"; min_marginal_entropy=1.80 was "87% of ln 8"). At E=28 the
+    # same absolutes are wrong in BOTH directions: 0.30 is 8.4x uniform and
+    # would kill a healthy top-4 router, while a 0.55-nat entropy drop is only
+    # 17% of ln 28 instead of 26% and would miss a collapse. Each is now a
+    # fraction of its natural scale — ln(E), 1/E, 1/top_k — and resolved from
+    # the model config at check time. The fractions reproduce the v6 absolutes
+    # exactly at E=8, top_k=2.
+    per_token_entropy_drop_frac: float = 0.265     # of ln(E); 0.55/ln 8
+    raw_max_prob_frac_of_topk: float = 0.60        # of 1/top_k; 0.30 at top-2
+    top_margin_frac_of_topk: float = 0.20          # of 1/top_k; 0.10 at top-2
+    marginal_entropy_frac: float = 0.866           # of ln(E); 1.80/ln 8
+    prebias_marginal_entropy_frac: float = 0.745   # of ln(E); 1.55/ln 8
+    prebias_expert_fraction_of_uniform: float = 0.08   # of 1/E; 0.01 at E=8
     max_bias_saturation_fraction: float = 0.85
 
     # --- Router exploration ---

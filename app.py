@@ -3,10 +3,12 @@
 Deliberately narrow. The v6 app.py dispatched a registry of ~20 stages
 (pretrain, midtrain x3, SFT v1-v4, GRPO x4, evals); none of those pipelines
 survived into v7, so rebuilding that surface would be recreating debt. This
-runs the gate that actually blocks the trunk run, and nothing else.
+runs the trunk, its 30-step gate, and the ladder arms.
 
-    modal run app.py --arm a          # one ladder arm
-    modal run app.py --arm a --spawn  # detached (long runs)
+    modal run app.py --trunk-run                 # THE run, detached, resumable
+    modal run app.py --trunk-run --hf-repo u/r   # ...also mirrored to HF for Colab
+    modal run app.py --sanity                    # 30-step gate
+    modal run app.py --arm a --spawn             # one ladder arm
 
 Each arm is a separate invocation on purpose: with N x $30 workspaces the arms
 run in parallel, one per workspace, and a arm that dies takes only itself down.
@@ -20,6 +22,7 @@ import modal
 APP = "osrt-v7-ladder"
 GPU = "H100"
 TIMEOUT_H = 6
+TRUNK_TIMEOUT_H = 24   # Modal's ceiling; the trunk chains across invocations
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -29,6 +32,7 @@ image = (
     )
     .add_local_dir("src", "/root/src")
     .add_local_dir("tokenizer", "/root/tokenizer")
+    .add_local_dir("scripts", "/root/scripts")
 )
 
 app = modal.App(APP, image=image)
@@ -175,15 +179,91 @@ def v7_sanity(steps: int = 30) -> dict:
     return {"stage": "v7_sanity", "steps": steps, "params": n}
 
 
+@app.function(
+    gpu=GPU,
+    timeout=TRUNK_TIMEOUT_H * 3600,
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("osrt-secrets")],
+)
+def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
+    """The v7 pretraining run. Committed without gates — see roadmap §19 for
+    the bets this embodies and what would falsify each.
+
+    Resumable by design: checkpoints land on the volume, so re-invoking picks
+    up from the highest step. Set hf_repo to ALSO mirror them to a private HF
+    repo, which is what lets the same run continue from Colab.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    sys.path.insert(0, "/root")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    from transformers import AutoTokenizer
+
+    from osrt.presets import OSRT_V7, build_config
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+    from osrt.train import run_training
+    from osrt.train_config import PretrainConfig
+
+    tok = AutoTokenizer.from_pretrained("/root/tokenizer")
+    validate_tokenizer_contract(tok)
+    real = len(tok)
+    padded = ((real + 127) // 128) * 128
+    if real != OSRT_V7["real_vocab_size"]:
+        raise SystemExit(f"tokenizer {real} != preset {OSRT_V7['real_vocab_size']}")
+    cfg = build_config(
+        vocab_size=padded, real_vocab_size=real,
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+    )
+    train_cfg = PretrainConfig()
+    if total_steps is not None:
+        train_cfg.total_steps = total_steps
+    train_cfg.dataloader_num_workers = 2
+    train_cfg.wandb_run_name = "osrt-v7-trunk"
+    print(f"[trunk] {train_cfg.total_steps} steps ≈ "
+          f"{train_cfg.total_tokens()/1e9:.2f}B tokens | "
+          f"E={cfg.num_routed_experts} top-{cfg.top_k_experts} h{cfg.expert_hidden} | "
+          f"vocab {real}->{padded}", flush=True)
+
+    ckpt_dir = "/vol/trunk"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    sync = None
+    if hf_repo:
+        from scripts import hf_ckpt_sync as sync
+        sync.pull_latest(hf_repo, ckpt_dir, "osrt")
+        sync.start_push_daemon(hf_repo, ckpt_dir, "osrt")
+
+    class _Vol:
+        def commit(self) -> None:
+            vol.commit()
+
+    try:
+        run_training(model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
+                     tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir)
+    finally:
+        vol.commit()
+        if sync is not None:
+            sync.flush(hf_repo, ckpt_dir, "osrt")
+    return {"stage": "trunk", "steps": train_cfg.total_steps}
+
+
 @app.local_entrypoint()
 def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
-         spawn: bool = False, sanity: bool = False, sanity_steps: int = 30) -> None:
-    """Two stages only: the launch gate, and one ladder arm.
+         spawn: bool = False, sanity: bool = False, sanity_steps: int = 30,
+         trunk_run: bool = False, hf_repo: str = "") -> None:
+    """Stages: --trunk (the run), --sanity (30-step gate), or one ladder --arm.
 
-    total_steps=8000 at seq 2048 is ~1.07B tokens per arm (PretrainConfig
-    phase batches), ~2h on an H100. There is deliberately no trunk stage —
-    the paid multi-month run is not reachable from this file.
+    total_steps=8000 at seq 2048 is ~1.07B tokens per ladder arm. The trunk
+    uses PretrainConfig's own budget (17,500 steps ≈ 5.28B tokens) unless
+    --total-steps is given.
     """
+    if trunk_run:
+        call = trunk.spawn(hf_repo, None if total_steps == 8000 else total_steps)
+        print(f"spawned trunk: {call.object_id} — resumes from /vol/trunk on re-invoke")
+        return
     if sanity:
         print(v7_sanity.remote(sanity_steps))
         return

@@ -1,93 +1,59 @@
-# Runbook — from zero to the first results
+# Runbook — run it
 
-Everything below is copy-paste. Four stages, in order; each gates the next.
+The design is committed (roadmap §14, §16, §19). No ladder, no launch gate:
+the collapse detectors run *during* the run instead of before it. §19 lists
+every bet and what would falsify it — read results against that.
 
-## 0 · Secrets (once per Modal workspace — yours to do, needs your tokens)
+## 1 · Secrets (once)
 
-```bash
-for ws in agents-of-output danielhalwell build-small codhe-hugging-mcp gradio-winter-hack; do
-  MODAL_PROFILE=$ws uv run modal secret create osrt-secrets \
-      HF_TOKEN=hf_... WANDB_API_KEY=...
-done
-```
-
-`scripts/launch_ladder.sh --dry-run` confirms which workspaces have it.
-
-## 1 · Probe the card (Colab, minutes, free) — gate G7 part 1
-
-Open `notebooks/v7_pretrain_colab.ipynb` on the RTX PRO 6000 runtime and run
-cells 1–2. You want to see:
-
-```
-capability : sm_120
-_grouped_mm bf16      OK
-_grouped_mm fp8 e4m3  unsupported   <- expected; roadmap §17.1
-```
-
-If it reports anything other than `sm_120`, stop — the card is not the one
-the plan is sized for.
-
-## 2 · Launch gate (Modal, ~5 min, ~$0.50)
-
-The real 968M shape, 30 steps, hard-capped. Answers what no proxy can: does the
-committed config build, fit, compile and step with loss falling.
+**Colab:** add `HF_TOKEN` (write) and `WANDB_API_KEY` in the Secrets panel.
+**Modal:** in whichever workspace will run it:
 
 ```bash
-uv run modal run app.py --sanity
+uv run modal secret create osrt-secrets HF_TOKEN=hf_... WANDB_API_KEY=...
 ```
 
-Pass = it finishes and `loss` in the log decreases. Any shape/vocab complaint
-here is a real bug; do not proceed past it.
+## 2 · Run
 
-## 3 · The ladder (Modal, ~2h wall-clock in parallel, ~$50 total)
+**Colab — RTX PRO 6000, 96GB, free, session-capped.** Open
+`notebooks/v7_pretrain_colab.ipynb`, set `HF_CKPT_REPO` to a private repo you
+own, run top to bottom. When the session dies, run it again: it pulls the
+newest checkpoint and continues. That is the whole resume story.
 
-Six arms, one per workspace, detached. G3a, G4, and E1 all at once; E2's
-telemetry rides on every arm.
+**Modal — H100, metered, no session cap.**
 
 ```bash
-scripts/launch_ladder.sh
+uv run modal run app.py --trunk-run                          # volume-resumable
+uv run modal run app.py --trunk-run --hf-repo HallD/osrt-v7-ckpt   # ...and mirrored to HF
 ```
 
-| arm | answers | vs |
+The two venues share the HF repo, so a run can move between them.
+
+Budget: `PretrainConfig` — 17,500 steps ≈ **5.28B tokens**, ~1× Chinchilla on
+active params. The first log line prints the exact number.
+
+## 3 · Watch
+
+The run **ends itself** on router collapse, loop collapse, residual
+explosion, or checkpoint drift, and names the criterion. Short of that:
+
+| signal | healthy | worry |
 |---|---|---|
-| `a` | G3a control · E1 control | — |
-| `b`, `c` | G3a: does total help at fixed active? | `a` |
-| `dense` | G3a: are we before the MoE crossover? | `a` |
-| `nohra` | E1: do adapters earn their FLOPs? | `a` (iso-compute, exact) |
-| `g4` | G4: 4 blocks × 5 loops vs 3 × 6 | `a` (±2%) |
-
-Watch W&B project `osrt`, runs `osrt-v7-ladder-*`.
+| `loss` | falling, spikes recover | flat, or spiking |
+| `moe/dead_experts_total` | 0 | > 0 |
+| `loop/update_norm_l*` | every loop non-trivial | late loops → 0 |
+| `loop_hidden_norm_ratio` | ≈ 1, flat | rising (§17.3) |
+| `moe/b*/bias_loop_spread` | flat | rising |
+| `muon/ortho_err` | small, flat | rising |
 
 ## 4 · Read
 
-All comparisons are **loss at matched tokens on the FineWeb held-out**, and the
-threshold is 0.02 nats — below that is noise at this budget.
+Roadmap **§19.4**. Three outcomes; only one of them establishes anything
+beyond stability, and §19 says which in advance.
 
-| result | meaning | action |
-|---|---|---|
-| `a` ≈ `b` ≈ `c` | token requirement tracks **active** | §14.8 holds; 968M shape is safe |
-| loss *rises* a→b→c | tracks **total** | re-price §14 before the trunk; the shape shrinks |
-| `dense` beats all MoE arms | before the crossover (§17.4) | 5.3B tokens is too few for sparsity to pay; revisit budget |
-| `nohra` ≈ `a` | adapters inert given grouping | **drop HRA** from v7 (−14.2M params) |
-| `nohra` worse by >0.02 | adapters earn their place | keep; report per-loop update-norm profile |
-| `g4` beats `a` | MoEUT's G=4 prior holds here too | G4 → 4 blocks; rerun G3a at that shape |
+## Afterwards, if you want to know *why*
 
-E2 has no pass/fail — it is the trajectory. Plot `loop_hidden_norm_ratio`,
-`moe/b*/bias_loop_spread`, and `muon/ortho_err` across all six arms. Flat is
-the boring good result; monotonic growth in any of them is the finding.
-
-## 5 · E3, on the first checkpoint that clears sanity
-
-```bash
-PYTHONPATH=src uv run python scripts/probe_cross_loop_kv.py --ckpt <path> --out probe.json
-uv run python scripts/recommend_loop_count.py probe.json
-```
-
-It will say either "recommend running K" with the depth saving, or "no loop is
-idle on all three signals — do not trim." On v6 it said the latter.
-
-## What is deliberately NOT here
-
-There is no trunk-run command. `app.py` cannot start one. The trunk is a
-separate, explicit decision taken after stage 4 reports, on a box, with
-`total_steps` set from what G3a says the yardstick is.
+The ladder is still here — `scripts/launch_ladder.sh` runs six arms across
+the Modal workspaces (§18). It is how you explain the trunk's result, not a
+prerequisite for it. `scripts/recommend_loop_count.py` on any checkpoint
+tells you how many loops to run at decode.

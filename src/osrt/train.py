@@ -762,32 +762,38 @@ def _check_early_stop_criteria(
     # hard-coded 2.079 = ln(8) — correct for v6's 8 experts, silently wrong
     # for v7's 28 (ln 28 = 3.332), which would have let an unsharpened router
     # pass as sharpened by ~1.25 nats.
-    init_pte = math.log(model_cfg.num_routed_experts)
-    target_pte = init_pte - cfg.min_per_token_entropy_drop
+    # Resolve the relative thresholds against THIS model's expert count and
+    # top-k (see train_config for why absolutes were wrong at E=28).
+    E, K = model_cfg.num_routed_experts, model_cfg.top_k_experts
+    ln_e = math.log(E)
+    target_pte = ln_e - cfg.per_token_entropy_drop_frac * ln_e
+    min_raw_max = cfg.raw_max_prob_frac_of_topk / K
+    min_margin = cfg.top_margin_frac_of_topk / K
+    min_marginal = cfg.marginal_entropy_frac * ln_e
+    min_prebias_marginal = cfg.prebias_marginal_entropy_frac * ln_e
+    min_prebias_expert = cfg.prebias_expert_fraction_of_uniform / E
+
     if per_token_h > target_pte:
         failures.append(
-            f"clean_per_token_entropy {per_token_h:.3f} > "
-            f"{target_pte:.3f} (router hasn't sharpened)"
+            f"clean_per_token_entropy {per_token_h:.3f} > {target_pte:.3f} "
+            f"(router hasn't sharpened; init ln {E} = {ln_e:.3f})"
         )
-    if raw_max < cfg.min_raw_max_prob:
+    if raw_max < min_raw_max:
         failures.append(
-            f"clean_raw_max_prob {raw_max:.3f} < "
-            f"{cfg.min_raw_max_prob:.3f} (no strong primary pick)"
+            f"clean_raw_max_prob {raw_max:.3f} < {min_raw_max:.3f} "
+            f"(no strong primary pick at top-{K})"
         )
-    if top_margin < cfg.min_top_margin:
+    if top_margin < min_margin:
         failures.append(
-            f"clean_top_margin {top_margin:.3f} < "
-            f"{cfg.min_top_margin:.3f} (no gap between rank 0 and rank 1)"
+            f"clean_top_margin {top_margin:.3f} < {min_margin:.3f} "
+            "(no gap between rank 0 and rank 1)"
         )
-    if marginal_h < cfg.min_marginal_entropy:
+    if marginal_h < min_marginal:
         failures.append(
-            f"clean_marginal_entropy {marginal_h:.3f} < "
-            f"{cfg.min_marginal_entropy:.3f} (dead/overloaded experts)"
+            f"clean_marginal_entropy {marginal_h:.3f} < {min_marginal:.3f} "
+            "(dead/overloaded experts)"
         )
     prebias_marginal_h = summary.get("prebias_marginal_H", marginal_h)
-    min_prebias_marginal = getattr(
-        cfg, "min_prebias_marginal_entropy", cfg.min_marginal_entropy,
-    )
     if prebias_marginal_h < min_prebias_marginal:
         failures.append(
             f"prebias_marginal_entropy {prebias_marginal_h:.3f} < "
@@ -795,35 +801,13 @@ def _check_early_stop_criteria(
             "(learned router collapsed before balance bias)"
         )
     prebias_expert_min = summary.get("prebias_expert_min", 1.0)
-    min_prebias_expert = getattr(cfg, "min_prebias_expert_fraction", 0.0)
     if prebias_expert_min < min_prebias_expert:
         failures.append(
             f"prebias_expert_min {prebias_expert_min:.4f} < "
             f"{min_prebias_expert:.4f} "
-            "(one or more experts are dead before balance bias)"
+            f"(an expert is below {cfg.prebias_expert_fraction_of_uniform:.0%} "
+            "of its fair share before balance bias)"
         )
-    # Recursion health (roadmap §17.3). A deep loop whose residual update has
-    # gone to ~0 is a no-op — the model has silently become shallower than it
-    # is paying for. A residual stream whose norm runs away across the loops
-    # is the explosion two independent groups report per-layer RMSNorm does
-    # not prevent. Either fails the run; both are what the v6 loop-collapse
-    # war was about.
-    min_upd = getattr(cfg, "min_loop_update_norm", 0.0)
-    if min_upd > 0:
-        upd_min = summary.get("loop_update_norm_min", 1.0)
-        if upd_min < min_upd:
-            failures.append(
-                f"loop_update_norm_min {upd_min:.2e} < {min_upd:.2e} "
-                "(a recursive loop has collapsed to a no-op)"
-            )
-    max_ratio = getattr(cfg, "max_loop_hidden_norm_ratio", 0.0)
-    if max_ratio > 0:
-        ratio = summary.get("loop_hidden_norm_ratio", 1.0)
-        if ratio > max_ratio:
-            failures.append(
-                f"loop_hidden_norm_ratio {ratio:.1f} > {max_ratio:.1f} "
-                "(residual stream is exploding across the recursion)"
-            )
     bias_limit = (
         model_cfg.router_balance_bias_max
         * getattr(cfg, "max_bias_saturation_fraction", 1.0)

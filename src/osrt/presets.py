@@ -81,7 +81,11 @@ OSRT_V7: dict = dict(
     # on the non-negative affinity; gating weights renormalise the selected
     # balanced affinities.
     router_affinity="sqrt_softplus",
-    max_position_embeddings=4096,
+    # 8192, not 4096: the anneal phase trains at seq 8192 (train_config) and
+    # RoPE tables are built to this length, so 4096 would index out of range
+    # in the last 15% of the run. Deployment context is still 4K (§8, "RoPE @
+    # 4096 ctx, 8K-capable"); this is the capability ceiling, not the target.
+    max_position_embeddings=8192,
 )
 
 

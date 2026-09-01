@@ -169,3 +169,45 @@ def test_resume_rejects_same_shape_recipe_drift(tmp_path):
     tc.peak_lr = 1e-9
     with pytest.raises(RuntimeError, match="TRAINING RECIPE drift"):
         assert_no_resume_drift(ck, model_config=mc, train_cfg=tc, path=path)
+
+
+# ── early-stop thresholds scale with the expert count ────────────────────
+
+def _thresholds(E, K):
+    """Mirror _check_early_stop_criteria's resolution exactly."""
+    cfg = PretrainConfig()
+    ln_e = math.log(E)
+    return {
+        "target_pte": ln_e - cfg.per_token_entropy_drop_frac * ln_e,
+        "min_raw_max": cfg.raw_max_prob_frac_of_topk / K,
+        "min_margin": cfg.top_margin_frac_of_topk / K,
+        "min_marginal": cfg.marginal_entropy_frac * ln_e,
+        "min_prebias_marginal": cfg.prebias_marginal_entropy_frac * ln_e,
+        "min_prebias_expert": cfg.prebias_expert_fraction_of_uniform / E,
+    }
+
+
+def test_relative_thresholds_reproduce_the_v6_absolutes_at_e8_top2():
+    """The fractions were chosen so v6's tuned numbers fall out exactly."""
+    t = _thresholds(E=8, K=2)
+    assert t["target_pte"] == pytest.approx(2.079 - 0.55, abs=0.01)
+    assert t["min_raw_max"] == pytest.approx(0.30)
+    assert t["min_margin"] == pytest.approx(0.10)
+    assert t["min_marginal"] == pytest.approx(1.80, abs=0.01)
+    assert t["min_prebias_marginal"] == pytest.approx(1.55, abs=0.01)
+    assert t["min_prebias_expert"] == pytest.approx(0.01)
+
+
+def test_relative_thresholds_scale_sanely_to_e28_top4():
+    """At v7's shape the old absolutes were wrong in both directions."""
+    t = _thresholds(E=28, K=4)
+    # raw_max: 0.30 would have been 8.4x uniform and killed a healthy top-4
+    # router. 0.15 is 0.6 of the 1/4 a sharpened top-4 pick sits near.
+    assert t["min_raw_max"] == pytest.approx(0.15)
+    # marginal entropy: 1.80 was 87% of ln 8; at E=28 that same 87% is 2.89,
+    # so a router sitting at the OLD 1.80 (54% of ln 28) is now caught.
+    assert t["min_marginal"] == pytest.approx(0.866 * math.log(28), abs=0.01)
+    assert 1.80 < t["min_marginal"]
+    # entropy must drop the same FRACTION of its ceiling, not the same nats
+    assert t["target_pte"] == pytest.approx(math.log(28) * (1 - 0.265), abs=0.01)
+    assert t["min_prebias_expert"] == pytest.approx(0.08 / 28)

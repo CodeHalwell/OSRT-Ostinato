@@ -89,13 +89,13 @@ GRPO reward because it was measurably harmful.
 `docs/v6/` holds the v6 handoff and Colab recipe: kept only because the
 roadmap cites them, labelled so nobody mistakes them for current.
 
-## To run anything: read `RUNBOOK.md` first
+## To run: read `RUNBOOK.md`
 
-Four stages, each gating the next: secrets → probe the card (Colab) → 30-step
-launch gate (`modal run app.py --sanity`) → the six-arm ladder
-(`scripts/launch_ladder.sh`). The runbook has the copy-paste commands and a
-table of what each result means. **There is no trunk-run command anywhere in
-this repo by design** — that decision is taken after the ladder reports.
+The design is committed and the trunk is one command — `modal run app.py
+--trunk-run`, or the Colab notebook. Roadmap **§19** records every design bet
+and its falsifier; results are read against that. The collapse detectors run
+during the run. The ladder (`scripts/launch_ladder.sh`) is for explaining
+results afterwards, not gating them.
 
 ## Environment & commands
 
