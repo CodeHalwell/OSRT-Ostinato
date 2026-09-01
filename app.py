@@ -29,11 +29,40 @@ GPU = "H100"
 TIMEOUT_H = 6
 TRUNK_TIMEOUT_H = 24   # Modal's ceiling; the trunk chains across invocations
 
+# Image ported from the v6 app.py that trained the whole v6 lineage. Two parts
+# are load-bearing, learned the hard way:
+#   * torch 2.10.0+cu128 from the PyTorch index. The first ladder launch pinned
+#     torch==2.8.0 and every arm died in Inductor's C++ codegen at the first
+#     compiled forward ("'zuf3' was not declared in this scope"): 2.8.0 cannot
+#     emit unbacked *float* symbols, which the router telemetry's .item() calls
+#     become under capture_scalar_outputs (needed for grouped GEMM). v6 ran the
+#     same code path on 2.10 without incident.
+#   * TOKENIZERS_PARALLELISM=false and expandable_segments — a fork deadlock at
+#     "Fetching first batch..." and a fragmentation OOM respectively, both seen
+#     on v6 and both fixed by these.
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "build-essential")
+    .env(
+        {
+            "PYTHONUNBUFFERED": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+    )
     .pip_install(
-        "torch==2.8.0", "transformers>=4.57", "datasets>=3.0",
-        "huggingface_hub>=0.35", "wandb", "numpy", "safetensors",
+        "torch==2.10.0+cu128",
+        extra_options="--index-url https://download.pytorch.org/whl/cu128",
+    )
+    .pip_install(
+        "transformers==5.3.0",
+        "datasets==4.6.1",
+        "triton==3.6.0",
+        "wandb==0.25.1",
+        "tokenizers==0.22.2",
+        "safetensors==0.7.0",
+        "huggingface_hub>=0.35",
+        "numpy",
     )
     .add_local_dir("src", "/root/src")
     .add_local_dir("tokenizer", "/root/tokenizer")
