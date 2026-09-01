@@ -242,3 +242,21 @@ def test_loop_guards_are_wired_into_the_early_stop_check():
         1000, _healthy_summary(loop_hidden_norm_ratio=600.0), cfg, mcfg)
     assert any(f.startswith("loop_hidden_norm_ratio") for f in blown)
 
+
+def test_hidden_norm_ratio_measures_within_loop_growth_not_embedding():
+    """Shapes lifted from the 2026-09-02 ladder W&B norms (18 effective layers,
+    norm_loop resets to unit RMS = 3.6e3 at each loop boundary)."""
+    from osrt.train import _hidden_norm_ratio
+
+    def avg(norms):
+        return {f"loop/hidden_norm_l{i}": v for i, v in enumerate(norms)}
+
+    nohra = [82.8, 7.57e5, 1.06e6] + [3.59e3, 6.5e5, 9.6e5] * 5
+    a = [75.0, 7.05e5, 3.67e7] + [3.62e3, 8.0e5, 3.5e7] * 5
+    g4 = [73.2, 9.89e5, 4.82e7, 2.72e9] + [3.6e3, 1.2e6, 5e7, 3e9] * 4
+    assert 1.0 < _hidden_norm_ratio(avg(nohra)) < 2.0     # residual composition intact
+    assert _hidden_norm_ratio(avg(a)) > 50                # blocks overwrite the stream
+    assert _hidden_norm_ratio(avg(g4)) > 1000
+    # deepest/embedding would have read ~1e4 on ALL of them, nohra included
+    assert _hidden_norm_ratio(avg([82.8, 7.57e5])) == 1.0  # too few layers: neutral
+

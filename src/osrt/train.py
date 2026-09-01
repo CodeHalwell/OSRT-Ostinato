@@ -669,16 +669,27 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
 
 
 def _hidden_norm_ratio(avg: dict) -> float:
-    """Residual-stream norm at the deepest effective layer over the first.
-    >> 1 is the 'residual explosion' both §17.3 papers describe; the value at
-    1.0 means the stream neither grows nor shrinks across the recursion."""
+    """Residual-stream growth WITHIN the recursion, past the first block.
+
+    Layer 0's hidden norm is the embedding (RMS ~0.02) and norm_loop resets
+    the stream to unit RMS at every loop boundary, so "deepest / first" is
+    embedding-vs-block-output and reads 1e4 on a healthy run. The ladder's
+    W&B norms (2026-09-02) showed the real pathology is inside a loop: on
+    the HRA arms each block's output was 50-300x its input, so the stream
+    inflated four orders of magnitude across three blocks (g4: 3e9). Measure
+    that: the largest hidden norm at any effective layer >= 1, over the
+    first block's output. ~1-2 is a residual network; >= 50 means blocks are
+    overwriting the stream rather than refining it (FLT §17.3).
+    """
     keys = sorted(
         (k for k in avg if k.startswith("loop/hidden_norm_l")),
         key=lambda k: int(k.rsplit("l", 1)[1]),
     )
-    if len(keys) < 2 or not avg.get(keys[0]):
+    if len(keys) < 3 or not avg.get(keys[1]):
         return 1.0
-    return float(avg[keys[-1]]) / float(avg[keys[0]])
+    first_block_out = float(avg[keys[1]])
+    return max(float(avg[k]) for k in keys[1:]) / first_block_out
+
 
 def _average_moe_snapshots(
     snapshots: list[dict[str, float]],

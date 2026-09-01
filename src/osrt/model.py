@@ -1524,10 +1524,14 @@ class RecursiveBlock(nn.Module):
                 rope_cos, rope_sin, past_key_value,
             )
         B, S, D = x_in.shape
-        adapter_out = (adapter_scale * (x_in @ adapter_a @ adapter_b)
-                       if adapter_a is not None else 0.0)
-
         h = self.norm_attn(x_in)
+        # HRA acts on the NORMALISED input. On the raw residual it was
+        # un-normalised multiplicative feedback on the stream (write ∝ ‖x‖,
+        # gain grows under Muon): the 2026-09-02 ladder measured every HRA
+        # arm's blocks writing 50-300x their input and the stream inflating
+        # 1e4 per loop, while the no-HRA arm composed residually (~1x).
+        adapter_out = (adapter_scale * (h @ adapter_a @ adapter_b)
+                       if adapter_a is not None else 0.0)
         q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
         c_kv_new = self.kv_down(h)            # (B, S, kv_dim) — un-rotated latent
 
@@ -1644,10 +1648,14 @@ class RecursiveBlock(nn.Module):
         history-wide GEMM there) differs -> gate with ppl/logit error.
         """
         B, S, D = x_in.shape
-        adapter_out = (adapter_scale * (x_in @ adapter_a @ adapter_b)
-                       if adapter_a is not None else 0.0)
-
         h = self.norm_attn(x_in)
+        # HRA acts on the NORMALISED input. On the raw residual it was
+        # un-normalised multiplicative feedback on the stream (write ∝ ‖x‖,
+        # gain grows under Muon): the 2026-09-02 ladder measured every HRA
+        # arm's blocks writing 50-300x their input and the stream inflating
+        # 1e4 per loop, while the no-HRA arm composed residually (~1x).
+        adapter_out = (adapter_scale * (h @ adapter_a @ adapter_b)
+                       if adapter_a is not None else 0.0)
         q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
         c_new = self.kv_down(h)                              # (B, 1, kv_dim)
 
