@@ -129,4 +129,11 @@ LADDER_ARMS: dict[str, dict] = {
     "a": {**_LADDER_BASE, "num_routed_experts": 14},   # 225M total, 1.83x
     "b": {**_LADDER_BASE, "num_routed_experts": 28},   # 365M total, 2.98x
     "c": {**_LADDER_BASE, "num_routed_experts": 56},   # 646M total, 5.26x
+    # DENSE CONTROL at matched active compute: top-4 of 4 means every expert
+    # is always on, so total == active and there is no sparsity. Required
+    # because Krajewski et al. (roadmap §17.4) find MoE needs LONGER training
+    # than dense before it pulls ahead, and v7's 5.3B-token budget is a third
+    # of their fitted minimum — without this arm, a "sparsity hurts" result
+    # and a "we are before the crossover" result look identical.
+    "dense": {**_LADDER_BASE, "num_routed_experts": 4, "dense_control": True},
 }

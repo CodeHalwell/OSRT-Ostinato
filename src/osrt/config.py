@@ -225,6 +225,11 @@ class OSRTConfig(PretrainedConfig):
         # target load — deterministic and free of update_rate/ema_rate/max.
         # v7 REQUIRES quantile (roadmap §14.6): at E=28 one dead expert is
         # 3.6% of block capacity, where the heuristic's tuning was done at 8.
+        # G3a dense control ONLY. Permits top_k == num_routed_experts so a
+        # "MoE" with every expert always active — i.e. a dense FFN of matched
+        # active compute — can be built as the ladder's control arm. Never set
+        # this on a real model: the sparsity guard below exists for a reason.
+        dense_control: bool = False,
         router_balance_mode: str = "heuristic",
         # Quantile-Balancing histogram resolution. Sets threshold precision:
         # the score range is bracketed in this many bins, so 2048 resolves a
@@ -349,6 +354,7 @@ class OSRTConfig(PretrainedConfig):
         self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
+        self.dense_control = dense_control
         self.router_balance_mode = router_balance_mode
         self.router_qb_histogram_bins = router_qb_histogram_bins
         self.router_balance_bias_enabled = router_balance_bias_enabled
@@ -430,7 +436,8 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"top_k_experts must be >= 1, got {self.top_k_experts}"
             )
-        if self.top_k_experts > self.num_routed_experts // 2:
+        if (not self.dense_control
+                and self.top_k_experts > self.num_routed_experts // 2):
             raise ValueError(
                 f"top_k_experts ({self.top_k_experts}) > "
                 f"num_routed_experts/2 ({self.num_routed_experts // 2}) "

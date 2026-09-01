@@ -654,6 +654,19 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
     return metrics, summary
 
 
+
+def _hidden_norm_ratio(avg: dict) -> float:
+    """Residual-stream norm at the deepest effective layer over the first.
+    >> 1 is the 'residual explosion' both §17.3 papers describe; the value at
+    1.0 means the stream neither grows nor shrinks across the recursion."""
+    keys = sorted(
+        (k for k in avg if k.startswith("loop/hidden_norm_l")),
+        key=lambda k: int(k.rsplit("l", 1)[1]),
+    )
+    if len(keys) < 2 or not avg.get(keys[0]):
+        return 1.0
+    return float(avg[keys[-1]]) / float(avg[keys[0]])
+
 def _average_moe_snapshots(
     snapshots: list[dict[str, float]],
 ) -> tuple[dict[str, float], dict[str, float]]:
@@ -715,6 +728,7 @@ def _average_moe_snapshots(
         "prebias_expert_min": avg.get("moe/prebias_expert_min_mean", 0.0),
         "loop_update_norm_min": avg.get("loop/update_norm_min", 0.0),
         "loop_update_norm_mean": avg.get("loop/update_norm_mean", 0.0),
+        "loop_hidden_norm_ratio": _hidden_norm_ratio(avg),
         "loop_update_norm_last": avg.get("loop/update_norm_last", 0.0),
         "dead_experts_total": avg.get("moe/dead_experts_total", 0.0),
     }
@@ -730,9 +744,13 @@ def _check_early_stop_criteria(
     raw_max = summary.get("clean_raw_max", summary["raw_max"])
     top_margin = summary.get("clean_top_margin", summary["top_margin"])
     marginal_h = summary.get("clean_marginal_H", summary["marginal_H"])
-    # per_token_entropy target: init near ln(num_routed) = ln(8) ≈ 2.079.
-    # Require it to drop by at least min_per_token_entropy_drop.
-    target_pte = 2.079 - cfg.min_per_token_entropy_drop
+    # per_token_entropy starts near ln(num_routed) at init (uniform router)
+    # and must drop by at least min_per_token_entropy_drop. This was a
+    # hard-coded 2.079 = ln(8) — correct for v6's 8 experts, silently wrong
+    # for v7's 28 (ln 28 = 3.332), which would have let an unsharpened router
+    # pass as sharpened by ~1.25 nats.
+    init_pte = math.log(model_cfg.num_routed_experts)
+    target_pte = init_pte - cfg.min_per_token_entropy_drop
     if per_token_h > target_pte:
         failures.append(
             f"clean_per_token_entropy {per_token_h:.3f} > "
@@ -771,6 +789,28 @@ def _check_early_stop_criteria(
             f"{min_prebias_expert:.4f} "
             "(one or more experts are dead before balance bias)"
         )
+    # Recursion health (roadmap §17.3). A deep loop whose residual update has
+    # gone to ~0 is a no-op — the model has silently become shallower than it
+    # is paying for. A residual stream whose norm runs away across the loops
+    # is the explosion two independent groups report per-layer RMSNorm does
+    # not prevent. Either fails the run; both are what the v6 loop-collapse
+    # war was about.
+    min_upd = getattr(cfg, "min_loop_update_norm", 0.0)
+    if min_upd > 0:
+        upd_min = summary.get("loop_update_norm_min", 1.0)
+        if upd_min < min_upd:
+            failures.append(
+                f"loop_update_norm_min {upd_min:.2e} < {min_upd:.2e} "
+                "(a recursive loop has collapsed to a no-op)"
+            )
+    max_ratio = getattr(cfg, "max_loop_hidden_norm_ratio", 0.0)
+    if max_ratio > 0:
+        ratio = summary.get("loop_hidden_norm_ratio", 1.0)
+        if ratio > max_ratio:
+            failures.append(
+                f"loop_hidden_norm_ratio {ratio:.1f} > {max_ratio:.1f} "
+                "(residual stream is exploding across the recursion)"
+            )
     bias_limit = (
         model_cfg.router_balance_bias_max
         * getattr(cfg, "max_bias_saturation_fraction", 1.0)

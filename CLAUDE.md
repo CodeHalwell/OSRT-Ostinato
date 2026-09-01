@@ -5,8 +5,10 @@ Guidance for AI assistants (Claude Code et al.) working in this repository.
 ## What this project is
 
 **OSRT** = **Optimized Sparse Recursive Transformer** — a small language model
-combining three ideas no released frontier model puts together at once:
-**sparse MoE** + **depth recurrence** + **Muon optimization**.
+combining **sparse MoE** + **depth recurrence** + **Muon optimization**.
+The first two together are prior art — MoEUT (NeurIPS 2024, roadmap §17.2) is
+the closest relative and should be cited as such. The three-way conjunction is
+OSRT's, but it is an engineering combination, not an architectural novelty.
 
 This repo is **v7**. Lineage v3–v6 lives in `CodeHalwell/OSRT-605M-A269M`,
 which is now an archive; v6's trained checkpoints remain on HF at

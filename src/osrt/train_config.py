@@ -156,6 +156,17 @@ class PretrainConfig:
     # forked workers leaks semaphores, and on a session-capped runtime a dead
     # worker costs the session. Raise on a dedicated box.
     dataloader_num_workers: int = 0
+
+    # ── Loop-collapse floor (roadmap §17.3) ────────────────────────────
+    # Per-effective-layer residual update ||Δx||/||x||. Two independent groups
+    # name residual-norm growth under weight-tied recurrence as THE failure
+    # mode, and one shows per-layer RMSNorm does not prevent it. A deep loop
+    # whose update → 0 has collapsed to a no-op; a loop whose hidden norm runs
+    # away is exploding. Both are checked at every eval and fail the run.
+    # 0 disables. OSRT's own probe measured a contracting iteration, so the
+    # defaults are loose — tighten once a v7 baseline exists.
+    min_loop_update_norm: float = 1e-3
+    max_loop_hidden_norm_ratio: float = 50.0   # last-loop / first-loop hidden norm
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
