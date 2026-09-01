@@ -194,6 +194,11 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
+        # Telemetry for the §17.3 stability analysis. Filled on every step
+        # (cheap RMS) with the orthogonality residual added only when
+        # `collect_ortho_error` is set, since that costs a matmul per param.
+        self.collect_ortho_error: bool = False
+        self.last_stats: dict[str, float] = {}
         # Validate at construction so a wrong param group fails loudly
         # instead of crashing inside the first step().
         for group in self.param_groups:
@@ -212,6 +217,10 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        pre_sq = post_sq = 0.0
+        n_el = 0
+        ortho_err_sum = 0.0
+        n_ortho = 0
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -275,12 +284,36 @@ class Muon(torch.optim.Optimizer):
                     else:
                         shape_scale = max(rows, cols) ** 0.5 * update_rms
 
+                # --- telemetry -------------------------------------------
+                # pre: RMS of the momentum-blended update Muon receives.
+                # post: RMS after Newton-Schulz, before shape_scale — how far
+                # from the raw step the orthogonalised step sits.
+                pre_sq += float(update.float().pow(2).sum())
+                post_sq += float(ortho.float().pow(2).sum())
+                n_el += update.numel()
+                if self.collect_ortho_error:
+                    o = ortho.float()
+                    if o.shape[0] > o.shape[1]:
+                        o = o.T
+                    k = o.shape[0]
+                    gram = o @ o.T
+                    eye = torch.eye(k, device=o.device, dtype=o.dtype)
+                    ortho_err_sum += float((gram - eye).norm() / (k ** 0.5))
+                    n_ortho += 1
+
                 # Decoupled weight decay (AdamW-style — applied to the
                 # parameter, not added to the gradient).
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd)
                 p.add_(ortho, alpha=-lr * shape_scale)
 
+        if n_el:
+            self.last_stats = {
+                "muon/update_rms_pre": (pre_sq / n_el) ** 0.5,
+                "muon/update_rms_post": (post_sq / n_el) ** 0.5,
+            }
+            if n_ortho:
+                self.last_stats["muon/ortho_err"] = ortho_err_sum / n_ortho
         return loss
 
 

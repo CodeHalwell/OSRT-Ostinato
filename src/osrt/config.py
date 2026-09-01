@@ -49,6 +49,12 @@ class OSRTConfig(PretrainedConfig):
         # Recursive structure (unchanged from v4)
         num_blocks: int = 3,
         recursive_loops: int = 6,
+        # Per-effective-layer HRA adapters — OSRT's mechanism for letting
+        # weight-tied blocks behave differently at different loops. MoEUT
+        # solves the same problem with layer GROUPING and no adapters
+        # (roadmap §17.2); use_hra=False is the ablation arm that asks whether
+        # the adapters add anything over the grouping the 3 blocks already are.
+        use_hra: bool = True,
         adapter_rank: int = 16,
         adapter_alpha: float = 16.0,
 
@@ -330,6 +336,7 @@ class OSRTConfig(PretrainedConfig):
 
         self.num_blocks = num_blocks
         self.recursive_loops = recursive_loops
+        self.use_hra = use_hra
         self.adapter_rank = adapter_rank
         self.adapter_alpha = adapter_alpha
         self.swiglu_clamp = swiglu_clamp

@@ -479,9 +479,22 @@ def _collect_moe_metrics(model: nn.Module) -> tuple[dict, dict]:
         if blk.moe.balance_loss is not None:
             balance_losses.append(blk.moe.balance_loss.item())
         if hasattr(blk.moe, "router_balance_bias"):
-            bias_abs_max = blk.moe.router_balance_bias.abs().max().item()
+            bias = blk.moe.router_balance_bias           # (num_loops, num_routed)
+            bias_abs_max = bias.abs().max().item()
             bias_abs_maxes.append(bias_abs_max)
             metrics[f"moe/bias_abs_max_b{bi}"] = bias_abs_max
+            # §17.3: the balance-bias TRAJECTORY per loop, not just its max.
+            # Under Quantile Balancing the bias is a one-shot solve, so a
+            # per-loop spread that keeps growing means the router's raw
+            # affinities are diverging across loops — the weight-tied
+            # analogue of residual explosion, visible before the loss is.
+            for li in range(bias.shape[0]):
+                row = bias[li]
+                metrics[f"moe/b{bi}/loop{li}/bias_std"] = row.std().item()
+                metrics[f"moe/b{bi}/loop{li}/bias_range"] = (
+                    row.max() - row.min()).item()
+            metrics[f"moe/b{bi}/bias_loop_spread"] = (
+                bias.std(dim=1).max() - bias.std(dim=1).min()).item()
         if hasattr(blk.moe, "expert_ema_fraction"):
             ema = blk.moe.expert_ema_fraction
             ema_max = ema.max().item()
@@ -1328,6 +1341,11 @@ def run_training(
                 moe_snapshots.append(micro_metrics)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+        # §18.2: Newton-Schulz orthogonality error costs a matmul per param, so
+        # collect it only on the steps that get logged.
+        _muon = getattr(optimizer, "muon", None)
+        if _muon is not None:
+            _muon.collect_ortho_error = ((step + 1) % train_cfg.log_interval == 0)
         optimizer.step()
         apply_router_balance_updates(model)
 
@@ -1437,6 +1455,8 @@ def run_training(
                     "train/seq_len": current_seq_len,
                 }
                 log_dict.update(moe_metrics)
+                if _muon is not None and _muon.last_stats:
+                    log_dict.update(_muon.last_stats)
                 wandb.log(log_dict, step=step)
 
         elif step < 100:

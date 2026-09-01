@@ -136,4 +136,22 @@ LADDER_ARMS: dict[str, dict] = {
     # of their fitted minimum — without this arm, a "sparsity hurts" result
     # and a "we are before the crossover" result look identical.
     "dense": {**_LADDER_BASE, "num_routed_experts": 4, "dense_control": True},
+    # ── E1 (roadmap §18.1): do per-loop adapters add anything over grouping?
+    # Identical to arm a except the HRA adapters are absent — a pure shared
+    # layer, MoEUT-style. If this matches `a` within noise, the adapters are
+    # inert given that 3 blocks already ARE grouping (G=3), and v7 drops them.
+    # The adapters are ALL-ACTIVE params, so removing them removes compute; a
+    # bare ablation would confound "adapters help" with "8.8% more FLOPs help".
+    # Reinvest them one-for-one into the shared expert (also all-active):
+    # 1920 -> 2688 is exactly 7,077,888 params, matching a to the parameter
+    # on both total and FLOP-equivalent.
+    "nohra": {**_LADDER_BASE, "num_routed_experts": 14, "use_hra": False,
+              "shared_expert_hidden": 2688},
+    # ── G4 with MoEUT's G=4 prior (roadmap §17.2): 4 blocks x 5 loops.
+    # A fourth block carries its own attention + shared expert, so total and
+    # compute cannot BOTH be held when block count changes. This shape holds
+    # both to within 2% (total -0.7%, FLOP-eq +1.8% vs a) at 20 effective
+    # layers vs a's 18: more distinct blocks, slightly smaller experts.
+    "g4": {**_LADDER_BASE, "num_blocks": 4, "recursive_loops": 5,
+           "num_routed_experts": 11, "expert_hidden": 960},
 }

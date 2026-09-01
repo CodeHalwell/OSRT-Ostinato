@@ -1524,7 +1524,8 @@ class RecursiveBlock(nn.Module):
                 rope_cos, rope_sin, past_key_value,
             )
         B, S, D = x_in.shape
-        adapter_out = adapter_scale * (x_in @ adapter_a @ adapter_b)
+        adapter_out = (adapter_scale * (x_in @ adapter_a @ adapter_b)
+                       if adapter_a is not None else 0.0)
 
         h = self.norm_attn(x_in)
         q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
@@ -1643,7 +1644,8 @@ class RecursiveBlock(nn.Module):
         history-wide GEMM there) differs -> gate with ppl/logit error.
         """
         B, S, D = x_in.shape
-        adapter_out = adapter_scale * (x_in @ adapter_a @ adapter_b)
+        adapter_out = (adapter_scale * (x_in @ adapter_a @ adapter_b)
+                       if adapter_a is not None else 0.0)
 
         h = self.norm_attn(x_in)
         q = self.q_proj(h).view(B, S, self.heads, self.head_dim)
@@ -1889,8 +1891,12 @@ class OSRTModel(OSRTPreTrainedModel):
             [RecursiveBlock(config, block_idx=bi) for bi in range(config.num_blocks)]
         )
 
-        # Per-pass low-rank adapters
-        total_pairs = config.num_blocks * config.recursive_loops
+        # Per-pass low-rank adapters (one pair per effective layer). With
+        # use_hra=False the lists are empty and every consumer receives None —
+        # the block then runs as a pure shared layer, MoEUT-style.
+        self.use_hra = config.use_hra
+        total_pairs = (config.num_blocks * config.recursive_loops
+                       if config.use_hra else 0)
         self.adapters_a = nn.ParameterList(
             [nn.Parameter(torch.randn(config.dim, config.adapter_rank) * 0.01)
              for _ in range(total_pairs)]
@@ -1899,7 +1905,8 @@ class OSRTModel(OSRTPreTrainedModel):
             [nn.Parameter(torch.zeros(config.adapter_rank, config.dim))
              for _ in range(total_pairs)]
         )
-        self.adapter_scale = config.adapter_alpha / config.adapter_rank
+        self.adapter_scale = (
+            config.adapter_alpha / config.adapter_rank if config.use_hra else 0.0)
 
         # Recursive-loop collapse telemetry. Per effective layer (loop × block)
         # we record the relative residual update ||Δx|| / ||x|| and the hidden
@@ -2118,8 +2125,8 @@ class OSRTModel(OSRTPreTrainedModel):
         for loop in range(n_loops_to_run):
             for block_idx, block in enumerate(self.blocks):
                 idx = loop * self.config.num_blocks + block_idx
-                adapter_a = self.adapters_a[idx]
-                adapter_b = self.adapters_b[idx]
+                adapter_a = self.adapters_a[idx] if self.use_hra else None
+                adapter_b = self.adapters_b[idx] if self.use_hra else None
                 if static_cache is not None:
                     layer_past = static_cache.layer(idx)
                 elif past_key_values is not None:
