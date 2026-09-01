@@ -4,14 +4,19 @@ The design is committed (roadmap §14, §16, §19). No ladder, no launch gate:
 the collapse detectors run *during* the run instead of before it. §19 lists
 every bet and what would falsify it — read results against that.
 
-## 1 · Secrets (once)
+## 1 · Secrets
 
-**Colab:** add `HF_TOKEN` (write) and `WANDB_API_KEY` in the Secrets panel.
-**Modal:** in whichever workspace will run it:
+**Already there.** Four workspaces carry `hf-secret` (HF_TOKEN) and
+`wandb-secret` (WANDB_API_KEY) from v6 — danielhalwell, build-small,
+codhe-hugging-mcp, gradio-winter-hack — and the launcher uses those four.
+`agents-of-output` has neither; to use it too:
 
 ```bash
-uv run modal secret create osrt-secrets HF_TOKEN=hf_... WANDB_API_KEY=...
+MODAL_PROFILE=agents-of-output uv run modal secret create hf-secret HF_TOKEN=hf_...
+MODAL_PROFILE=agents-of-output uv run modal secret create wandb-secret WANDB_API_KEY=...
 ```
+
+**Colab:** `HF_TOKEN` and `WANDB_API_KEY` in the Secrets panel.
 
 ## 2 · Run
 

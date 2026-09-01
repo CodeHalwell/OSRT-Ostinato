@@ -5,20 +5,23 @@
 #   scripts/launch_ladder.sh --dry-run  # print what would run, launch nothing
 #   scripts/launch_ladder.sh a nohra    # just these arms
 #
-# Each workspace needs the `osrt-secrets` secret (HF_TOKEN, WANDB_API_KEY).
+# Each workspace needs BOTH `hf-secret` (HF_TOKEN) and `wandb-secret`
+# (WANDB_API_KEY) — the v6 names, already present in four workspaces.
 # The script checks and refuses rather than burning a cold-start on a run that
 # will die at the first HF call.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# arm -> workspace. Six arms, five workspaces: the two cheapest share one.
+# arm -> workspace. Six arms over the FOUR workspaces that carry both
+# hf-secret and wandb-secret (agents-of-output has neither — add them there
+# to spread wider). The two G3a controls share; the experiments each get one.
 declare -A WS=(
-  [a]=agents-of-output
-  [b]=danielhalwell
-  [c]=build-small
-  [dense]=codhe-hugging-mcp
+  [a]=danielhalwell
+  [b]=build-small
+  [c]=codhe-hugging-mcp
+  [dense]=danielhalwell
   [nohra]=gradio-winter-hack
-  [g4]=agents-of-output
+  [g4]=build-small
 )
 ORDER=(a b c dense nohra g4)
 STEPS="${STEPS:-8000}"
@@ -38,13 +41,14 @@ for arm in "${ARMS[@]}"; do
   ws="${WS[$arm]:?unknown arm $arm}"
   [ -n "${CHECKED[$ws]:-}" ] && continue
   CHECKED[$ws]=1
-  if MODAL_PROFILE="$ws" uv run modal secret list 2>/dev/null | grep -q "osrt-secrets"; then
-    echo "  ✓ $ws has osrt-secrets"
-  else
-    echo "  ✗ $ws is MISSING osrt-secrets — create it there first:"
-    echo "      MODAL_PROFILE=$ws uv run modal secret create osrt-secrets HF_TOKEN=... WANDB_API_KEY=..."
-    MISSING=1
-  fi
+  have=$(MODAL_PROFILE="$ws" uv run modal secret list 2>/dev/null)
+  ok=1
+  for sec in hf-secret wandb-secret; do
+    if ! grep -q "$sec" <<<"$have"; then
+      echo "  ✗ $ws is MISSING $sec"; ok=0; MISSING=1
+    fi
+  done
+  [ "$ok" -eq 1 ] && echo "  ✓ $ws has hf-secret + wandb-secret"
 done
 [ -n "${MISSING:-}" ] && [ "$DRY" -eq 0 ] && { echo; echo "refusing to launch with missing secrets"; exit 1; }
 echo

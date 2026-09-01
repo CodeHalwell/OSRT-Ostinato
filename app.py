@@ -13,7 +13,8 @@ runs the trunk, its 30-step gate, and the ladder arms.
 Each arm is a separate invocation on purpose: with N x $30 workspaces the arms
 run in parallel, one per workspace, and a arm that dies takes only itself down.
 
-Secrets required: `osrt-secrets` containing HF_TOKEN and WANDB_API_KEY.
+Secrets required: `hf-secret` (HF_TOKEN) and `wandb-secret` (WANDB_API_KEY) —
+the names every existing workspace already carries from v6.
 """
 from __future__ import annotations
 
@@ -43,7 +44,8 @@ vol = modal.Volume.from_name("osrt-v7-ladder-ckpt", create_if_missing=True)
     gpu=GPU,
     timeout=TIMEOUT_H * 3600,
     volumes={"/vol": vol},
-    secrets=[modal.Secret.from_name("osrt-secrets")],
+    secrets=[modal.Secret.from_name("hf-secret"),
+             modal.Secret.from_name("wandb-secret")],
 )
 def ladder_arm(arm: str, total_steps: int, seq_len: int) -> dict:
     """Run one G3a arm. Active params are identical across arms; only the
@@ -106,7 +108,8 @@ def ladder_arm(arm: str, total_steps: int, seq_len: int) -> dict:
     gpu=GPU,
     timeout=45 * 60,
     volumes={"/vol": vol},
-    secrets=[modal.Secret.from_name("osrt-secrets")],
+    secrets=[modal.Secret.from_name("hf-secret"),
+             modal.Secret.from_name("wandb-secret")],
 )
 def v7_sanity(steps: int = 30) -> dict:
     """The launch gate: a hard-capped run of the REAL committed v7 shape.
@@ -183,7 +186,8 @@ def v7_sanity(steps: int = 30) -> dict:
     gpu=GPU,
     timeout=TRUNK_TIMEOUT_H * 3600,
     volumes={"/vol": vol},
-    secrets=[modal.Secret.from_name("osrt-secrets")],
+    secrets=[modal.Secret.from_name("hf-secret"),
+             modal.Secret.from_name("wandb-secret")],
 )
 def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
     """The v7 pretraining run. Committed without gates — see roadmap §19 for
