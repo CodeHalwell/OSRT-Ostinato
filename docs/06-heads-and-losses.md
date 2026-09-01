@@ -370,14 +370,13 @@ DeepSeek-V3 §5.2 sequence-wise balance: the same Switch formula but computed
 single long document dominating one expert even when the *global* batch is
 balanced — a long-context (phase 3, `seq_len=8192`) failure mode.
 
-> **Status: implemented but OFF in the canonical config.**
-> `router_seq_balance_loss_coeff` defaults to `0.0` (`src/osrt/config.py:122`)
-> and the preset does not set it. So `seq_balance_loss` is *computed* and
-> *logged* every step but contributes **exactly 0** to the gradient until you
-> opt in (intended for the long-context phase). It appears in the total-loss
-> formula below for completeness; in the standard run its coefficient zeroes it
-> out. (Ignore `ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale and
-> conflates the global and sequence balance losses.)
+> **Status: ON in the canonical config since 2026-08-31.**
+> `router_seq_balance_loss_coeff` defaults to `0.0` in `OSRTConfig` (so
+> v6-reproduction runs are untouched), but `OSRT_V7` sets it to `1e-4` per
+> the roadmap's §14.1 committed router line (V4 runs exactly this
+> coefficient). `seq_balance_loss` is computed and logged every step either
+> way. (Ignore `ARCHITECTURE.md §11.3`'s `α=0.0001` — that section is stale
+> and conflates the global and sequence balance losses.)
 
 The aux-loss-**free** balance-bias controller is a *separate* heuristic: a
 per-expert additive bias updated outside the gradient. It is **not** one of these
@@ -439,13 +438,13 @@ else:
     loss = task_loss
 ```
 
-With the canonical `OSRT_605M_A288M` coefficients:
+With the canonical `OSRT_V7` coefficients:
 
 ```
 L_train = task_loss
         + 0.10  · (Σ_layers balance_loss   / n_moe_layers)
         + 1e-3  · (Σ_layers z_loss          / n_moe_layers)
-        + 0.0   · (Σ_layers seq_balance_loss / n_moe_layers)   # off in canonical
+        + 1e-4  · (Σ_layers seq_balance_loss / n_moe_layers)   # on since 2026-08-31
         + 0.05  · Σ_{r=1}^{5} aux_loop_CE_r                     # uniform per-loop
         + 0.30  · (mtp_CE_{+2} + mtp_CE_{+3})
 
