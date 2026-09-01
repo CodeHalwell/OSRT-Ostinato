@@ -38,9 +38,9 @@ See `docs/specs/2026-08-11-v7-roadmap.md` §14. Summary:
 
 - 3 physical blocks × 6 loops (18 effective layers), dim 1536
 - **28 × h2112 routed experts per block, top-4** (14.3% density)
-- 1 × h2816 shared expert per block
+- 1 × h3840 shared expert per block (HRA's 14.16M params reinvested here — E1)
 - GQA 24q/8kv, KDV compressed-latent cache, QK-norm
-- HRA rank 256, native, per effective layer
+- HRA **off** in pretraining (roadmap §18.1 result); rank-256 adapter for post-training only
 - Tokenizer: **SmolLM2-based, 49,280 padded / 49,184 real** — G2 resolved (§16)
 - **mHC: OFF** — decision stands (§12.3; its 2026-08-18 amendment keeps one
   G3 ladder slot as cheap insurance, so "off" is settled, not unrevisitable)

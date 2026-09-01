@@ -23,9 +23,9 @@ is a design constraint, not a deployment afterthought.
 |---|---|
 | blocks × loops | 3 × 6 (18 effective layers), dim 1536 |
 | routed experts | 28 × h2112 per block, top-4 (14.3% density) |
-| shared expert | 1 × h2816 per block |
+| shared expert | 1 × h3840 per block (absorbed the HRA budget, E1) |
 | attention | GQA 24q/8kv, KDV compressed-latent cache, QK-norm |
-| adapters | HRA rank 256, native, per effective layer |
+| adapters | **off in pretraining** (E1, 2026-09-02); HRA rank 256 attached to the frozen base for SFT/GRPO |
 | optimizer | Muon (2D hidden matrices) + AdamW (embeddings, norms, biases) |
 
 **Parameter counts are not stated in this README on purpose.** Generate them:

@@ -42,8 +42,8 @@ deliberately quotes no number that the script does not generate.
 | Vocab | 49,280 padded / 49,184 real (SmolLM2 base + 32 OSRT specials) |
 | Physical blocks × loops | 3 × 6 = **18 effective layers** |
 | Attention | GQA 24 query / 8 KV heads, head_dim 64 |
-| MoE | 1 shared (h=2,816) + 28 routed (h=2,112), top-4 |
-| HRA adapters | rank 256, 18 (one per effective layer) |
+| MoE | 1 shared (h=3,840) + 28 routed (h=2,112), top-4 |
+| HRA adapters | **off in pretraining** (E1, 2026-09-02 — see §18.1 Result); rank-256 post-training adapter |
 | MTP heads | 2 (training-only, dropped at deploy) |
 
 > **Naming rule.** No parameter count appears in any name — repo, preset,
@@ -87,7 +87,7 @@ assembled afterwards.
 |---|---|---|
 | G3a — does the token requirement track active or total? | unrun; MoEUT prior says total helps with diminishing returns | ladder arms a/b/c/dense |
 | G4 — 3×6 vs 4×5 blocks | unrun; MoEUT prior says G=4 at this scale | arm g4 |
-| E1 — do per-loop adapters beat grouping? | unrun; iso-compute to the parameter | arm nohra |
+| E1 — do per-loop adapters beat grouping? | **run 2026-09-02**: nohra −1.5 nats at 600 steps; the raw-residual adapter broke residual composition (roadmap §18.1 Result). HRA now off in pretraining. | arm nohra |
 | E2 — Muon + QB stability under recurrence | instrumented on every run | telemetry, §18.2 |
 | E3 — how many loops at decode? | tool built; on v6 it said "do not trim" | `scripts/recommend_loop_count.py` |
 
@@ -114,7 +114,7 @@ input_ids
    │     │ Attention sub-block                            │   │
    │     │   GQA + KDV (Key-Derived Value) latent cache   │   │ → ch.02
    │     │   QK-Norm, RoPE, flash SDPA (no sink)          │   │
-   │     │   + HRA rank-256 adapter (this effective layer)│   │ → ch.04
+   │     │   (+ HRA adapter — post-training only, E1)     │   │ → ch.04
    │     ├──────────────────────────────────────────────┤   │
    │     │ MoE sub-block                                  │   │
    │     │   loop_emb biases the router                   │   │ → ch.05
@@ -146,7 +146,7 @@ shrinks it for deployment.
 | 01 | [Tokenizer & Embedding](01-tokenizer-embedding.md) | byte-level BPE, the 21-token contract (14 built / 7 missing), tied embedding ↔ LM head |
 | 02 | [Attention](02-attention.md) | GQA via flash `F.scaled_dot_product_attention`, the KDV (Key-Derived Value) latent KV cache, RoPE, QK-Norm (attention sink dropped) |
 | 03 | [MoE & Routing](03-moe-and-routing.md) | shared + 28 routed experts, sqrt(softplus) router, aux-loss-free balancing, hash routing, SwiGLU clamp |
-| 04 | [HRA Adapters](04-hra-adapters.md) | the 18 rank-256 attention-path adapters (+ the separate injected retrofit path) |
+| 04 | [HRA Adapters](04-hra-adapters.md) | the rank-256 attention-path adapters — off in pretraining after E1; the post-training adapter |
 | 05 | [Recursion](05-recursion.md) | depth recurrence, loop embeddings, loop dropout, per-loop aux heads |
 | 06 | [Heads & Losses](06-heads-and-losses.md) | tied LM head, per-loop aux losses, MTP heads, router losses, the total loss |
 | 07 | [Optimizer (Muon)](07-optimizer.md) | Muon + Newton-Schulz, the Muon/AdamW split, decoupled weight decay |

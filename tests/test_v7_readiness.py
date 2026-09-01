@@ -36,6 +36,8 @@ def test_v7_preset_is_the_committed_shape():
     assert cfg.situ_glu is True
     assert cfg.router_balance_mode == "quantile"
     assert cfg.router_seq_balance_loss_coeff == 1e-4
+    assert cfg.use_hra is False                # E1: off for pretraining
+    assert cfg.shared_expert_hidden == 3840    # HRA params reinvested exactly
     assert "use_mhc" not in OSRT_V7          # removed, not merely disabled
     with torch.device("meta"):
         n = sum(p.numel() for p in OSRTForCausalLM(cfg).parameters())

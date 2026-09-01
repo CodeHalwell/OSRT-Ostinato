@@ -1,5 +1,18 @@
 # HRA — High-Rank Adapters
 
+> **Status (2026-09-02): HRA is OFF for v7 pretraining.** E1 (roadmap §18.1)
+> found the adapter, as it stood, was un-normalised multiplicative feedback on
+> the residual stream: computed on the raw residual and added after the
+> post-norm, its write scaled with ‖x‖ and its gain grew under Muon, so inside
+> each loop every block's output was 50–300× its input and residual
+> composition was gone. The no-HRA ladder arm led by 1.5 nats at 600 steps.
+> The adapter now acts on the **normalised** input (`h`), its 14,155,776
+> parameters went into the shared expert (2,816 → 3,840, exact), and HRA's
+> role in v7 is the **post-training adapter** on a frozen base (SFT, GRPO).
+> Everything below describes the mechanism; read "per effective layer" as
+> "when attached".
+
+
 > **Updated to v7 (2026-09-01).** Config values, parameter counts, expert
 > layout, tokenizer and optimizer recipe below are the committed v7 shape
 > (`OSRT_V7`: 968,468,355 physical / 263,035,779 active). `file:line`

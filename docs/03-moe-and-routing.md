@@ -64,7 +64,7 @@ For the OSRT-605M preset (`presets.py:22-64`) the numbers are:
 
 | Component       | Count | Hidden (`h`) | Active per token        |
 |-----------------|-------|--------------|-------------------------|
-| Shared expert   | 1     | 2,816        | always                  |
+| Shared expert   | 1     | 3,840        | always                  |
 | Routed experts  | 28    | 2,112        | top-4 (14.3% of the pool) |
 
 ---
@@ -83,7 +83,7 @@ unconditionally. The routed experts are then free to specialise on what's
 left, and the model always has a dense backbone to fall back on.
 
 In OSRT the shared expert is *narrower* than each routed expert
-(`h=2,816` vs `h=2,112` in v7 — note the **inversion**: the shared expert is now
+(`h=3,840` vs `h=2,112` in v7 — note the **inversion**: the shared expert is now
 *wider* than any single routed expert, where in v6 it was narrower than the
 8 × h3,840 routed pool). That was a v6 budget decision — the 8 wide routed
 experts are where the parameters (and the specialisation capacity) live; the
@@ -93,7 +93,7 @@ shared expert is a lean always-on floor.
 > `expert_hidden=2048` and `shared_expert_hidden=4096`
 > (`config.py:80-81`) — i.e. the shared expert is *wider*. That is **not**
 > the trained model. The preset overrides both
-> (`expert_hidden=2112`, `shared_expert_hidden=2816`,
+> (`expert_hidden=2112`, `shared_expert_hidden=3840`,
 > `presets.py:33-34`), making the routed experts wider, as intended.
 
 The shared/routed split also maps onto a two-level gating scheme (§11): the
@@ -714,7 +714,7 @@ truth. Running it on the canonical preset (`OSRT_605M_A288M`) reports:
 
 ```
 cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
-     experts=28 top_k=4 h_routed=2112 h_shared=2816 rank=256 mtp=2
+     experts=28 top_k=4 h_routed=2112 h_shared=3840 rank=256 mtp=2
 ----------------------------------------------------------------
   embedding           100,690,944
   attention            17,308,032

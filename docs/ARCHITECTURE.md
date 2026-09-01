@@ -107,14 +107,14 @@ Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
 
   -- per-sub-block A/B/C generators; shared across loop iterations
 
-Shared experts × 3 (SwiGLU, h=2,816)             38,928,384     38,928,384
-  -- per block: 3 × 1,536 × 2,816 = 12,976,128; always active
+Shared experts × 3 (SiTU-GLU, h=3,840)           53,084,160     53,084,160
+  -- per block: 3 × 1,536 × 3,840 = 17,694,720; always active (absorbed HRA's 14,155,776 — E1)
 
 Routed experts: 3 × 28 × (SiTU-GLU, h=2,112)    817,496,064    116,785,152
   -- per expert: 3 × 1,536 × 2,112 = 9,732,096
   -- top-4 of 28 active per token → 4/28 = 14.3% routing density
 
-HRA adapters (rank 256, 18 injection points)     14,155,776     14,155,776
+HRA adapters (OFF in pretraining — E1 §18.1)              0              0
   -- adapter_a (1,536 × 256) + adapter_b (256 × 1,536) = 786,432 each
   -- ONE rank-256 parallel adapter per effective layer (3 blocks ×
      6 loops = 18), applied on the attention sub-block input
@@ -154,7 +154,8 @@ is ~283M; the 278M headline is the inference forward.)
 - **Physical transformer blocks**: 3
 - **Recursive loops**: 6 → 18 effective layers
 - **Attention**: GQA 24 query heads / 8 KV heads / head_dim 64
-- **MoE**: 1 shared expert (h=2,816) + **28 routed (h=2,112)**, top-4, Quantile Balancing, SiTU-GLU
+- **MoE**: 1 shared expert (h=3,840) + **28 routed (h=2,112)**, top-4, Quantile Balancing, SiTU-GLU
+- **HRA**: **off** in pretraining (E1, 2026-09-02); rank-256 adapter on the normalised input for SFT/GRPO
   - 8 (not 12) for denser routing — see §2.5
 - **HRA adapter rank**: 256 (real high-rank, not LoRA-style 16)
 - **HRA injection points**: 18 (implementation-defined; see §2.4)
@@ -599,7 +600,7 @@ HRA adapter applied to `W_O` output additively.
 ### 7.1 Structure
 
 Each MoE block has:
-- 1 always-active shared expert (h=2,816)
+- 1 always-active shared expert (h=3,840; was 2,816 before E1 moved HRA's budget here)
 - **28 routed experts** (h=2,112), top-4 active per token
 - 1 router (linear projection + sqrt-softplus affinity)
 
@@ -616,9 +617,9 @@ wider (h=3,840) to absorb the capacity.
 ### 7.2 Shared expert (SwiGLU)
 
 ```
-w_gate ∈ ℝ^(1536 × 2816)       # 4.33M params
-w_up ∈ ℝ^(1536 × 2816)         # 4.33M params
-w_down ∈ ℝ^(2816 × 1536)       # 4.33M params
+w_gate ∈ ℝ^(1536 × 3840)       # 5.90M params
+w_up ∈ ℝ^(1536 × 3840)         # 5.90M params
+w_down ∈ ℝ^(3840 × 1536)       # 5.90M params
 
 shared_output(x) = w_down @ (SiLU(w_gate @ x) ⊙ (w_up @ x))
 ```

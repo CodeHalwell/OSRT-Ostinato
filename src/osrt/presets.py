@@ -40,8 +40,17 @@ OSRT_V7: dict = dict(
     num_routed_experts=28,
     top_k_experts=4,            # 4/28 = 14.3% density
     expert_hidden=2112,
-    shared_expert_hidden=2816,
-    adapter_rank=256,           # real HRA capacity (NOT LoRA-style 16)
+    # E1 (roadmap §18.1, 2026-09-02): HRA is OFF for pretraining. The adapter
+    # on the raw residual was un-normalised feedback that broke residual
+    # composition inside every loop; the no-HRA ladder arm led by 1.5 nats.
+    # Its 14,155,776 all-active params (18 x 2 x 1536 x 256) go into the
+    # shared expert instead: 3 blocks x 3 x 1536 x (3840 - 2816) is exactly
+    # the same count, so total, active and per-token FLOPs are unchanged.
+    # HRA is attached to the frozen base as the post-training adapter; the
+    # rank/alpha below size that adapter (now on the normalised input).
+    use_hra=False,
+    shared_expert_hidden=3840,
+    adapter_rank=256,           # post-training adapter capacity (NOT LoRA-style 16)
     adapter_alpha=256.0,        # match rank so scale = 1.0
     # SiTU-GLU (graduated, §14.1): param-free smooth cap that REPLACES
     # SwiGLU + the hard clamp — no parameter change, so the budget numbers
