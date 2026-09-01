@@ -26,7 +26,7 @@ import modal
 
 APP = "osrt-v7-ladder"
 GPU = "H100"
-TIMEOUT_H = 6
+TIMEOUT_H = 8
 TRUNK_TIMEOUT_H = 24   # Modal's ceiling; the trunk chains across invocations
 
 # Image ported from the v6 app.py that trained the whole v6 lineage. Two parts
