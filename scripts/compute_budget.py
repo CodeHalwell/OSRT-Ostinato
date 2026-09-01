@@ -1,6 +1,6 @@
 """Canonical parameter / active-param budget for osrt configs.
 
-Replaces the hand-derived tables in README.md / ARCHITECTURE.md with numbers
+Replaces the hand-derived tables in README.md / docs/ARCHITECTURE.md with numbers
 generated from the real model on a meta device (no memory allocated).
 
 IMPORTANT: by default this reports the canonical preset OSRT_V7, which

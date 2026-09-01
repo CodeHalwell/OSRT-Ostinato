@@ -3,14 +3,14 @@
 **Date:** 2026-06-16
 **Status:** Investigation / hypothesis — NOT approved, NOT implemented.
 **Owner axis:** decode memory bandwidth (the project's stated attention thesis).
-**Companion:** `ARCHITECTURE.md` §6.2–6.3 (KDV), `docs/02-attention.md`.
+**Companion:** `docs/ARCHITECTURE.md` §6.2–6.3 (KDV), `docs/02-attention.md`.
 
 ---
 
 ## 1. Why this note exists
 
 OSRT's attention design is justified on **memory bandwidth**, not expressivity
-(`ARCHITECTURE.md` §6.2): autoregressive decode is HBM-bandwidth-bound, so
+(`docs/ARCHITECTURE.md` §6.2): autoregressive decode is HBM-bandwidth-bound, so
 decode throughput scales as `1 / (cache bytes per token per layer)`. KDV banks a
 **constant 2×** on that axis (cache 512 scalars/token/layer instead of 1024).
 

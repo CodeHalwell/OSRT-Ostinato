@@ -43,7 +43,7 @@ Structural checks:
   `probe_gpu.py` is G7 part 1, the budget cell asserts the committed
   968,468,355 / 263,035,779, and the launch cell is a deliberately short run.
 - **Hygiene holds**: weights/data/jsonl/PDFs gitignored; `docs/v6/` and
-  `ARCHITECTURE.md` carry superseded banners; `train_config.py` honestly
+  `docs/ARCHITECTURE.md` carry superseded banners; `train_config.py` honestly
   declares its values inherited-from-v6 and gated on G3a.
 
 Gate board as actually verified: **G1 closed** (mHC off, §12.3 — but see

@@ -2,7 +2,7 @@
 """Train the custom 65K BPE tokenizer for OSRT-605M (v6 contract).
 
 v6 change vs the v4 32K tokenizer: vocab 32768 → 65536, and the special
-set is the full 21-token contract (ARCHITECTURE.md §3.2) — adds
+set is the full 21-token contract (docs/ARCHITECTURE.md §3.2) — adds
 <|end_turn|>, tool_call/result, image, audio (IDs 14-20) that the v4
 tokenizer lacked — plus an 11-slot reserved band (21-31) so real BPE
 vocab starts at id 32. The model's vocab is frozen into the embedding at
@@ -257,7 +257,7 @@ def train_with_hf_tokenizers(data_path: str, vocab_size: int, output_dir: str) -
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
 
-    # Special tokens — the full v6 21-token contract (ARCHITECTURE.md §3.2),
+    # Special tokens — the full v6 21-token contract (docs/ARCHITECTURE.md §3.2),
     # plus an 11-slot reserved band so real BPE vocab begins at id 32 and
     # future special tokens can be slotted in WITHOUT shifting trained IDs
     # (the v4 tokenizer only had IDs 0-13 and started real vocab at 14,

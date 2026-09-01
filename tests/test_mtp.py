@@ -1,4 +1,4 @@
-"""Tests for Multi-Token Prediction (MTP) heads (ARCHITECTURE.md §9.3, §11.4).
+"""Tests for Multi-Token Prediction (MTP) heads (docs/ARCHITECTURE.md §9.3, §11.4).
 
 MTP is a TRAINING-TIME auxiliary objective: extra heads on the FINAL hidden
 state predict tokens at offsets +2, +3, ... in addition to the main +1 head.

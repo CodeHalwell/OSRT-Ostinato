@@ -156,7 +156,7 @@ class ExpertFFN(nn.Module):
         self.w_gate = nn.Linear(dim, hidden, bias=False)
         self.w_up = nn.Linear(dim, hidden, bias=False)
         self.w_down = nn.Linear(hidden, dim, bias=False)
-        # Optional SwiGLU stability clamp (ARCHITECTURE.md §7.8): bound the
+        # Optional SwiGLU stability clamp (docs/ARCHITECTURE.md §7.8): bound the
         # gate (max) and up (both sides) pre-activations so a single extreme
         # activation can't blow up the product. None → no clamp (no-op for a
         # healthy model; the bound just caps tails).
@@ -275,7 +275,7 @@ class MoELayer(nn.Module):
         # Save seed for deferred orthogonal init (applied after post_init).
         self._moe_seed = moe_seed
         self._orthogonal_init_requested = config.expert_orthogonal_init
-        # Hash routing (ARCHITECTURE.md §7.5): this physical block uses
+        # Hash routing (docs/ARCHITECTURE.md §7.5): this physical block uses
         # deterministic top-1 hash routing instead of the learned router iff
         # block_idx < hash_routing_blocks. Hard switch, decided at construction.
         self.block_idx = block_idx
@@ -570,7 +570,7 @@ class MoELayer(nn.Module):
         token_ids: Tensor,
         loop_idx: int,
     ) -> tuple[Tensor, Tensor]:
-        """Deterministic top-1 hash routing (ARCHITECTURE.md §7.5).
+        """Deterministic top-1 hash routing (docs/ARCHITECTURE.md §7.5).
 
         Each token is sent to exactly one expert,
             expert_id = (token_id + loop_idx) % num_routed_experts
@@ -942,7 +942,7 @@ class MoELayer(nn.Module):
         # Shared expert (always active, not gated by caller's moe_gate)
         shared_out = self.shared_expert(x)
 
-        # ── Hash routing (ARCHITECTURE.md §7.5) ──
+        # ── Hash routing (docs/ARCHITECTURE.md §7.5) ──
         # Deterministic top-1 dispatch: expert_id = (token_id + loop_idx) % E,
         # a loop-indexed hash. No learned router, no balance loss/z-loss/Gumbel.
         # Used to stabilise early blocks before the learned router warms up.
@@ -1462,7 +1462,7 @@ class RecursiveBlock(nn.Module):
         self.norm_k = nn.RMSNorm(config.head_dim)
         self.out_proj = nn.Linear(config.dim, config.dim, bias=False)
 
-        # Attention sink (ARCHITECTURE.md §6.6). Per-head learnable sink logits,
+        # Attention sink (docs/ARCHITECTURE.md §6.6). Per-head learnable sink logits,
         # initialised to zeros (sink_logit=0 ⇒ the sink contributes exp(0)=1 to
         # the denominator). The sink adds an extra term to the softmax
         # denominator only — its "value" is zero, so it never enters the
@@ -1564,7 +1564,7 @@ class RecursiveBlock(nn.Module):
         # SDPA broadcast KV groups without materialising repeated heads.
         gqa = self.group_size > 1
         if self.attention_sink:
-            # Attention sink (ARCHITECTURE.md §6.6): the sink adds an extra term
+            # Attention sink (docs/ARCHITECTURE.md §6.6): the sink adds an extra term
             # to the softmax denominator only, which SDPA cannot express. Use
             # the manual path so we can apply the exact log-sum-exp rescale.
             attn_out = self._attention_with_sink(
@@ -1804,7 +1804,7 @@ class RecursiveBlock(nn.Module):
 
 
 class MTPHead(nn.Module):
-    """A single Multi-Token Prediction head (ARCHITECTURE.md §9.3, §11.4).
+    """A single Multi-Token Prediction head (docs/ARCHITECTURE.md §9.3, §11.4).
 
     Small projection applied to the FINAL post-norm_out hidden state before
     the WEIGHT-TIED LM head (the embedding) turns it into vocab logits. Head
@@ -1936,7 +1936,7 @@ class OSRTModel(OSRTPreTrainedModel):
         self.last_intermediate_hiddens: list[Tensor] | None = None
 
     def _resolve_num_loops(self, num_loops: int | None) -> int:
-        """Validate and resolve the variable loop count (ARCHITECTURE.md §12.2).
+        """Validate and resolve the variable loop count (docs/ARCHITECTURE.md §12.2).
 
         The inference-compute knob: run only the first K of the trained
         recursive_loops. None → recursive_loops (the trained/default count,
@@ -1972,7 +1972,7 @@ class OSRTModel(OSRTPreTrainedModel):
             input_ids: (B, S) token ids.
             past_key_values: per-effective-layer cached latents, or None.
             use_cache: return the per-layer present latents for decode.
-            num_loops: optional variable loop count (ARCHITECTURE.md §12.2).
+            num_loops: optional variable loop count (docs/ARCHITECTURE.md §12.2).
                 None → config.recursive_loops (bit-identical to before). When
                 set to K (1 <= K <= recursive_loops) only the first K recursive
                 loops run before collapse/norm_out + the LM head — the
@@ -2247,7 +2247,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         super().__init__(config)
         self.model = OSRTModel(config)
 
-        # Multi-Token Prediction heads (ARCHITECTURE.md §9.3, §11.4). Created
+        # Multi-Token Prediction heads (docs/ARCHITECTURE.md §9.3, §11.4). Created
         # ONLY when mtp_heads > 0 so the default (0) path is bit-identical:
         # the attribute is an empty ModuleList, adds no params, and the loss
         # block below short-circuits. Head k (0-indexed) predicts the token at
@@ -2419,7 +2419,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
     ) -> CausalLMOutputWithPast:
         """Causal-LM forward.
 
-        num_loops (ARCHITECTURE.md §12.2) is the optional variable-loop
+        num_loops (docs/ARCHITECTURE.md §12.2) is the optional variable-loop
         inference knob: None → config.recursive_loops (bit-identical to the
         historical path); K in [1, recursive_loops] runs only the first K
         recursive loops before norm_out + the (tied) LM head. The aux per-loop
@@ -2548,7 +2548,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                         w = 1.0
                     aux_loop_total = aux_loop_total + w * aux_l
 
-            # Multi-Token Prediction loss (ARCHITECTURE.md §9.3, §11.4). For
+            # Multi-Token Prediction loss (docs/ARCHITECTURE.md §9.3, §11.4). For
             # head k = 1..mtp_heads, predict the token at offset +(1+k) from the
             # FINAL hidden state `hidden` (post-norm_out, the same state feeding
             # the main +1 LM head). Each head applies its small RMSNorm+Linear
@@ -2703,7 +2703,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         switch happens in MoELayer.forward via self.training, which
         .train(False) toggles.
 
-        num_loops (ARCHITECTURE.md §12.2) selects the variable inference
+        num_loops (docs/ARCHITECTURE.md §12.2) selects the variable inference
         loop count: None → config.recursive_loops (full quality, default,
         bit-identical to before); K in [1, recursive_loops] runs only the
         first K loops at every step for a speed/quality trade-off. The SAME
@@ -2712,7 +2712,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         across the whole call — mixing loop counts mid-generation would
         misalign the per-effective-layer cache and is therefore not allowed.
 
-        speculative (ARCHITECTURE.md §12.3) gates a greedy speculative-decode
+        speculative (docs/ARCHITECTURE.md §12.3) gates a greedy speculative-decode
         fast path: draft spec_draft_tokens tokens cheaply at
         config.spec_draft_loops loops, then verify them in ONE forward at the
         full loop count, committing the longest matching greedy prefix plus the

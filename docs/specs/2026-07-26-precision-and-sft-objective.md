@@ -4,7 +4,7 @@
 **Status:** Investigation — **nothing implemented, no config changed.** All
 findings below are reads of the tree at commit `7ebc2e7` (the `main` base of
 `claude/model-precision-sarrdk`).
-**Companions:** `ARCHITECTURE.md` §14–15, `docs/07-optimizer.md`,
+**Companions:** `docs/ARCHITECTURE.md` §14–15, `docs/07-optimizer.md`,
 `docs/AGENT_HANDOFF.md` §1–2,
 `docs/specs/2026-07-26-ckpt-sync-and-data-builder-findings.md` (same-day
 infra findings: checkpoint sync races, data-builder decon gap).
@@ -82,7 +82,7 @@ in-place apply.
 
 - Eval casts the whole model to bf16 (`app.py:886`, `:932`); lm-eval log-probs
   upcast to fp32 for the sum (`lm_eval_wrapper.py:443`).
-- Deployment plan (`ARCHITECTURE.md` §14.1) is int8 embeddings/attention/shared
+- Deployment plan (`docs/ARCHITECTURE.md` §14.1) is int8 embeddings/attention/shared
   experts + **MXFP4** routed experts + bf16 for the small sensitive parts +
   **int4 KV latent** via TurboQuant (`quant.py`). Note `quant.py:11-15`: int4 KV
   is a *standalone deployment utility*, **not wired into training** and off by
@@ -136,7 +136,7 @@ Sinkhorn iterations × 18 effective layers, and Muon's NS: realistically **≤10
   as showing "gradient amplification + NaN under sustained training… needs
   profiling on real hardware." Stack fp8 on top and the next NaN is
   unattributable.
-- **Router collapse is the documented failure mode** (`LEARNINGS.md`). The fp32
+- **Router collapse is the documented failure mode** (`docs/LEARNINGS.md`). The fp32
   router losses at `model.py:802-820` exist precisely to prevent it.
 
 ### 3.4 Hardware fragmentation
@@ -160,13 +160,13 @@ gradients, and optimizer states in fp32/bf16 and casts to fp8 **only at the GEMM
 boundary**. The only memory it saves is *saved activations for backward*.
 
 Full gradient checkpointing is already on (`app.py:427`; required to fit per
-`ARCHITECTURE.md` §15.1). Checkpointing works by **not storing** those
+`docs/ARCHITECTURE.md` §15.1). Checkpointing works by **not storing** those
 activations. **The two levers compete for the same bytes** — checkpointing has
 already claimed them.
 
 ### 4.2 The floor fp8 cannot touch
 
-Arithmetic on the documented param counts in `ARCHITECTURE.md` §14.2 — *not* a
+Arithmetic on the documented param counts in `docs/ARCHITECTURE.md` §14.2 — *not* a
 fresh measurement; `compute_budget.py` is the trusted source and should be run
 to confirm:
 
@@ -178,7 +178,7 @@ to confirm:
 | AdamW states, 2 buffers fp32 (~106M embed/norm) | 0.85 GB |
 | **fixed floor, unchanged by fp8** | **~7.6 GB** |
 
-Measured totals for reference (`ARCHITECTURE.md` §15.1): seq-8192/batch-2 =
+Measured totals for reference (`docs/ARCHITECTURE.md` §15.1): seq-8192/batch-2 =
 **35.9 GB**; seq-4096/batch-6 = **~59 GB**. Both already post-checkpointing and
 post-fused-CE.
 
@@ -518,7 +518,7 @@ pass rate separately, adding importance weighting only if a transfer gap shows u
 
 ### 6.7 Two guards worth building in
 
-**Leakage.** `LEARNINGS.md` is largely about reward hacking biting v5. A hint
+**Leakage.** `docs/LEARNINGS.md` is largely about reward hacking biting v5. A hint
 like *"the answer is a multiple of 7 near 90"* is an answer. Cheap filter reusing
 existing code: run every generated hint through `extract_numeric_answer`
 (`rewards.py:14`) and `extract_numeric_answer_strict` (`:63`), reject any that
@@ -754,7 +754,7 @@ disqualification.
 
 ### 8.5 The new degenerate solution
 
-Given `LEARNINGS.md` is largely about router collapse, this deserves weight:
+Given `docs/LEARNINGS.md` is largely about router collapse, this deserves weight:
 **with variable k and no explicit penalty, more experts always lowers loss**, so
 the router learns to always select `max_k`. Sparsity is not self-enforcing the
 way it is at fixed top-k.
@@ -781,7 +781,7 @@ assumes every token contributes exactly K pairs — **each normalizer divides by
 The last is not just bookkeeping: "278M active per token" becomes a
 *distribution* rather than a number (slope ≈ 53M per unit k: ~225M at k=1,
 278M at today's top-2, ~385M at §8.7's padded k=4, ~600M ≈ physical at k=8).
-That figure appears in the repo name, the preset names, and the `ARCHITECTURE.md`
+That figure appears in the repo name, the preset names, and the `docs/ARCHITECTURE.md`
 §14.2 deployment memory math, which assumes a fixed active set.
 
 **Recursion compounds it:** 18 routing decisions per token (6 loops × 3 blocks),
@@ -966,7 +966,7 @@ retrofit.
 ### 10.2 What low rank + low precision resolves
 
 At rank 256, HRA is **14,155,776 params** across 18 injection points
-(`ARCHITECTURE.md:107`) — 50 copies would be 708M, *larger than the 601M base*.
+(`docs/ARCHITECTURE.md:107`) — 50 copies would be 708M, *larger than the 601M base*.
 That objection dissolves at low rank:
 
 ```
@@ -1010,7 +1010,7 @@ out-of-distribution.
 
 ### 10.4 ⚠️ Low precision on adapters contradicts the current deployment spec
 
-`ARCHITECTURE.md` §14.1 singles adapters out as the component to keep at full
+`docs/ARCHITECTURE.md` §14.1 singles adapters out as the component to keep at full
 precision:
 
 | component | format | method |
@@ -1066,7 +1066,7 @@ for free — early-loop and late-loop behaviour are separately parameterised. Th
 is a point in the design's favour, and it removes the compounding-error concern
 from §10.4. The loop-depth probe (`monitoring.py:104`, `loop_depth_probe`) is
 still worth running per adapter before shipping, since loop collapse is the v5
-lineage's headline failure (`LEARNINGS.md`) — but as ordinary diligence, not to
+lineage's headline failure (`docs/LEARNINGS.md`) — but as ordinary diligence, not to
 catch an amplification effect that isn't there.
 
 ### 10.6 Serving mechanics
@@ -1188,7 +1188,7 @@ Mixture-of-LoRA track (§10) — a **serving** play, independent of the training
 - [ ] **Soft-blend with a null/identity option** from the start — not argmax
       switching. This is what preserves general-question behaviour and makes
       misroutes graceful. (§10.3)
-- [ ] Measure int8 adapters against bf16 before adopting: `ARCHITECTURE.md` §14.1
+- [ ] Measure int8 adapters against bf16 before adopting: `docs/ARCHITECTURE.md` §14.1
       currently specifies bf16 for adapters as "small, sensitive", and error lands
       on the residual stream × 6 loops. If int8 holds, **update §14.1**. (§10.4)
 - [ ] Decide the mid-conversation switching policy (pin vs invalidate KV cache)

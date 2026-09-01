@@ -1,6 +1,6 @@
 """Recursion + MoE health monitoring — the v5 blind spot, instrumented.
 
-v5 lost months to two failure modes discovered late (see LEARNINGS.md):
+v5 lost months to two failure modes discovered late (see docs/LEARNINGS.md):
   * MoE collapse  — routing funnels to ~2 of N experts; the rest go dead.
   * Loop collapse — one recursive loop does ~all the work; depth is wasted.
 

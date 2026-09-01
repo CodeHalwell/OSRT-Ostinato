@@ -24,7 +24,7 @@ this doc is kept in sync with it (param counts via
 `scripts/compute_budget.py`, behaviour via `src/osrt/model.py`).
 
 **Companion docs:**
-- [`README.md`](README.md) — design philosophy, why each choice was made
+- [`README.md`](../README.md) — design philosophy, why each choice was made
 - [`LEARNINGS.md`](LEARNINGS.md) — v5 lessons that shaped these choices
 - [`RESEARCH.md`](RESEARCH.md) — external research cited
 - `review/` — code reviews; `archive/` — pre-implementation plan reviews

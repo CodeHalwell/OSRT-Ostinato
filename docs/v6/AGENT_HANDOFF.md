@@ -28,7 +28,7 @@ mode we hit. If the machine has no GPU, drive Colab (§4B) or Modal (§4C).
 ## 1. What this project is
 
 **OSRT** = Optimized Sparse Recursive Transformer. ~601M physical params /
-~278M active. Key architecture (see `CLAUDE.md`, `ARCHITECTURE.md`, `docs/`):
+~278M active. Key architecture (see `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/`):
 - **3 physical decoder blocks applied 6× via a loop** → 18 effective layers from
   ⅓ the params (depth recurrence).
 - Per block: 1 shared + 8 routed experts (top-2) MoE; GQA attention with an

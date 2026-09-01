@@ -1,4 +1,4 @@
-"""Tests for the per-head learnable attention sink (ARCHITECTURE.md §6.6/§6.7).
+"""Tests for the per-head learnable attention sink (docs/ARCHITECTURE.md §6.6/§6.7).
 
 The sink adds an extra term to the softmax DENOMINATOR only (its "value" is
 zero), so a query's attention weights may sum to < 1. Gated by

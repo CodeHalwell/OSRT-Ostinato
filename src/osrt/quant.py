@@ -1,6 +1,6 @@
 """TurboQuant-style int4 quantization for the MLA KV-cache latent.
 
-ARCHITECTURE.md §13.3 / §14.1: at deployment the per-effective-layer K_DOWN
+docs/ARCHITECTURE.md §13.3 / §14.1: at deployment the per-effective-layer K_DOWN
 latent (the ONLY thing cached — V is recomputed from it) is compressed from
 bf16 to int4 with a TurboQuant random-rotation + symmetric int4 quantizer. This
 pairs with the MLA latent cache to hit the §13.3 deployment KV-cache size

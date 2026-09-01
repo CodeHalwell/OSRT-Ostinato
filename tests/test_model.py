@@ -1821,7 +1821,7 @@ def test_strict_model_state_loader_rejects_key_drift():
         load_model_state_or_raise(model, state, context="test checkpoint")
 
 
-# ── Variable loop count (ARCHITECTURE.md §12.2) ────────────────────────
+# ── Variable loop count (docs/ARCHITECTURE.md §12.2) ────────────────────────
 
 
 def test_num_loops_none_equals_recursive_loops():
@@ -1918,7 +1918,7 @@ def test_generate_num_loops_runs_and_shapes():
     assert (out >= 0).all() and (out < cfg.vocab_size).all()
 
 
-# ── Speculative decoding (ARCHITECTURE.md §12.3) ───────────────────────
+# ── Speculative decoding (docs/ARCHITECTURE.md §12.3) ───────────────────────
 
 
 def test_speculative_matches_greedy_when_draft_equals_full():

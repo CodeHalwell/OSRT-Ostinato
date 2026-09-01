@@ -130,6 +130,6 @@ cross-session checkpoints via `--hf-repo`. Needs `HF_TOKEN` and
 - **`docs/specs/2026-08-11-v7-roadmap.md`** — the plan, its audit (§12), the
   north star (§13), the committed shape (§14), and DSpark (§15). Start here.
 - `docs/00-overview.md` → chapters 01–09 — architecture deep-dive.
-- `LEARNINGS.md` — what went wrong in v5, and why the design is shaped this way.
-- `RESEARCH.md` — the papers behind each technique.
-- `ARCHITECTURE.md` — config-value spec.
+- `docs/LEARNINGS.md` — what went wrong in v5, and why the design is shaped this way.
+- `docs/RESEARCH.md` — the papers behind each technique.
+- `docs/ARCHITECTURE.md` — config-value spec.

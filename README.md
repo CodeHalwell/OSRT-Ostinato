@@ -56,11 +56,11 @@ verifier that does not exist yet, and the v6 GRPO reward is on record as having
 made the model measurably worse. History lives in
 [`CodeHalwell/OSRT-605M-A269M`](https://github.com/CodeHalwell/OSRT-605M-A269M). The open decision gates —
 and the evidence behind each — are tracked in the roadmap; the measure-first
-rule from `LEARNINGS.md` still governs.
+rule from `docs/LEARNINGS.md` still governs.
 
 ## Reading order
 
 1. [`docs/specs/2026-08-11-v7-roadmap.md`](docs/specs/2026-08-11-v7-roadmap.md) — the plan, its independent citation audit (§12), the north star (§13), the committed shape (§14)
 2. [`docs/00-overview.md`](docs/00-overview.md) — architecture, chapters 01–09
-3. [`LEARNINGS.md`](LEARNINGS.md) — v5's failure modes, and why the design looks like this
-4. [`RESEARCH.md`](RESEARCH.md) — the papers behind each technique
+3. [`docs/LEARNINGS.md`](docs/LEARNINGS.md) — v5's failure modes, and why the design looks like this
+4. [`docs/RESEARCH.md`](docs/RESEARCH.md) — the papers behind each technique

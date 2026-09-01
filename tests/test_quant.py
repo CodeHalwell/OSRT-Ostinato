@@ -1,6 +1,6 @@
 """Unit tests for the TurboQuant int4 KV-cache quantizer (osrt.quant).
 
-Covers ARCHITECTURE.md §13.3 / §14.1: a random-rotation + symmetric int4
+Covers docs/ARCHITECTURE.md §13.3 / §14.1: a random-rotation + symmetric int4
 quantize/dequantize round-trip on the MLA K_DOWN latent, the orthogonality of
 the seeded rotation, the int4 pack/unpack helper, and — the point of the
 "Turbo" rotation — that the random rotation reduces reconstruction error on
