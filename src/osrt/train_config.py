@@ -473,7 +473,7 @@ class PretrainConfig:
                     name="opencodeinstruct",
                     hf_id="nvidia/OpenCodeInstruct",
                     format="io_pair",
-                    filter={"average_test_score": "1.0"},
+                    filter={"average_test_score": ["1.0", "1", "1.00", 1.0, 1]},
                     weight=0.1,
                 ),
                 dict(
