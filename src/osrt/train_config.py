@@ -442,6 +442,18 @@ class PretrainConfig:
                    else cursor + round(ph["frac"] * self.total_steps))
             ph["start"], ph["end"] = cursor, end
             cursor = end
+            # Dataset weights are normalised by the loader, so a typo in one
+            # weight silently re-scales every other source. Insist they sum
+            # to 1 as written (data plan §1 tables are authored that way).
+            ds = ph.get("datasets") or []
+            for d in ds:
+                if "hf_id" not in d or "weight" not in d:
+                    raise ValueError(
+                        f"phase {name!r}: dataset entry needs hf_id and weight: {d}")
+            wsum = sum(d["weight"] for d in ds)
+            if ds and abs(wsum - 1.0) > 1e-6:
+                raise ValueError(
+                    f"phase {name!r}: dataset weights sum to {wsum:.4f}, not 1.0")
 
     def validate(self) -> None:
         """Cross-field checks, run once at train start rather than on every

@@ -278,6 +278,62 @@ def _format_bbh(example: dict) -> str:
     )
 
 
+def _format_openmath_instruct2(example: dict) -> str:
+    """nvidia/OpenMathInstruct-2 rows — problem / generated_solution (short CoT)."""
+    q = (example.get("problem") or "").strip()
+    a = (example.get("generated_solution") or "").strip()
+    if not q or not a:
+        return ""
+    return f"<|user|>{q}<|assistant|>{a}"
+
+
+def _format_io_pair(example: dict) -> str:
+    """Rows with `input` / `output` columns (nvidia/OpenCodeInstruct)."""
+    q = (example.get("input") or "").strip()
+    a = (example.get("output") or "").strip()
+    if not q or not a:
+        return ""
+    return f"<|user|>{q}<|assistant|>{a}"
+
+
+def row_passes(ds_cfg: dict, example: dict, rng: random.Random) -> bool:
+    """Per-dataset row gate, driven by two optional keys on the dataset entry.
+
+    `filter`: {field: value | [values]} — the row must match EVERY field;
+        a missing field rejects the row. Used for allow-lists such as
+        `{"language": ["Python", "Rust", ...]}` on Stack v3.
+    `subsample`: {field: {value: p, ..., "*": p_default}} — the row is kept
+        with probability p for its field value; unlisted values use "*"
+        (default 1.0). Acceptance probabilities, not target shares: the
+        realised mix is base-distribution x p, so it is logged (see
+        TokenStream) rather than assumed.
+    """
+    flt = ds_cfg.get("filter")
+    if flt:
+        for field, allowed in flt.items():
+            if field not in example:
+                return False
+            allowed = allowed if isinstance(allowed, (list, tuple, set)) else [allowed]
+            if example[field] not in allowed:
+                return False
+    sub = ds_cfg.get("subsample")
+    if sub:
+        for field, table in sub.items():
+            value = example.get(field)
+            p = table.get(value, table.get("*", 1.0))
+            if p < 1.0 and rng.random() >= p:
+                return False
+    return True
+
+
+def _mix_fields(ds_cfg: dict) -> list[str]:
+    """Fields whose realised value mix is worth logging (filter/subsample keys)."""
+    fields: list[str] = []
+    for key in ("filter", "subsample"):
+        fields.extend(f for f in (ds_cfg.get(key) or {}) if f not in fields)
+    return fields
+
+
 FORMAT_FN_PRETRAIN = {
     "nemotron_sft": _format_nemotron_sft_text,
     "stack_code": _format_stack_code,
@@ -289,6 +345,8 @@ FORMAT_FN_PRETRAIN = {
     "magicoder": _format_magicoder,
     "magicoder_oss": _format_magicoder_oss,
     "bbh": _format_bbh,
+    "openmath_instruct2": _format_openmath_instruct2,
+    "io_pair": _format_io_pair,
 }
 
 
@@ -328,6 +386,7 @@ class TokenStream(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed if worker_info is None else self.seed + worker_info.id
         rng = random.Random(seed)
+        mix_counts: dict[str, dict[str, dict[str, int]]] = {}
 
         # Build (or rebuild) one stream with bounded retries. Used both
         # for the initial connect AND mid-run reconnect so a transient
@@ -530,6 +589,21 @@ class TokenStream(IterableDataset):
             example = _robust_next(idx, ds_name)
             if example is None:
                 continue
+            if not row_passes(ds_cfg_i, example, rng):
+                continue
+            for field in _mix_fields(ds_cfg_i):
+                tally = mix_counts.setdefault(ds_name, {}).setdefault(field, {})
+                v = str(example.get(field))
+                tally[v] = tally.get(v, 0) + 1
+                n = sum(tally.values())
+                if n % 5000 == 0:
+                    top = sorted(tally.items(), key=lambda kv: -kv[1])[:12]
+                    print(
+                        f"[DataWorker] {ds_name} realised {field} mix after "
+                        f"{n} rows: " + ", ".join(
+                            f"{k}={c / n:.1%}" for k, c in top),
+                        flush=True,
+                    )
 
             # Extract text from example. Per-stream `format` config
             # (used by extend-stage rehearsal) overrides the generic
@@ -550,6 +624,9 @@ class TokenStream(IterableDataset):
                 continue
 
             tokens = tok.encode(text, add_special_tokens=False)
+            max_tok = ds_cfg_i.get("max_tokens")
+            if max_tok and len(tokens) > max_tok:
+                continue   # e.g. cap Nemotron-Science MCQ traces at 2K (data plan §1.3)
             buffer.extend(tokens)
             buffer.append(tok.eos_token_id)
             # Record token count for the debt-based sampler. We count
