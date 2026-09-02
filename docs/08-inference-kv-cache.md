@@ -530,6 +530,48 @@ shipped routine is explicitly greedy-only, as its banner states.
 
 ---
 
+### 7.5 The MTP-head drafter — `spec_drafter="mtp"` (v7, 2026-09-02)
+
+The loop-truncated draft in §7.1–§7.3 is an *autoregressive* drafter, which
+the DSpark evidence (roadmap §15.3) ranks below parallel drafters. v7 trains
+two MTP heads (ch. 06) that ARE a parallel drafter, so `generate` gained a
+second speculative path that uses them:
+
+```python
+out = model.generate(ids, max_new_tokens=256, temperature=0.0,
+                     speculative=True, spec_drafter="mtp")
+model.last_spec_stats   # rounds, forwards, drafts_offered/accepted,
+                        # acceptance_rate, tokens_per_forward
+```
+
+**One forward per round, no draft cache.** Round r verifies
+`[pending, d_1..d_K]` (K = `mtp_heads`) in a single full-loop forward and
+also asks for the post-`norm_out` hidden (`output_hidden_states=True`). The
+verifier's greedy argmax at position *i* is compared with `d_{i+1}`; the
+matched prefix plus the verifier's token at the first mismatch (or the bonus
+after a full match) is committed — the same commit rule as §7.2. The **next
+round's drafts** are the heads applied to the hidden at input position
+`accept`: that position's +1 prediction is the token just committed, so its
+heads (offsets +2, +3) propose the tokens that follow it. Nothing is drafted
+autoregressively and there is only the one cache, sliced along the sequence
+axis exactly as §7.3 describes.
+
+**Cost.** `1 + a` committed tokens per forward, `a ∈ [0, K]`. Zero acceptance
+degrades to plain greedy, not below it; full acceptance is `1 + K` = 3 tokens
+per forward at two heads. The prefill runs over the whole prompt (not
+`prompt[:-1]` as in §7.1) so its last hidden can seed the first drafts.
+
+**Correctness.** Token-identical to greedy decoding regardless of the heads'
+quality — `tests/test_mtp_speculative.py` checks it with random heads (near-
+zero acceptance), with an oracle drafter (100% acceptance, round count
+collapses to ⌈(N−1)/(K+1)⌉), batched with EOS, and that a model without heads
+refuses the drafter.
+
+**Where it sits.** The heads were documented in ch. 06 as "droppable at
+deployment". That is no longer true when this path is used: they are the
+drafter. A post-hoc DSpark-style drafter (roadmap §15.4–15.5) is the next
+step once a trunk checkpoint exists to freeze.
+
 ## 8. `num_loops` — variable test-time compute
 
 `num_loops` is an inference knob (`ARCHITECTURE.md` §12.2;

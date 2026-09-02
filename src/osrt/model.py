@@ -2670,6 +2670,9 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             loss=cast("torch.FloatTensor | None", loss),
             logits=cast("torch.FloatTensor", logits),
             past_key_values=presents,
+            # The post-norm_out hidden, on request only: the MTP-head drafter
+            # in _generate_speculative_mtp projects it through the heads.
+            hidden_states=(hidden,) if kwargs.get("output_hidden_states") else None,
         )
 
     @torch.no_grad()
@@ -2687,6 +2690,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         num_loops: int | None = None,
         speculative: bool = False,
         spec_draft_tokens: int = 4,
+        spec_drafter: str = "loops",
         cache_impl: str = "latent",
         **kwargs,
     ) -> Tensor:
@@ -2736,6 +2740,13 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         config.recursive_loops (or `num_loops` when set, which also caps the
         draft loops). See _generate_speculative for the (documented,
         NOT distribution-preserving) acceptance rule.
+
+        spec_drafter selects WHAT proposes the draft: "loops" (above) or
+        "mtp" — the trained MTP heads (config.mtp_heads >= 1) read off the
+        final hidden of the last accepted position, so a round is ONE
+        forward over 1 + mtp_heads tokens and commits 1..(1 + mtp_heads)
+        tokens. Worst case equals plain greedy; best case (1 + mtp_heads)
+        tokens per forward. See _generate_speculative_mtp.
         """
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
@@ -2757,6 +2768,14 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                     "speculative=True is greedy-only; temperature/top_p/top_k "
                     "are not supported."
                 )
+            if spec_drafter == "mtp":
+                return self._generate_speculative_mtp(
+                    input_ids, max_new_tokens, eos_token_id, stop_token_ids,
+                    repetition_penalty, num_loops,
+                )
+            if spec_drafter != "loops":
+                raise ValueError(
+                    f"spec_drafter must be 'loops' or 'mtp', got {spec_drafter!r}")
             return self._generate_speculative(
                 input_ids,
                 max_new_tokens=max_new_tokens,
@@ -2991,6 +3010,180 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         return generated[:, :cursor]
 
     @torch.no_grad()
+    def _mtp_drafts(self, hidden_pos: Tensor) -> Tensor:
+        """Greedy draft tokens from the MTP heads at ONE position.
+
+        hidden_pos: (B, dim) post-norm_out hidden at the last accepted
+        position. Head k predicts the token at offset +(2+k) from that
+        position, i.e. the tokens FOLLOWING the verifier's own +1 prediction
+        there. Returns (B, mtp_heads) token ids over the real vocab.
+        """
+        cols = []
+        for head in self.mtp_heads:
+            logits = F.linear(head(hidden_pos), self.model.embedding.weight)
+            logits = logits[:, :self.config.real_vocab_size].float()
+            cols.append(logits.argmax(dim=-1, keepdim=True))
+        return torch.cat(cols, dim=1)
+
+    def _generate_speculative_mtp(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int,
+        eos_token_id: int | None,
+        stop_token_ids: list[int] | None,
+        repetition_penalty: float,
+        num_loops: int | None,
+    ) -> Tensor:
+        """Greedy self-speculative decoding drafted by the MTP heads.
+
+        Same GREEDY-ONLY contract and the same cache bookkeeping as
+        _generate_speculative; the difference is where the draft comes from
+        and what a round costs.
+
+        Round r has `pending` (the last committed token, not yet in the cache)
+        and drafts d_1..d_K (K = mtp_heads) proposed by the heads at the
+        previous round's accepted position. ONE full forward over
+        [pending, d_1..d_K] yields the verifier's greedy prediction at every
+        position: pred_0 is the token after pending (checked against d_1),
+        pred_i against d_{i+1}, and pred_K is the bonus token if all match.
+        Commit the matched prefix plus the verifier's token at the first
+        mismatch (or the bonus). The next round's drafts are the heads applied
+        to the hidden at input position `accept` — the position whose +1
+        prediction is the token just committed — so they propose the tokens
+        that follow it. No separate draft forward exists: the drafter is a
+        projection of a hidden the verifier computed anyway.
+
+        Per forward this commits 1 + a tokens, a in [0, K]: worst case is
+        exactly plain greedy, best case 1 + K. With K = 2 that is a 3x ceiling.
+
+        The first round's drafts come from a prefill over the WHOLE prompt:
+        its last hidden gives both the first committed token (main head) and
+        the heads' proposals for the two after it.
+
+        Statistics land in self.last_spec_stats: rounds, tokens, drafts
+        offered/accepted, acceptance rate and tokens per forward.
+        """
+        if len(self.mtp_heads) == 0:
+            raise ValueError(
+                "spec_drafter='mtp' needs config.mtp_heads >= 1; this model "
+                "has none")
+        PastKV = list[Tensor | None]
+
+        def _trunc(past: "PastKV | None", length: int) -> "PastKV | None":
+            if past is None or length <= 0:
+                return None
+            return [None if p is None else p[:, :length, :] for p in past]
+
+        full_loops = self.model._resolve_num_loops(num_loops)
+        context = input_ids[:, -self.config.max_position_embeddings:]
+        batch_size = context.shape[0]
+        device = context.device
+        K = len(self.mtp_heads)
+        stop_tensor = None
+        if stop_token_ids:
+            stop_tensor = torch.tensor(list(stop_token_ids), device=device)
+
+        def _greedy(logits_row: Tensor, gen: Tensor) -> Tensor:
+            logits_last = logits_row[:, :self.config.real_vocab_size].float()
+            if repetition_penalty != 1.0:
+                vocab = logits_last.shape[-1]
+                gen_clamped = gen.clamp(max=vocab - 1)
+                in_vocab = (gen < vocab)
+                score = torch.gather(logits_last, 1, gen_clamped)
+                penalised = torch.where(
+                    score > 0, score / repetition_penalty, score * repetition_penalty,
+                )
+                penalised = torch.where(in_vocab, penalised, score)
+                logits_last = logits_last.clone()
+                logits_last.scatter_(1, gen_clamped, penalised)
+            return logits_last.argmax(dim=-1, keepdim=True)
+
+        generated = context.clone()
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        stats = {"rounds": 0, "forwards": 0, "tokens": 0,
+                 "drafts_offered": 0, "drafts_accepted": 0}
+
+        # Prefill over the whole prompt: cache covers every prompt token, the
+        # last hidden gives the first committed token and the first drafts.
+        pf = self._fwd(
+            context, use_cache=True, num_loops=full_loops,
+            output_hidden_states=True,
+        )
+        stats["forwards"] += 1
+        verify_past = cast("PastKV | None", pf.past_key_values)
+        cache_len = context.shape[1]
+        last_hidden = cast(tuple, pf.hidden_states)[0][:, -1, :]
+        first = _greedy(cast(Tensor, pf.logits)[:, -1, :], generated)
+        if eos_token_id is not None:
+            finished = finished | (first.squeeze(-1) == eos_token_id)
+        if stop_tensor is not None:
+            finished = finished | torch.isin(first.squeeze(-1), stop_tensor)
+        generated = torch.cat([generated, first], dim=1)
+        produced = 1
+        stats["tokens"] = 1
+        drafts = self._mtp_drafts(last_hidden)  # (B, K)
+
+        while produced < max_new_tokens and not (
+            (eos_token_id is not None or stop_tensor is not None)
+            and bool(finished.all())
+        ):
+            pending = generated[:, -1:]
+            verify_input = torch.cat([pending, drafts], dim=1)  # (B, K+1)
+            vv = self._fwd(
+                verify_input, past_key_values=verify_past, use_cache=True,
+                num_loops=full_loops, output_hidden_states=True,
+            )
+            stats["forwards"] += 1
+            stats["rounds"] += 1
+            verify_past_full = cast("PastKV | None", vv.past_key_values)
+            v_logits = cast(Tensor, vv.logits)  # (B, K+1, vocab)
+            v_hidden = cast(tuple, vv.hidden_states)[0]  # (B, K+1, dim)
+            if repetition_penalty == 1.0:
+                verify_preds = v_logits[
+                    :, :, :self.config.real_vocab_size].float().argmax(dim=-1)
+            else:
+                preds, running = [], generated
+                for i in range(K + 1):
+                    vt = _greedy(v_logits[:, i, :], running)
+                    preds.append(vt)
+                    running = torch.cat([running, vt], dim=1)
+                verify_preds = torch.cat(preds, dim=1)
+            all_match = (drafts == verify_preds[:, :K]).all(dim=0)  # (K,)
+            mismatches = (~all_match).nonzero(as_tuple=True)[0]
+            accept = int(mismatches[0].item()) if mismatches.numel() > 0 else K
+            stats["drafts_offered"] += K
+            stats["drafts_accepted"] += accept
+
+            new_cols = [drafts[:, i:i + 1] for i in range(accept)]
+            new_cols.append(verify_preds[:, accept:accept + 1])
+            new_cols = new_cols[:max_new_tokens - produced]
+            for col in new_cols:
+                if eos_token_id is not None:
+                    col = torch.where(finished.unsqueeze(-1),
+                                      torch.full_like(col, eos_token_id), col)
+                t = col.squeeze(-1)
+                if eos_token_id is not None:
+                    finished = finished | (t == eos_token_id)
+                if stop_tensor is not None:
+                    finished = finished | torch.isin(t, stop_tensor)
+                generated = torch.cat([generated, col], dim=1)
+                produced += 1
+            stats["tokens"] = produced
+
+            # Keep the cache through the accepted prefix (+ pending), and take
+            # the next drafts from the hidden at the accepted position.
+            keep = cache_len + accept + 1
+            verify_past = _trunc(verify_past_full, keep)
+            cache_len = keep
+            drafts = self._mtp_drafts(v_hidden[:, accept, :])
+
+        offered = max(stats["drafts_offered"], 1)
+        stats["acceptance_rate"] = stats["drafts_accepted"] / offered
+        stats["tokens_per_forward"] = stats["tokens"] / max(stats["forwards"], 1)
+        self.last_spec_stats = stats
+        max_len = context.shape[1] + max_new_tokens
+        return generated[:, :max_len]
+
     def _generate_speculative(
         self,
         input_ids: Tensor,

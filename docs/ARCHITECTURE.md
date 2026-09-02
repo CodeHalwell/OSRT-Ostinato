@@ -1108,6 +1108,49 @@ Expected accept rate: 60-75% per draft (the loop-3 head is trained to
 predict the same thing the loop-6 head predicts via the aux loss).
 Net speedup: ~1.8-2.4× on generation.
 
+> **v7 status.** The loop-3 draft above is an *autoregressive* drafter, the
+> family DSpark's Table 1 shows losing to parallel drafters at every scale
+> (roadmap §15.3). It stays available as `spec_drafter="loops"`. The default
+> recommendation is §12.3b.
+
+### 12.3b Speculative decoding via the MTP heads (`spec_drafter="mtp"`, 2026-09-02)
+
+The two MTP heads (§9.3) are a parallel multi-position drafter that the
+model already trained. `generate(speculative=True, spec_drafter="mtp")`
+routes to `_generate_speculative_mtp`, which costs **one forward per round**
+over `1 + mtp_heads` tokens and needs no draft-side cache:
+
+```python
+# round r: pending = last committed token (not yet cached); drafts d1..dK
+# were proposed by the heads at the previous round's accepted position.
+verify_input = [pending, d1, ..., dK]                 # K = mtp_heads
+logits, hidden = forward(verify_input, cache, loops=6, output_hidden_states=True)
+preds = greedy(logits)          # preds[i] = token after verify_input[:i+1]
+accept = first i where drafts[i] != preds[i], else K
+commit drafts[:accept] + [preds[accept]]              # 1 + accept tokens
+cache = cache[: cache_len + accept + 1]               # stale tail sliced off
+drafts = [greedy(embedding @ head_k(hidden[accept])) for k in 1..K]
+#        ^ the heads at the accepted position predict the tokens that
+#          FOLLOW the token just committed (offsets +2, +3 from there)
+```
+
+The first round's drafts come from a prefill over the whole prompt, whose
+last hidden gives the first committed token (main head) and the heads'
+proposals for the two after it. Per forward the loop commits `1 + a` tokens,
+`a ∈ [0, K]`: the **worst case is exactly plain greedy** (one token per
+forward) and the ceiling is `1 + K` = 3× at two heads. Output is
+token-identical to greedy decoding (`tests/test_mtp_speculative.py`).
+`model.last_spec_stats` records rounds, forwards, drafts offered/accepted,
+acceptance rate and tokens per forward.
+
+Why this matters more for OSRT than for a dense model of the same size: decode
+is depth/launch bound (roadmap §13.2 roofline: ~136 tok/s measured against a
+~3,400 tok/s bandwidth ceiling on v6), so each forward costs roughly the same
+whatever it produces, and tokens-per-forward is the lever. The measured
+acceptance rate on a real checkpoint is recorded in roadmap §15.7; a
+DSpark-style post-hoc parallel drafter (§15.4) is the follow-on once the trunk
+exists.
+
 ---
 
 ## 13. KV cache structure
