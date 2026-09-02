@@ -57,3 +57,46 @@ def test_phase_weights_must_sum_to_one_as_written():
     del nokey.phases["anneal"]["datasets"][0]["weight"]
     with pytest.raises(ValueError, match="hf_id and weight"):
         nokey._resolve_phases()
+
+
+def test_every_phase_format_key_is_registered_and_gates_are_well_formed():
+    cfg = PretrainConfig()
+    for name, ph in cfg.phases.items():
+        for d in ph["datasets"]:
+            fmt = d.get("format")
+            assert fmt is None or fmt in FORMAT_FN_PRETRAIN, (name, d["name"], fmt)
+            for key in ("filter", "subsample"):
+                assert isinstance(d.get(key, {}), dict), (name, d["name"], key)
+            assert d.get("max_tokens", 1) > 0
+
+
+
+def _repo(*files):
+    return {"repo_path": "u/r", "files": [
+        {"content_id": cid, "content": body, "file_path": path, "language": lang,
+         "is_vendor": vendor, "size_bytes": str(len(body))}
+        for cid, path, lang, body, vendor in files]}
+
+
+def test_stack_v3_formatter_keeps_wanted_languages_and_skips_vendor():
+    from osrt.data import _format_stack_v3, _format_stack_v3_nonpython
+    row = _repo(
+        ("00000000", "main.rs", "Rust", "fn main() {}", "False"),
+        ("00000001", "lib/vendor.js", "JavaScript", "var x", "True"),      # vendor
+        ("00000002", "a.py", "Python", "print(1)", "False"),
+        ("00000003", "weird.cob", "COBOL", "DISPLAY", "False"),             # p = 0
+    )
+    out = _format_stack_v3(row)
+    assert "# main.rs\nfn main() {}" in out and "print(1)" in out
+    assert "var x" not in out and "DISPLAY" not in out
+    assert "print(1)" not in _format_stack_v3_nonpython(row)
+    assert "fn main" in _format_stack_v3_nonpython(row)
+
+
+def test_stack_v3_acceptance_is_deterministic_by_content_id():
+    from osrt.data import _stack_v3_keep
+    accept = {"C#": 0.15}
+    lo = {"content_id": "00000001", "language": "C#", "is_vendor": "False"}  # u ~ 0
+    hi = {"content_id": "ffffffff", "language": "C#", "is_vendor": "False"}  # u ~ 1
+    assert _stack_v3_keep(lo, accept) and not _stack_v3_keep(hi, accept)
+    assert _stack_v3_keep(lo, accept) == _stack_v3_keep(lo, accept)

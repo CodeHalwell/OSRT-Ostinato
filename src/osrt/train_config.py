@@ -140,7 +140,7 @@ class PretrainConfig:
     # active or total, and if it is total this number must roughly quadruple.
     # `total_tokens()` reports the implied budget; check it, do not infer it.
     _total_steps: int = 17_500
-    warmup_steps: int = 400          # ~2%; spins up Muon + the balance bias
+    warmup_steps: int = 400  # ~2%; spins up Muon + the balance bias
 
     # ── Schedule ───────────────────────────────────────────────────────
     # "wsd" = warmup / stable / decay (roadmap item 0.2). The stable phase is
@@ -166,14 +166,14 @@ class PretrainConfig:
     # 0 disables. OSRT's own probe measured a contracting iteration, so the
     # defaults are loose — tighten once a v7 baseline exists.
     min_loop_update_norm: float = 1e-3
-    max_loop_hidden_norm_ratio: float = 50.0   # last-loop / first-loop hidden norm
+    max_loop_hidden_norm_ratio: float = 50.0  # last-loop / first-loop hidden norm
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
     grad_clip: float = 1.0
     log_interval: int = 50
     eval_interval: int = 1_000
-    eval_steps: int = 20           # number of batches per eval
+    eval_steps: int = 20  # number of batches per eval
     # Frequent ckpts protect against budget-driven Modal kills: with a
     # capped credit pool, the function dies hard (no clean shutdown,
     # no rescue ckpt) when the wallet hits zero. 500-step intervals
@@ -244,12 +244,12 @@ class PretrainConfig:
     # fraction of its natural scale — ln(E), 1/E, 1/top_k — and resolved from
     # the model config at check time. The fractions reproduce the v6 absolutes
     # exactly at E=8, top_k=2.
-    per_token_entropy_drop_frac: float = 0.265     # of ln(E); 0.55/ln 8
-    raw_max_prob_frac_of_topk: float = 0.60        # of 1/top_k; 0.30 at top-2
-    top_margin_frac_of_topk: float = 0.20          # of 1/top_k; 0.10 at top-2
-    marginal_entropy_frac: float = 0.866           # of ln(E); 1.80/ln 8
-    prebias_marginal_entropy_frac: float = 0.745   # of ln(E); 1.55/ln 8
-    prebias_expert_fraction_of_uniform: float = 0.08   # of 1/E; 0.01 at E=8
+    per_token_entropy_drop_frac: float = 0.265  # of ln(E); 0.55/ln 8
+    raw_max_prob_frac_of_topk: float = 0.60  # of 1/top_k; 0.30 at top-2
+    top_margin_frac_of_topk: float = 0.20  # of 1/top_k; 0.10 at top-2
+    marginal_entropy_frac: float = 0.866  # of ln(E); 1.80/ln 8
+    prebias_marginal_entropy_frac: float = 0.745  # of ln(E); 1.55/ln 8
+    prebias_expert_fraction_of_uniform: float = 0.08  # of 1/E; 0.01 at E=8
     max_bias_saturation_fraction: float = 0.85
 
     # --- Router exploration ---
@@ -269,130 +269,286 @@ class PretrainConfig:
     #   Phase 3 (instruction, 50K steps): 2 × 32 × 8192 = 524K tok/step → ~26B
     # Total budget: ~90B tokens if the full 300K schedule completes.
     _phase_spec: dict = {  # noqa: RUF012
+        # Data plan: docs/specs/2026-09-02-data-plan.md §1. Every HF id and
+        # column layout below was verified on 2026-09-02 (metadata server or a
+        # one-row Modal probe with hf-secret). Weights are written to sum to
+        # 1.0 per phase and _resolve_phases enforces it. Nemotron-CC-v2 is
+        # NOT here: its NV-DAMT gate is unaccepted on the hf-secret account.
         "foundation": {
-            "frac": 0.05,          # broad, short-seq warm-in
+            "frac": 0.05,  # broad, short-seq warm-in
             "seq_len": 2048,
             "grad_accum_steps": 8,
             "datasets": [
-                {
-                    "name": "fineweb-edu",
-                    "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.40,
-                },
-                {
-                    "name": "nemotron-cc-math-4plus",
-                    "hf_id": "nvidia/Nemotron-CC-Math-v1",
-                    "hf_config": "4plus",
-                    "weight": 0.25,
-                },
-                {
-                    "name": "nemotron-code-syn-qa",
-                    "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
-                    "hf_config": "Synthetic-Question-Answering",
-                    "weight": 0.20,
-                },
-                {
-                    "name": "cosmopedia-web",
-                    "hf_id": "HuggingFaceTB/cosmopedia",
-                    "hf_config": "web_samples_v2",
-                    "weight": 0.15,
-                },
+                dict(
+                    name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu", weight=0.35
+                ),
+                dict(
+                    name="stack-v3",
+                    hf_id="HuggingFaceCode/stack-v3-train",
+                    format="stack_v3",
+                    weight=0.15,
+                ),
+                dict(
+                    name="nemotron-cc-math-4plus",
+                    hf_id="nvidia/Nemotron-CC-Math-v1",
+                    hf_config="4plus",
+                    weight=0.15,
+                ),
+                dict(
+                    name="cosmopedia-v2",
+                    hf_id="HuggingFaceTB/smollm-corpus",
+                    hf_config="cosmopedia-v2",
+                    weight=0.15,
+                ),
+                dict(
+                    name="nemotron-code-syn-qa",
+                    hf_id="nvidia/Nemotron-Pretraining-Code-v2",
+                    hf_config="Synthetic-Question-Answering",
+                    weight=0.1,
+                ),
+                dict(
+                    name="stackexchange",
+                    hf_id="common-pile/stackexchange_filtered",
+                    weight=0.05,
+                ),
+                dict(
+                    name="nemotron-rqa",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-RQA",
+                    weight=0.05,
+                ),
             ],
         },
         "knowledge": {
-            "frac": 0.80,          # the trunk: stable LR, broad mix
+            # the trunk: stable LR. web 25 / code 27 / math 22 / STEM 22 / reasoning 4
+            "frac": 0.80,
             "seq_len": 4096,
-            # Bumped from batch_size=4, grad_accum_steps=16 once the
-            # grad-checkpointing threshold was raised (see train.py
-            # commit 57513a9). At seq_len 4096 with no checkpointing,
-            # H100 80GB had ~31 GB unused at batch 4 (49 GB total).
-            # Batch 8 OOMed at 76.7 GB (activations scale super-linearly
-            # at this sequence length); batch 6 sits at ~59 GB, leaving
-            # ~20 GB headroom for fragmentation and the optimizer step's
-            # transient buffers. Effective batch 6*11=66 sequences,
-            # close to the prior 4*16=64. If a future GPU has tighter
-            # VRAM (3090, A100 40GB), drop batch_size back to 4 with
-            # grad_accum_steps=16.
             "batch_size": 6,
             "grad_accum_steps": 11,
             "datasets": [
-                {
-                    "name": "nemotron-cc-math-4plus",
-                    "hf_id": "nvidia/Nemotron-CC-Math-v1",
-                    "hf_config": "4plus",
-                    "weight": 0.25,
-                },
-                {
-                    "name": "nemotron-stem",
-                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                    "hf_config": "Nemotron-Pretraining-STEM-SFT",
-                    "weight": 0.15,
-                },
-                {
-                    "name": "nemotron-math-textbooks",
-                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                    "hf_config": "Nemotron-Pretraining-Math-Textbooks",
-                    "weight": 0.15,
-                },
-                {
-                    "name": "nemotron-reasoning",
-                    "hf_id": "nvidia/Nemotron-Pretraining-Specialized-v1",
-                    "hf_config": "Nemotron-Pretraining-InfiniByte-Reasoning",
-                    "weight": 0.10,
-                },
-                {
-                    "name": "fineweb-edu",
-                    "hf_id": "HuggingFaceFW/fineweb-edu",
-                    "weight": 0.15,
-                },
-                {
-                    "name": "nemotron-code-syn-qa",
-                    "hf_id": "nvidia/Nemotron-Pretraining-Code-v2",
-                    "hf_config": "Synthetic-Question-Answering",
-                    "weight": 0.10,
-                },
-                {
-                    "name": "cosmopedia-openstax",
-                    "hf_id": "HuggingFaceTB/cosmopedia",
-                    "hf_config": "openstax",
-                    "weight": 0.10,
-                },
+                dict(name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu", weight=0.2),
+                dict(
+                    name="cosmopedia-v2",
+                    hf_id="HuggingFaceTB/smollm-corpus",
+                    hf_config="cosmopedia-v2",
+                    weight=0.05,
+                ),
+                dict(
+                    name="stack-v3",
+                    hf_id="HuggingFaceCode/stack-v3-train",
+                    format="stack_v3",
+                    weight=0.15,
+                ),
+                dict(
+                    name="nemotron-code-syn-qa",
+                    hf_id="nvidia/Nemotron-Pretraining-Code-v2",
+                    hf_config="Synthetic-Question-Answering",
+                    weight=0.08,
+                ),
+                dict(
+                    name="nemotron-cc-code",
+                    hf_id="nvidia/Nemotron-CC-Code-v1",
+                    weight=0.04,
+                ),
+                dict(
+                    name="nemotron-cc-math-4plus",
+                    hf_id="nvidia/Nemotron-CC-Math-v1",
+                    hf_config="4plus",
+                    weight=0.1,
+                ),
+                dict(
+                    name="finemath-4plus",
+                    hf_id="HuggingFaceTB/finemath",
+                    hf_config="finemath-4plus",
+                    weight=0.04,
+                ),
+                dict(
+                    name="nemotron-math-textbooks",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-Math-Textbooks",
+                    weight=0.05,
+                ),
+                dict(
+                    name="infiwebmath-4plus",
+                    hf_id="HuggingFaceTB/finemath",
+                    hf_config="infiwebmath-4plus",
+                    weight=0.03,
+                ),
+                dict(
+                    name="nemotron-stem-sft",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-STEM-SFT",
+                    weight=0.06,
+                ),
+                dict(
+                    name="nemotron-rqa",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-RQA",
+                    weight=0.05,
+                ),
+                dict(
+                    name="stackexchange",
+                    hf_id="common-pile/stackexchange_filtered",
+                    weight=0.05,
+                ),
+                dict(
+                    name="arxiv", hf_id="common-pile/arxiv_papers_filtered", weight=0.03
+                ),
+                dict(
+                    name="code-docs",
+                    hf_id="bigcode/starcoder2data-extras",
+                    hf_config="documentation",
+                    weight=0.03,
+                ),
+                dict(
+                    name="nemotron-infinibyte",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-InfiniByte-Reasoning",
+                    weight=0.04,
+                ),
             ],
         },
         "anneal": {
-            "frac": 0.15,          # the branch: high-quality data under LR decay
+            # the WSD decay IS the mid-train. instruction 35 / code 26 / math 23 /
+            # STEM 11 / long docs 5. No long reasoning traces (data plan §0.1).
+            "frac": 0.15,
             "seq_len": 8192,
             "batch_size": 2,
             "grad_accum_steps": 32,
             "datasets": [
-                {
-                    "name": "smoltalk",
-                    "hf_id": "HuggingFaceTB/smoltalk",
-                    "hf_config": "all",
-                    "weight": 0.30,
-                },
-                {
-                    "name": "evol-instruct-code",
-                    "hf_id": "nickrosh/Evol-Instruct-Code-80k-v1",
-                    "weight": 0.20,
-                },
-                {
-                    "name": "openhermes",
-                    "hf_id": "teknium/OpenHermes-2.5",
-                    "weight": 0.10,
-                },
-                {
-                    "name": "nemotron-post-training-math",
-                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-                    "split": "math",
-                    "weight": 0.20,
-                },
-                {
-                    "name": "nemotron-post-training-stem",
-                    "hf_id": "nvidia/Nemotron-Post-Training-Dataset-v1",
-                    "split": "stem",
-                    "weight": 0.20,
-                },
+                dict(
+                    name="smoltalk2-magpie",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="smoltalk_smollm3_smol_magpie_ultra_no_think",
+                    weight=0.07,
+                ),
+                dict(
+                    name="smoltalk2-openhermes",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="OpenHermes_2.5_no_think",
+                    weight=0.03,
+                ),
+                dict(
+                    name="smoltalk2-personas-if",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="tulu_3_sft_personas_instruction_following_no_think",
+                    weight=0.02,
+                ),
+                dict(
+                    name="smoltalk2-xlam",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="xlam_traces_no_think",
+                    weight=0.01,
+                ),
+                dict(
+                    name="smoltalk2-systemchats",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="smoltalk_smollm3_systemchats_30k_no_think",
+                    weight=0.01,
+                ),
+                dict(
+                    name="smoltalk2-everyday",
+                    hf_id="HuggingFaceTB/smoltalk2",
+                    hf_config="SFT",
+                    split="smoltalk_smollm3_everyday_conversations_no_think",
+                    weight=0.01,
+                ),
+                dict(
+                    name="dolci-instruct",
+                    hf_id="allenai/Dolci-Instruct-SFT",
+                    weight=0.15,
+                ),
+                dict(
+                    name="nemotron-if-chat-off",
+                    hf_id="nvidia/Nemotron-SFT-Instruction-Following-Chat-v2",
+                    split="reasoning_off",
+                    weight=0.05,
+                ),
+                dict(
+                    name="opencodeinstruct",
+                    hf_id="nvidia/OpenCodeInstruct",
+                    format="io_pair",
+                    filter={"average_test_score": "1.0"},
+                    weight=0.1,
+                ),
+                dict(
+                    name="opc-educational",
+                    hf_id="OpenCoder-LLM/opc-sft-stage2",
+                    hf_config="educational_instruct",
+                    weight=0.03,
+                ),
+                dict(
+                    name="opc-mceval",
+                    hf_id="OpenCoder-LLM/opc-sft-stage2",
+                    hf_config="mceval_instruct",
+                    weight=0.03,
+                ),
+                dict(
+                    name="opc-algorithmic",
+                    hf_id="OpenCoder-LLM/opc-annealing-corpus",
+                    hf_config="algorithmic_corpus",
+                    weight=0.05,
+                ),
+                dict(
+                    name="stack-v3-nonpython",
+                    hf_id="HuggingFaceCode/stack-v3-train",
+                    format="stack_v3_nonpython",
+                    weight=0.05,
+                ),
+                dict(
+                    name="openmathinstruct-2",
+                    hf_id="nvidia/OpenMathInstruct-2",
+                    format="openmath_instruct2",
+                    weight=0.1,
+                ),
+                dict(
+                    name="finemath-4plus",
+                    hf_id="HuggingFaceTB/finemath",
+                    hf_config="finemath-4plus",
+                    weight=0.05,
+                ),
+                dict(
+                    name="nemotron-cc-math-mind",
+                    hf_id="nvidia/Nemotron-CC-Math-v1",
+                    hf_config="4plus_MIND",
+                    weight=0.05,
+                ),
+                dict(
+                    name="infiwebmath-4plus",
+                    hf_id="HuggingFaceTB/finemath",
+                    hf_config="infiwebmath-4plus",
+                    weight=0.03,
+                ),
+                dict(
+                    name="nemotron-stem-sft",
+                    hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                    hf_config="Nemotron-Pretraining-STEM-SFT",
+                    weight=0.05,
+                ),
+                dict(
+                    name="nemotron-science-mcq",
+                    hf_id="nvidia/Nemotron-Science-v1",
+                    split="MCQ",
+                    max_tokens=2048,
+                    weight=0.03,
+                ),
+                dict(
+                    name="cosmopedia-openstax",
+                    hf_id="HuggingFaceTB/cosmopedia",
+                    hf_config="openstax",
+                    weight=0.03,
+                ),
+                dict(
+                    name="finepdfs-edu",
+                    hf_id="HuggingFaceFW/finepdfs-edu",
+                    hf_config="eng_Latn",
+                    weight=0.05,
+                ),
             ],
         },
     }
@@ -400,6 +556,7 @@ class PretrainConfig:
     # ── Derived. Phase boundaries come from total_steps; do not hand-edit. ──
     def __init__(self, **overrides) -> None:
         import copy
+
         # Instance-private copy: the spec is a class attribute, and resolving
         # boundaries in place on a shared dict would leak between configs.
         self.phases = copy.deepcopy(type(self)._phase_spec)
@@ -438,8 +595,11 @@ class PretrainConfig:
         names = list(self.phases)
         for k, name in enumerate(names):
             ph = self.phases[name]
-            end = (self.total_steps if k == len(names) - 1
-                   else cursor + round(ph["frac"] * self.total_steps))
+            end = (
+                self.total_steps
+                if k == len(names) - 1
+                else cursor + round(ph["frac"] * self.total_steps)
+            )
             ph["start"], ph["end"] = cursor, end
             cursor = end
             # Dataset weights are normalised by the loader, so a typo in one
@@ -449,11 +609,13 @@ class PretrainConfig:
             for d in ds:
                 if "hf_id" not in d or "weight" not in d:
                     raise ValueError(
-                        f"phase {name!r}: dataset entry needs hf_id and weight: {d}")
+                        f"phase {name!r}: dataset entry needs hf_id and weight: {d}"
+                    )
             wsum = sum(d["weight"] for d in ds)
             if ds and abs(wsum - 1.0) > 1e-6:
                 raise ValueError(
-                    f"phase {name!r}: dataset weights sum to {wsum:.4f}, not 1.0")
+                    f"phase {name!r}: dataset weights sum to {wsum:.4f}, not 1.0"
+                )
 
     def validate(self) -> None:
         """Cross-field checks, run once at train start rather than on every
@@ -466,12 +628,14 @@ class PretrainConfig:
         if self.warmup_steps >= self.total_steps:
             raise ValueError(
                 f"warmup_steps ({self.warmup_steps}) >= total_steps "
-                f"({self.total_steps})")
+                f"({self.total_steps})"
+            )
         decay_start = int(self.total_steps * (1 - self.wsd_decay_frac))
         if self.lr_schedule == "wsd" and decay_start <= self.warmup_steps:
             raise ValueError(
                 f"WSD decay would start at step {decay_start}, inside warmup "
-                f"({self.warmup_steps}) — no stable phase exists")
+                f"({self.warmup_steps}) — no stable phase exists"
+            )
 
     def total_tokens(self) -> int:
         """Implied token budget: sum over phases of steps x batch x accum x seq."""
@@ -493,10 +657,11 @@ class V7SanityConfig(PretrainConfig):
     Exists as a class so it cannot be mistaken for a trunk recipe — nothing in
     it is tuned, it just has to build, fit, compile and step with loss falling.
     """
+
     _total_steps: int = 30
     warmup_steps: int = 5
     wsd_decay_frac: float = 0.3
     ckpt_interval: int = 10
-    eval_interval: int = 10_000        # never, inside 30 steps
+    eval_interval: int = 10_000  # never, inside 30 steps
     save_final_checkpoint: bool = False
     wandb_log: bool = False

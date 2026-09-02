@@ -296,6 +296,81 @@ def _format_io_pair(example: dict) -> str:
     return f"<|user|>{q}<|assistant|>{a}"
 
 
+# Stack v3 (HuggingFaceCode/stack-v3-train) rows are whole repositories:
+# {repo_path, repo_id, commit_id, github_metadata, num_files,
+#  files: [{content_id, content, size_bytes, file_path, file_timestamp,
+#           language, is_vendor, license_type, detected_licenses}]}
+# (every field a str; verified by a one-row probe on 2026-09-02). Per-file
+# language acceptance probabilities steer the mix toward data plan §1.4.
+# They are NOT target shares: a 300-repo sample was C# 25%, Java 20%,
+# JS 9%, Markdown 6%, Python 3.4%, Kotlin 3%, C 2.9%, Go/TS 2.3%, so the
+# dominant languages are damped and the wanted ones kept whole. The
+# formatter tallies the realised mix and prints it every 5,000 files.
+STACK_V3_LANG_ACCEPT: dict[str, float] = {
+    "Python": 1.0, "Rust": 1.0, "Go": 1.0, "TypeScript": 1.0, "TSX": 1.0,
+    "C": 1.0, "C++": 1.0, "SQL": 1.0, "Shell": 1.0, "Lua": 1.0,
+    "JavaScript": 0.6, "Ruby": 0.8, "Kotlin": 0.5, "Swift": 0.5, "PHP": 0.4,
+    "Java": 0.25, "C#": 0.15,
+    "Markdown": 0.3, "YAML": 0.2, "TOML": 0.5, "JSON": 0.1, "Dockerfile": 1.0,
+    "CMake": 0.5, "Makefile": 0.8,
+}
+STACK_V3_MAX_FILES = 24
+STACK_V3_MAX_CHARS = 120_000
+_stack_v3_tally: dict[str, int] = {}
+
+
+def _stack_v3_keep(f: dict, accept: dict[str, float]) -> bool:
+    if str(f.get("is_vendor", "False")) == "True":
+        return False
+    p = accept.get(str(f.get("language")), 0.0)
+    if p <= 0.0:
+        return False
+    if p >= 1.0:
+        return True
+    # Deterministic per file: hash the content id into [0, 1).
+    cid = str(f.get("content_id", ""))[:8] or "0"
+    u = int(cid, 16) / 0xFFFFFFFF if all(c in "0123456789abcdef" for c in cid) else 0.5
+    return u < p
+
+
+def _format_stack_v3_with(example: dict, accept: dict[str, float]) -> str:
+    files = example.get("files") or []
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        if len(parts) >= STACK_V3_MAX_FILES or total >= STACK_V3_MAX_CHARS:
+            break
+        if not _stack_v3_keep(f, accept):
+            continue
+        content = f.get("content") or ""
+        if not content.strip():
+            continue
+        lang = str(f.get("language"))
+        _stack_v3_tally[lang] = _stack_v3_tally.get(lang, 0) + 1
+        n = sum(_stack_v3_tally.values())
+        if n % 5000 == 0:
+            top = sorted(_stack_v3_tally.items(), key=lambda kv: -kv[1])[:14]
+            print(
+                f"[DataWorker] stack-v3 realised language mix after {n} files: "
+                + ", ".join(f"{k}={c / n:.1%}" for k, c in top),
+                flush=True,
+            )
+        parts.append(f"# {f.get('file_path', '')}\n{content}")
+        total += len(content)
+    return "\n\n".join(parts)
+
+
+def _format_stack_v3(example: dict) -> str:
+    """Stack v3 repo row -> concatenated kept files, language-steered (§1.4)."""
+    return _format_stack_v3_with(example, STACK_V3_LANG_ACCEPT)
+
+
+def _format_stack_v3_nonpython(example: dict) -> str:
+    """Anneal variant: same table with Python dropped, so the other languages
+    stay alive through the decay while Python comes from the curated sets."""
+    return _format_stack_v3_with(example, {**STACK_V3_LANG_ACCEPT, "Python": 0.0})
+
+
 def row_passes(ds_cfg: dict, example: dict, rng: random.Random) -> bool:
     """Per-dataset row gate, driven by two optional keys on the dataset entry.
 
@@ -347,6 +422,8 @@ FORMAT_FN_PRETRAIN = {
     "bbh": _format_bbh,
     "openmath_instruct2": _format_openmath_instruct2,
     "io_pair": _format_io_pair,
+    "stack_v3": _format_stack_v3,
+    "stack_v3_nonpython": _format_stack_v3_nonpython,
 }
 
 
