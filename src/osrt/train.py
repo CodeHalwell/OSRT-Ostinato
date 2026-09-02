@@ -1305,6 +1305,7 @@ def run_training(
         optimizer.zero_grad(set_to_none=True)
         accum_task_loss = torch.tensor(0.0, device=device)
         accum_balance_norm = torch.tensor(0.0, device=device)
+        n_task_terms = 0   # micro-batches that actually contributed a task loss
         # Accumulate MoE telemetry across all grad_accum micro-batches so
         # the per-step metrics (and the 5k gate) average over the full
         # effective batch instead of reading only the last micro-batch.
@@ -1368,6 +1369,7 @@ def run_training(
                 accum_task_loss += (
                     inner.last_task_loss.detach() / grad_accum
                 )
+                n_task_terms += 1
             if inner.last_balance_loss_normalised is not None:
                 accum_balance_norm += (
                     inner.last_balance_loss_normalised.detach() / grad_accum
@@ -1402,6 +1404,19 @@ def run_training(
         # --- Logging ---
         should_log = should_log_this_step
         if should_log:
+            # The logged task loss is a sum over micro-batches of
+            # last_task_loss / grad_accum, skipping micro-batches where the
+            # attribute was unset. Trunk step 1050 (2026-09-02) logged 1.67
+            # between 4.13 and 4.41 — the first log after run_eval, during a
+            # Dynamo recompile-limit transition — i.e. a fraction of the terms.
+            # Rescale to the terms that contributed and make it visible.
+            if 0 < n_task_terms < grad_accum:
+                accum_task_loss = accum_task_loss * (grad_accum / n_task_terms)
+                print(
+                    f"  [warn] task loss at step {step} averaged over only "
+                    f"{n_task_terms}/{grad_accum} micro-batches (rescaled)",
+                    flush=True,
+                )
             elapsed = time.time() - start_time
             vram_gb = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
