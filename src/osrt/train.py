@@ -1198,6 +1198,17 @@ def run_training(
             print(
                 f"    Datasets: {[d['name'] for d in phase_cfg['datasets']]}"
             )
+            # Phase-switch memory hygiene. The new (batch, seq) shape recompiles
+            # and Triton autotunes the fused-CE backward by CLONING its (N, vocab)
+            # logits inputs; with the previous shape's cached allocator blocks
+            # still resident that pushed the first trunk launch over 192 GB at
+            # this exact point. Drop everything the old shape held first.
+            if torch.cuda.is_available():
+                import gc
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
 
             if current_loader is not None:
                 # Tear down the previous phase's loader BEFORE building the

@@ -295,7 +295,7 @@ def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
     """Stages: --trunk (the run), --sanity (30-step gate), or one ladder --arm.
 
     total_steps=8000 at seq 2048 is ~1.07B tokens per ladder arm. The trunk
-    uses PretrainConfig's own budget (18,000 steps ≈ 5.31B tokens) unless
+    uses PretrainConfig's own budget (18,000 steps ≈ 5.43B tokens) unless
     --total-steps is given.
     """
     if trunk_run:

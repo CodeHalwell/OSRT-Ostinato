@@ -34,7 +34,7 @@ uv run modal run --detach app.py --trunk-run --hf-repo HallD/osrt-v7-ckpt   # ..
 
 The two venues share the HF repo, so a run can move between them.
 
-Budget: `PretrainConfig` — 18,000 steps ≈ **5.31B tokens** (32K tokens per micro-batch on B200 — roadmap §13b), ~1× Chinchilla on
+Budget: `PretrainConfig` — 18,000 steps ≈ **5.43B tokens** (16×2048 / 6×4096 / 2×8192 micro-batches on B200 — roadmap §13b), ~1× Chinchilla on
 active params. The first log line prints the exact number.
 
 ## 3 · Watch

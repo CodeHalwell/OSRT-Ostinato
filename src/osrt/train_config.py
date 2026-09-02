@@ -139,7 +139,7 @@ class PretrainConfig:
     # §14.8 assumption made operational — G3a decides whether the yardstick is
     # active or total, and if it is total this number must roughly quadruple.
     # `total_tokens()` reports the implied budget; check it, do not infer it.
-    # 18,000 x the B200 batch shapes = 5.30B tokens (was 17,500 at 6x11x4096).
+    # 18,000 steps at 16x4x2048 / 6x11x4096 / 2x32x8192 = 5.43B tokens.
     _total_steps: int = 18_000
     warmup_steps: int = 400  # ~2%; spins up Muon + the balance bias
 
@@ -329,8 +329,12 @@ class PretrainConfig:
             # the trunk: stable LR. web 25 / code 27 / math 22 / STEM 22 / reasoning 4
             "frac": 0.80,
             "seq_len": 4096,
-            "batch_size": 8,  # 8 x 4096 = 32K tokens/micro-batch (B200 sweep)
-            "grad_accum_steps": 8,  # 262,144 tokens/step
+            # 24K tokens/micro-batch (~110 GB), NOT the sweep's 32K: the first trunk
+            # launch OOMed at this phase switch — 145 GB steady + the previous
+            # shape's cached blocks + Triton autotune cloning the (N, vocab) logits
+            # for the fused-CE backward went over 192 GB. Headroom is the fix.
+            "batch_size": 6,
+            "grad_accum_steps": 11,  # 270,336 tokens/step
             "datasets": [
                 dict(name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu", weight=0.2),
                 dict(
@@ -419,8 +423,10 @@ class PretrainConfig:
             # STEM 11 / long docs 5. No long reasoning traces (data plan §0.1).
             "frac": 0.15,
             "seq_len": 8192,
-            "batch_size": 4,  # 4 x 8192 = 32K tokens/micro-batch (B200 sweep)
-            "grad_accum_steps": 16,  # 524,288 tokens/step
+            # 16K tokens/micro-batch (~75 GB): same headroom reasoning as knowledge,
+            # and this switch also triggers a fresh compile at the largest logits.
+            "batch_size": 2,
+            "grad_accum_steps": 32,  # 524,288 tokens/step
             "datasets": [
                 dict(
                     name="smoltalk2-magpie",
