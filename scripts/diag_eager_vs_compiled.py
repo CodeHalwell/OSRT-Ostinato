@@ -43,6 +43,7 @@ def diag(step: int, n_batches: int) -> str:
     from osrt.presets import build_v7_config
     from osrt.train_config import PretrainConfig
 
+    vol.reload()   # a container can start before the trainer's last commit is visible
     cfg = build_v7_config()
     cfg.fused_cross_entropy_chunks = 8
     model = OSRTForCausalLM(cfg)
