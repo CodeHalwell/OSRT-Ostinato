@@ -139,7 +139,8 @@ class PretrainConfig:
     # §14.8 assumption made operational — G3a decides whether the yardstick is
     # active or total, and if it is total this number must roughly quadruple.
     # `total_tokens()` reports the implied budget; check it, do not infer it.
-    _total_steps: int = 17_500
+    # 18,000 x the B200 batch shapes = 5.30B tokens (was 17,500 at 6x11x4096).
+    _total_steps: int = 18_000
     warmup_steps: int = 400  # ~2%; spins up Muon + the balance bias
 
     # ── Schedule ───────────────────────────────────────────────────────
@@ -277,7 +278,12 @@ class PretrainConfig:
         "foundation": {
             "frac": 0.05,  # broad, short-seq warm-in
             "seq_len": 2048,
-            "grad_accum_steps": 8,
+            # B200 sweep 2026-09-02 (scripts/probe_b200_batch.py, roadmap §13b):
+            # 32,768 tokens per micro-batch peaks at ~145 GB of 192 on the trunk
+            # shape in EVERY phase; 65,536 OOMs. So micro-batch x seq = 32K
+            # throughout and the accumulation holds tokens/step.
+            "batch_size": 16,  # 16 x 2048 = 32K tokens/micro-batch
+            "grad_accum_steps": 4,  # 131,072 tokens/step
             "datasets": [
                 dict(
                     name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu", weight=0.35
@@ -323,8 +329,8 @@ class PretrainConfig:
             # the trunk: stable LR. web 25 / code 27 / math 22 / STEM 22 / reasoning 4
             "frac": 0.80,
             "seq_len": 4096,
-            "batch_size": 6,
-            "grad_accum_steps": 11,
+            "batch_size": 8,  # 8 x 4096 = 32K tokens/micro-batch (B200 sweep)
+            "grad_accum_steps": 8,  # 262,144 tokens/step
             "datasets": [
                 dict(name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu", weight=0.2),
                 dict(
@@ -413,8 +419,8 @@ class PretrainConfig:
             # STEM 11 / long docs 5. No long reasoning traces (data plan §0.1).
             "frac": 0.15,
             "seq_len": 8192,
-            "batch_size": 2,
-            "grad_accum_steps": 32,
+            "batch_size": 4,  # 4 x 8192 = 32K tokens/micro-batch (B200 sweep)
+            "grad_accum_steps": 16,  # 524,288 tokens/step
             "datasets": [
                 dict(
                     name="smoltalk2-magpie",
@@ -636,6 +642,25 @@ class PretrainConfig:
                 f"WSD decay would start at step {decay_start}, inside warmup "
                 f"({self.warmup_steps}) — no stable phase exists"
             )
+
+    def scale_micro_batches(self, scale: float) -> None:
+        """Re-shape every phase for a smaller (or larger) card at constant
+        tokens/step: micro-batch x scale, accumulation adjusted to compensate.
+        The defaults are sized for a 192 GB B200 (32K tokens per micro-batch,
+        roadmap §13b); pass 0.5 for a 96 GB RTX PRO 6000, 0.25 for an 80 GB H100.
+        Rounds micro-batch to >= 1 and keeps tokens/step within one micro-batch
+        of the original."""
+        if scale <= 0:
+            raise ValueError(f"micro-batch scale must be > 0, got {scale}")
+        if scale == 1.0:
+            return
+        for name, ph in self.phases.items():
+            bs = ph.get("batch_size", self.batch_size)
+            ga = ph.get("grad_accum_steps", self.grad_accum_steps)
+            tokens_per_step = bs * ga
+            new_bs = max(1, round(bs * scale))
+            new_ga = max(1, round(tokens_per_step / new_bs))
+            ph["batch_size"], ph["grad_accum_steps"] = new_bs, new_ga
 
     def total_tokens(self) -> int:
         """Implied token budget: sum over phases of steps x batch x accum x seq."""

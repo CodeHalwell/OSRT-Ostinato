@@ -1299,7 +1299,7 @@ Total per token per training step: ~2.4 BFLOPs
 cosine horizon is sized to a **~$100 Modal H100 run** (≈ $3.95/hr ≈ 25
 H100-hr):
 ```
-total_steps  = 17,500         # ≈5.28B tokens; WSD decays over the last 15%
+total_steps  = 18,000         # ≈5.31B tokens; WSD decays over the last 15%
 warmup_steps = 400            # ~11% — spins up Muon + the MoE balance bias
 peak_lr      = 6e-4  →  min_lr = 6e-5    # WSD: flat trunk, linear decay branch
 ```

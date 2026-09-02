@@ -1264,7 +1264,14 @@ def run_training(
         # a config-forced True down to False at shorter seq).
         inner = model._orig_mod if hasattr(model, "_orig_mod") else model
         base = inner.model if hasattr(inner, "model") else inner
-        if current_seq_len >= 8192 and not base._osrt_grad_ckpt:
+        # Force recompute-in-backward at 8192 only where it is needed: an 80 GB
+        # card. The 2026-09-02 B200 sweep (roadmap §13b) fit 4 x 8192 at 144 GB
+        # with checkpointing OFF, and checkpointing did not rescue 8 x 8192 —
+        # the memory scales with tokens/micro-batch outside the blocks — so on
+        # 96-192 GB cards it would only add the recompute.
+        small_card = torch.cuda.is_available() and (
+            torch.cuda.get_device_properties(0).total_memory < 100e9)
+        if current_seq_len >= 8192 and small_card and not base._osrt_grad_ckpt:
             base._osrt_grad_ckpt = True
             print(
                 f"    Gradient checkpointing: ENABLED for seq "

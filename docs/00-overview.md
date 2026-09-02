@@ -79,7 +79,7 @@ assembled afterwards.
 | expert activation | SiTU-GLU (smooth cap; hard clamp inert) | ch.03 |
 | optimizer | Muon, V4 recipe: 8 fast + 2 stabilising NS, update-RMS 0.18, per-head | ch.07 |
 | schedule | WSD, 15% decay aligned to the anneal phase | ch.07 |
-| budget | 17,500 steps ≈ 5.28B tokens, sized on **active** params | §14.8 — the bet |
+| budget | 18,000 steps ≈ 5.31B tokens, sized on **active** params; 32K tokens/micro-batch on B200 | §14.8 — the bet; §13b — the sweep |
 | precision | bf16 throughout — grouped GEMM is bf16-only in stock PyTorch | §17.1 |
 | context | 4K deployment target, 8K capability (anneal phase trains at 8192) | ch.08 |
 

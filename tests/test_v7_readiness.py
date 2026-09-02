@@ -262,3 +262,23 @@ def test_hidden_norm_ratio_measures_within_loop_growth_not_embedding():
     # deepest/embedding would have read ~1e4 on ALL of them, nohra included
     assert _hidden_norm_ratio(avg([82.8, 7.57e5])) == 1.0  # too few layers: neutral
 
+
+def test_micro_batch_scale_holds_tokens_per_step():
+    """Defaults are the B200 shapes (32K tokens/micro-batch); 0.5 is the
+    96 GB RTX PRO 6000; 0.25 the 80 GB H100. Tokens/step must not move."""
+    base = PretrainConfig()
+    for scale in (0.5, 0.25):
+        cfg = PretrainConfig()
+        cfg.scale_micro_batches(scale)
+        for name in base.phases:
+            b, c = base.phases[name], cfg.phases[name]
+            assert c["batch_size"] == max(1, round(b["batch_size"] * scale)), name
+            assert c["batch_size"] * c["grad_accum_steps"] == \
+                b["batch_size"] * b["grad_accum_steps"], name
+        assert cfg.total_tokens() == base.total_tokens()
+    same = PretrainConfig()
+    same.scale_micro_batches(1.0)
+    assert same.phases == base.phases
+    with pytest.raises(ValueError):
+        PretrainConfig().scale_micro_batches(0)
+

@@ -101,6 +101,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable W&B logging (still prints to stdout).",
     )
+    p.add_argument(
+        "--micro-batch-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale every phase's micro-batch (accumulation adjusts to hold "
+            "tokens/step). Defaults fit a 192 GB B200; use 0.5 on a 96 GB "
+            "RTX PRO 6000, 0.25 on an 80 GB H100."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -174,6 +184,7 @@ def main(argv: list[str] | None = None) -> None:
     train_cfg = PretrainConfig()
     if args.total_steps is not None:
         train_cfg.total_steps = args.total_steps
+    train_cfg.scale_micro_batches(args.micro_batch_scale)
     if args.wandb_run_name is not None:
         train_cfg.wandb_run_name = args.wandb_run_name
     if args.wandb_run_id is not None:

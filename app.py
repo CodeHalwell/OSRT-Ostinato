@@ -25,7 +25,8 @@ from __future__ import annotations
 import modal
 
 APP = "osrt-v7-ladder"
-GPU = "H100"
+GPU = "H100"  # ladder arms + sanity
+TRUNK_GPU = "B200"  # trunk: 192 GB -> 32K tokens/micro-batch, ~33K tok/s (roadmap §13b)
 TIMEOUT_H = 8
 TRUNK_TIMEOUT_H = 24   # Modal's ceiling; the trunk chains across invocations
 
@@ -216,7 +217,7 @@ def v7_sanity(steps: int = 30) -> dict:
 
 
 @app.function(
-    gpu=GPU,
+    gpu=TRUNK_GPU,
     timeout=TRUNK_TIMEOUT_H * 3600,
     volumes={"/vol": vol},
     secrets=[modal.Secret.from_name("hf-secret"),
@@ -294,7 +295,7 @@ def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
     """Stages: --trunk (the run), --sanity (30-step gate), or one ladder --arm.
 
     total_steps=8000 at seq 2048 is ~1.07B tokens per ladder arm. The trunk
-    uses PretrainConfig's own budget (17,500 steps ≈ 5.28B tokens) unless
+    uses PretrainConfig's own budget (18,000 steps ≈ 5.31B tokens) unless
     --total-steps is given.
     """
     if trunk_run:
