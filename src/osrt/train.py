@@ -358,12 +358,18 @@ def run_eval(
         loader = make_loader(
             dataset_configs=[
                 {
+                    # Held-out = the NEWEST dump as its own config. Training
+                    # streams the `default` config (dumps in order from 2013)
+                    # and consumes ~1.3M FineWeb-Edu docs in the whole run, so
+                    # it never reaches 2025-26. The previous `skip: 100_000_000`
+                    # on `default` iterated 100M rows through the HF stream:
+                    # the 2026-09-02 trunk sat >1 h at step 1000 with no
+                    # checkpoint (the save came after the eval). O(1) now.
                     "name": "fineweb-edu-eval",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
+                    "hf_config": "CC-MAIN-2025-26",
                     "weight": 1.0,
-                    # Held-out offset past the full training budget.
-                    # See docstring for the ~32M-record budget math.
-                    "skip": 100_000_000,
+                    "skip": 1_000,
                 },
             ],
             seq_len=seq_len,
@@ -380,11 +386,17 @@ def run_eval(
         )
         data_iter = iter(loader)
         cached = []
+        t_mat = time.time()
         for _ in range(eval_steps):
             try:
                 cached.append(next(data_iter))
             except StopIteration:
                 break
+        print(
+            f"  [eval] materialised {len(cached)} held-out batches in "
+            f"{time.time() - t_mat:.0f}s (cached for the rest of the process)",
+            flush=True,
+        )
         _EVAL_BATCH_CACHE[cache_key] = cached
         # Drop the iterator before the loader so worker processes are
         # reaped cleanly. `del loader, data_iter` evaluates left-to-right
@@ -1495,21 +1507,6 @@ def run_training(
                 sys.stdout.write(f" [step {step}]\n")
                 sys.stdout.flush()
 
-        # --- Eval on held-out FineWeb-Edu ---
-        if step > 0 and step % train_cfg.eval_interval == 0:
-            eval_metrics = run_eval(
-                model, tokenizer_name, current_seq_len,
-                current_batch_size, train_cfg.eval_steps,
-                device, model_config.real_vocab_size,
-            )
-            print(
-                f"  EVAL step {step} | "
-                f"loss {eval_metrics['eval/loss']:.4f} | "
-                f"ppl {eval_metrics['eval/perplexity']:.1f}",
-                flush=True,
-            )
-            if use_wandb:
-                wandb.log(eval_metrics, step=step)
 
         # --- Phase-1 early-stop check (router health) ---
         # MUST run BEFORE the numbered checkpoint save on the same step.
@@ -1564,6 +1561,22 @@ def run_training(
                             train_cfg=train_cfg)
             vol.commit()
 
+        # --- Eval on held-out FineWeb-Edu --- AFTER the checkpoint save, so a
+        # slow eval can never again cost a checkpoint (2026-09-02 trunk).
+        if step > 0 and step % train_cfg.eval_interval == 0:
+            eval_metrics = run_eval(
+                model, tokenizer_name, current_seq_len,
+                current_batch_size, train_cfg.eval_steps,
+                device, model_config.real_vocab_size,
+            )
+            print(
+                f"  EVAL step {step} | "
+                f"loss {eval_metrics['eval/loss']:.4f} | "
+                f"ppl {eval_metrics['eval/perplexity']:.1f}",
+                flush=True,
+            )
+            if use_wandb:
+                wandb.log(eval_metrics, step=step)
         # --- 23h Modal safety (rescue checkpoint + clean exit) ---
         # Rescue filename includes the step so resume scanner can rank it
         # against numbered checkpoints.
