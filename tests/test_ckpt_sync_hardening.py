@@ -251,6 +251,25 @@ def test_pull_latest_does_not_redownload_a_local_copy(hub):
     assert hub.downloads == []
 
 
+def test_pull_latest_refreshes_side_files_when_the_remote_run_is_ahead(hub):
+    """A persistent volume keeps its own wandb_run_id.txt; when another venue
+    has progressed the run (a newer remote checkpoint) its side file is the
+    truth and must replace the stale local one. (Codex review on PR #2.)"""
+    hub.use(_FakeApi(files=["osrt_step_200.pt", "wandb_run_id.txt"]))
+    hub.local("osrt_step_100.pt", "wandb_run_id.txt")
+    assert sync.pull_latest(REPO, hub.ckpt_dir, "osrt") == "osrt_step_200.pt"
+    assert hub.downloads == ["wandb_run_id.txt", "osrt_step_200.pt"]
+
+
+def test_pull_latest_keeps_local_side_files_when_local_run_is_ahead(hub):
+    hub.use(_FakeApi(files=["osrt_step_200.pt", "wandb_run_id.txt"]))
+    hub.local("osrt_step_300.pt", "wandb_run_id.txt")
+    # the remote's newest is still reported (it is what the repo holds) but
+    # nothing is fetched over the local, more advanced run
+    assert sync.pull_latest(REPO, hub.ckpt_dir, "osrt") == "osrt_step_200.pt"
+    assert hub.downloads == ["osrt_step_200.pt"]
+
+
 # ── push daemon ─────────────────────────────────────────────────────────────
 
 def test_daemon_seeds_pushed_from_remote_and_uploads_only_new_files(hub):

@@ -26,9 +26,11 @@ import time
 _SYNC_RE = re.compile(r"^(?P<prefix>.+?)_(?:rescue_)?step_(?P<step>\d+)\.pt$")
 
 # Small files that ride along with the checkpoints so a run keeps its identity
-# across venues: pulled when absent locally, pushed whenever their CONTENT
-# differs from what this process last uploaded (a name-only check missed an
-# explicit --wandb-run-id rewriting the file under a name already remote), never
+# across venues: pulled when absent locally OR when the remote run is ahead of
+# the local checkpoints (another venue progressed the run, so its side files
+# are the truth), pushed whenever their CONTENT differs from what this process
+# last uploaded (a name-only check missed an explicit --wandb-run-id rewriting
+# the file under a name already remote), never
 # pruned. `wandb_run_id.txt` is what lets Colab re-runs continue ONE W&B run.
 SIDE_FILES = ("wandb_run_id.txt",)
 
@@ -136,9 +138,11 @@ def _upload(api, repo_id: str, path: str, name: str, attempts: int = 3) -> bool:
 def pull_latest(repo_id: str, ckpt_dir: str, prefix: str,
                 base_name: str | None = None) -> str | None:
     """Download the highest {prefix}_step_*.pt / {prefix}_rescue_step_*.pt from
-    the repo into ckpt_dir (so the resume scan finds it), plus any SIDE_FILES
-    and `base_name` absent locally. Returns the checkpoint name pulled, or None
-    for a clean start.
+    the repo into ckpt_dir (so the resume scan finds it), plus `base_name` when
+    absent locally and the SIDE_FILES when absent locally or when the remote
+    run is ahead of the local checkpoints (a persistent volume must not keep
+    a stale `wandb_run_id.txt` beside a checkpoint another venue wrote).
+    Returns the checkpoint name pulled, or None for a clean start.
 
     Only a repo that does not exist yet starts clean. A bad token, a 5xx or a
     dead network raises (see `_list_remote`) — better a loud abort than a run
@@ -153,16 +157,29 @@ def pull_latest(repo_id: str, ckpt_dir: str, prefix: str,
               flush=True)
         files = []
 
-    for name in (*SIDE_FILES, *([base_name] if base_name else [])):
-        if name in files and not os.path.exists(os.path.join(ckpt_dir, name)):
-            print(f"[hf-sync] pulling {name}...", flush=True)
-            hf_hub_download(repo_id, name, repo_type="model",
-                            local_dir=ckpt_dir)
-
     # Include rescue checkpoints: the 23h-cap `_rescue_step_*.pt` is often the
     # newest artifact of a capped session, and the local resume-scan already
     # ranks it. `_step_of` matches both names. (ckpt-sync §2)
     steps = [f for f in files if _is_sync_name(f, prefix)]
+    local_latest = max(
+        (_step_of(os.path.basename(q)) for q in _local_files(ckpt_dir, prefix)
+         if _is_sync_name(os.path.basename(q), prefix)),
+        default=-1,
+    )
+    remote_ahead = bool(steps) and _step_of(max(steps, key=_step_of)) > local_latest
+
+    for name in (*SIDE_FILES, *([base_name] if base_name else [])):
+        if name not in files:
+            continue
+        local = os.path.join(ckpt_dir, name)
+        refresh = name in SIDE_FILES and remote_ahead and os.path.exists(local)
+        if not os.path.exists(local) or refresh:
+            print(f"[hf-sync] pulling {name}..."
+                  + (" (remote run is ahead; refreshing)" if refresh else ""),
+                  flush=True)
+            hf_hub_download(repo_id, name, repo_type="model",
+                            local_dir=ckpt_dir)
+
     if not steps:
         print("[hf-sync] no prior checkpoints in repo — starting from base",
               flush=True)
