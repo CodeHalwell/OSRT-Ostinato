@@ -9,7 +9,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-*Part of the `docs/` architecture series for OSRT-605M. This document explains the attention sub-block; see `ARCHITECTURE.md` §6 (attention) and §13 (KV cache) for the original design intent, and `src/osrt/model.py` for the implementation that ships.*
+*Part of the `docs/` architecture series for OSRT. This document explains the attention sub-block; see `ARCHITECTURE.md` §6 (attention) and §13 (KV cache) for the original design intent, and `src/osrt/model.py` for the implementation that ships.*
 
 ---
 
@@ -50,7 +50,7 @@ self.v_from_k = nn.Linear(self.kv_dim, self.kv_dim, bias=True)
 self.out_proj = nn.Linear(config.dim, config.dim, bias=False)
 ```
 
-With the locked `OSRT_605M_A288M` preset (`src/osrt/presets.py:22-47`): `dim = 1536`, `heads = 24`, `head_dim = 64`, `num_kv_heads = 8`, so `kv_dim = 8 × 64 = 512`.
+With the locked `OSRT_V7` preset (`src/osrt/presets.py:22-47`): `dim = 1536`, `heads = 24`, `head_dim = 64`, `num_kv_heads = 8`, so `kv_dim = 8 × 64 = 512`.
 
 | Projection | nn.Linear shape | Output | Role |
 |---|---|---|---|

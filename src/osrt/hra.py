@@ -104,7 +104,9 @@ def inject_hra(
 
     Args:
         model: The model to inject into.
-        rank: Adapter rank. 256 adds ~11M params, 512 adds ~22M.
+        rank: Adapter rank (v7 post-training uses 256; the added parameter
+            count is 2 * rank * (in + out) per wrapped linear — measure it
+            with scripts/compute_budget.py rather than quoting a figure).
         scale: Scaling factor for adapter outputs.
         freeze_pretrained: If True, freeze original weights (only train adapters).
         target_modules: Names of Linear modules to wrap.

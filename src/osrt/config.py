@@ -1,17 +1,18 @@
-"""Configuration for OSRT — Mixtral-style MoE without dense FFN.
+"""Configuration for OSRT — sparse MoE + depth recurrence, no dense FFN.
 
-3 physical blocks × 6 loops = 18 effective layers.
-MoE only (1 shared + 8 routed experts, top-2 routing).
-No dense FFN — shared expert replaces it.
-Switch-style balance loss (minimises at uniform without enforcing it).
-DeepSeek-style per-expert balance bias controller.
-No importance loss, no soft warmup.
-Training can use annealed Gumbel top-k noise to prevent early dead experts.
-Orthogonal per-expert initialisation breaks symmetry at step 0.
+Physical blocks × recursive loops = effective layers (3 × 6 = 18 in v7).
+MoE only: 1 shared expert (always on) + routed experts, top-k. Switch-style
+balance loss (minimises at uniform without enforcing it) plus a per-expert
+balance-bias controller (Quantile Balancing in v7). Annealed Gumbel top-k
+noise in early training; orthogonal per-expert initialisation.
 
-Architecture: ~363M physical params, ~192M active per token (52.9%),
-~1.15B effective via recursive weight sharing.
+The DEFAULTS below are the v5/v6 shape kept for reproduction of those runs.
+The committed v7 shape lives in `osrt.presets.OSRT_V7` — build models from
+there. Parameter counts are deliberately not stated anywhere in this file;
+`scripts/compute_budget.py` is the only trusted source (CLAUDE.md).
 """
+
+import warnings
 
 from transformers import PretrainedConfig
 
@@ -185,9 +186,18 @@ class OSRTConfig(PretrainedConfig):
         # osrt.fused_ce.fused_linear_cross_entropy, which materialises only
         # ~1/n_chunks of the (N, vocab) logits at a time (gradient-checkpointed)
         # — same loss + gradients (tests/test_fused_ce.py), much lower peak
-        # memory. 0 = OFF (bit-identical to the plain F.linear+CE path). The
-        # main +1 head is unaffected (its logits are returned in the output).
+        # memory. 0 = OFF (bit-identical to the plain F.linear+CE path).
         fused_cross_entropy_chunks: int = 0,
+        # With fused_cross_entropy_chunks > 0, also route the MAIN +1 head's
+        # training loss through the chunked kernel. The unchunked path holds
+        # the full (tokens, vocab) logits in bf16 PLUS an fp32 copy PLUS the
+        # log-softmax saved for backward: ~16 GB per 32K-token micro-batch at
+        # the v7 vocab, the single largest activation and the reason the
+        # knowledge phase was cut from 32K to 24K tokens per micro-batch.
+        # When it applies (training AND labels given) the forward returns
+        # `logits=None`; pass `return_logits=True` to forward() to get them
+        # anyway. Eval/generate are unaffected (never fused).
+        fused_main_head: bool = True,
 
         # NOTE: gradient (activation) checkpointing is deliberately NOT a field
         # here. `gradient_checkpointing` is an HF-managed name on PretrainedConfig
@@ -259,6 +269,20 @@ class OSRTConfig(PretrainedConfig):
         #                     that balanced affinity. Telemetry/balance-loss use
         #                     an affinity-normalised probability view.
         router_affinity: str = "softmax",
+
+        # --- Where the balance bias acts (DeepSeek-V3 §2.1.2) ---
+        # False (default): the bias (and training-time Gumbel noise) steer
+        #   TOP-K SELECTION only; the gating weight multiplied into each chosen
+        #   expert's output is taken from the ORIGINAL pre-bias affinity /
+        #   softmax and renormalised. This is the aux-loss-free recipe as
+        #   published and what docs/ARCHITECTURE.md §7 describes: the router
+        #   keeps full control of the gate it receives gradient through, and
+        #   a controller bias that is re-solved every step (Quantile
+        #   Balancing) cannot make the expert outputs jump by a non-learned
+        #   factor between steps.
+        # True: the v6 behaviour — gates come from the bias-adjusted (and
+        #   Gumbel-noised) selection distribution. Kept for reproducing v6.
+        router_bias_in_gates: bool = False,
 
         # Training-time noisy top-k. The training loop anneals this buffer;
         # default stays 0.0 so unit tests and standalone/eval forwards are
@@ -359,6 +383,8 @@ class OSRTConfig(PretrainedConfig):
         self.mtp_heads = mtp_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.fused_cross_entropy_chunks = fused_cross_entropy_chunks
+        self.fused_main_head = fused_main_head
+        self.router_bias_in_gates = router_bias_in_gates
         self.loop_dropout_prob = loop_dropout_prob
         self.loop_dropout_min_loops = loop_dropout_min_loops
         self.dense_control = dense_control
@@ -534,4 +560,56 @@ class OSRTConfig(PretrainedConfig):
             raise ValueError(
                 f"hash_routing_blocks must be in [0, num_blocks="
                 f"{self.num_blocks}], got {self.hash_routing_blocks}"
+            )
+        # Vocabulary: the embedding may be padded past the real vocab (tensor
+        # cores), never the other way round, and every structural id must be
+        # a real token. bos/eos/pad live on PretrainedConfig after super().
+        if self.real_vocab_size > self.vocab_size:
+            raise ValueError(
+                f"real_vocab_size ({self.real_vocab_size}) must be <= "
+                f"vocab_size ({self.vocab_size})"
+            )
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id",
+                     "unk_token_id", "think_open_id", "think_close_id",
+                     "answer_open_id", "answer_close_id", "user_token_id",
+                     "assistant_token_id", "system_token_id"):
+            tid = getattr(self, name, None)
+            if tid is not None and not 0 <= tid < self.real_vocab_size:
+                raise ValueError(
+                    f"{name}={tid} is outside the real vocabulary "
+                    f"[0, {self.real_vocab_size}); the config's token ids "
+                    "must come from the tokenizer actually in use "
+                    "(osrt.presets.OSRT_V7 carries the v7 ids)"
+                )
+        if (
+            self.per_loop_aux_weights is not None
+            and len(self.per_loop_aux_weights) != self.recursive_loops - 1
+        ):
+            raise ValueError(
+                f"per_loop_aux_weights must have recursive_loops - 1 = "
+                f"{self.recursive_loops - 1} entries, got "
+                f"{len(self.per_loop_aux_weights)}"
+            )
+        if (
+            self.loop_dropout_prob > 0
+            and self.loop_dropout_min_loops >= self.recursive_loops
+        ):
+            raise ValueError(
+                f"loop_dropout_min_loops ({self.loop_dropout_min_loops}) must "
+                f"be < recursive_loops ({self.recursive_loops}) for loop "
+                "dropout to do anything"
+            )
+        # Roadmap §14.6: the ±γ heuristic controller was tuned at 8 experts;
+        # at v7's granularity Quantile Balancing is required, not optional.
+        if (
+            self.router_balance_bias_enabled
+            and self.router_balance_mode != "quantile"
+            and self.num_routed_experts > 8
+        ):
+            warnings.warn(
+                f"router_balance_mode={self.router_balance_mode!r} with "
+                f"{self.num_routed_experts} routed experts: the heuristic "
+                "controller was tuned at E=8; roadmap §14.6 requires "
+                "'quantile' above that.",
+                stacklevel=2,
             )

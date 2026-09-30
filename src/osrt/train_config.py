@@ -8,14 +8,11 @@ Refresh / Math, GRPO x4) were removed: they encode v6 checkpoints, the v6
 tokenizer and a superseded pipeline, and nothing in the tree imported them. They
 remain in git history and in CodeHalwell/OSRT-605M-A269M.
 
-The values below are inherited from v6 and are NOT yet re-derived for v7. Three
-things must change before a trunk run, and all three are gated:
-
-  * the data mix and token budget, once G3a settles whether the token
-    requirement tracks active or total parameters;
-  * the schedule — the roadmap adopts WSD trunk-and-branch over cosine (§7.1);
-  * batch/seq economics under the new tokenizer, which is ~6% more tokens per
-    character on the real mix (§16.4).
+PretrainConfig below IS the committed trunk recipe: the data plan's phase
+tables (docs/specs/2026-09-02-data-plan.md), the WSD schedule (§7.1), and the
+B200 batch economics (§13b). The §14.8 assumption — that the token requirement
+tracks ACTIVE parameters — is still open at gate G3a; if it falls, total_steps
+roughly quadruples and nothing else here changes.
 
 Post-training configs are deliberately absent. v7's post-training is redesigned
 around a verifier that does not exist yet (roadmap §7.6, §12); the v6 GRPO
@@ -134,12 +131,13 @@ class PretrainConfig:
     # ── Budget ─────────────────────────────────────────────────────────
     batch_size: int = 8
     grad_accum_steps: int = 8
-    # Sized to ~1x Chinchilla on ACTIVE params (263M x 20 ≈ 5.3B tokens) at the
-    # per-phase batch economics below: 17,500 steps ≈ 5.28B tokens. This is the
-    # §14.8 assumption made operational — G3a decides whether the yardstick is
-    # active or total, and if it is total this number must roughly quadruple.
-    # `total_tokens()` reports the implied budget; check it, do not infer it.
-    # 18,000 steps at 16x4x2048 / 6x11x4096 / 2x32x8192 = 5.43B tokens.
+    # Sized to ~1x Chinchilla on ACTIVE params (active x 20 ≈ 5.3B tokens; the
+    # count comes from scripts/compute_budget.py) at the per-phase batch
+    # economics below: 18,000 steps at 16x4x2048 / 6x11x4096 / 2x32x8192 =
+    # 5.43B tokens. This is the §14.8 assumption made operational — G3a decides
+    # whether the yardstick is active or total, and if it is total this number
+    # must roughly quadruple. `total_tokens()` reports the implied budget;
+    # check it, do not infer it.
     _total_steps: int = 18_000
     warmup_steps: int = 400  # ~2%; spins up Muon + the balance bias
 
@@ -163,11 +161,27 @@ class PretrainConfig:
     # name residual-norm growth under weight-tied recurrence as THE failure
     # mode, and one shows per-layer RMSNorm does not prevent it. A deep loop
     # whose update → 0 has collapsed to a no-op; a loop whose hidden norm runs
-    # away is exploding. Both are checked at every eval and fail the run.
-    # 0 disables. OSRT's own probe measured a contracting iteration, so the
-    # defaults are loose — tighten once a v7 baseline exists.
+    # away is exploding. Both are checked on every logging step once warmup is
+    # over (see `continuous_health_checks`) and fail the run when they hold for
+    # `health_check_patience` consecutive checks. 0 disables. OSRT's own probe
+    # measured a contracting iteration, so the defaults are loose — tighten
+    # once a v7 baseline exists.
     min_loop_update_norm: float = 1e-3
-    max_loop_hidden_norm_ratio: float = 50.0  # last-loop / first-loop hidden norm
+    max_loop_hidden_norm_ratio: float = 50.0  # deepest / first-block hidden norm
+    # ── Continuous health checks ───────────────────────────────────────
+    # The router-sharpening gate at `early_stop_check_step` is one-shot by
+    # design (the router is not expected to be sharp before it). Everything
+    # else — loop collapse, residual explosion, and, after the gate, the full
+    # router-health set — is re-evaluated on every logging step, on the
+    # grad-accum-averaged telemetry. A failure must persist for
+    # `health_check_patience` consecutive checks (3 x log_interval = 150 steps
+    # by default) before the run stops, so a single noisy micro-batch average
+    # cannot end a 45-hour run; the gate step itself keeps one-shot semantics.
+    continuous_health_checks: bool = True
+    health_check_patience: int = 3
+    # A non-finite gradient norm skips the optimizer step (gradients are
+    # zeroed, nothing is written). This many in a row fails the run instead.
+    max_consecutive_nonfinite_steps: int = 5
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3
@@ -175,6 +189,11 @@ class PretrainConfig:
     log_interval: int = 50
     eval_interval: int = 1_000
     eval_steps: int = 20  # number of batches per eval
+    # Held-out eval runs at a FIXED context and batch so the cached eval set is
+    # the same set in every phase and eval/loss is comparable across the run
+    # (keyed on the phase's seq_len it changed at every phase boundary).
+    eval_seq_len: int = 2048
+    eval_batch_size: int = 8
     # Frequent ckpts protect against budget-driven Modal kills: with a
     # capped credit pool, the function dies hard (no clean shutdown,
     # no rescue ckpt) when the wallet hits zero. 500-step intervals
@@ -195,16 +214,23 @@ class PretrainConfig:
     # via optimizer_name="lion" for comparison runs. AdamW is the
     # fallback when optimizer_name is anything else.
     optimizer_name: str = "muon"
-    # Muon LR (used only when optimizer_name == "muon"). The Newton-Schulz
-    # update is normalised, so Muon's effective step size is much smaller
-    # per parameter than Lion/AdamW. The 1200-step Cell C run held
-    # task-loss steady at lr=0.02 through 23 % of warmup with no fatal
-    # divergence. If a full Phase 1 (10k steps, peak at step 3000)
-    # destabilises, drop to 0.015 first — that's the next thing to
-    # try before deeper changes. AdamW (the other half of the hybrid)
-    # keeps using peak_lr / min_lr.
-    muon_lr: float = 0.02
-    muon_min_lr: float = 2e-3
+    # Muon LR (used only when optimizer_name == "muon"). Its meaning depends
+    # on the step scaling in muon.py:
+    #   * shape heuristic (update_rms=None): per-element step ≈ lr/sqrt(cols),
+    #     so the v5/v6 value 0.02 gave ≈5.1e-4 per element at cols=1536 — the
+    #     regime the 1200-step Cell C run and the v6 lineage were tuned in.
+    #   * update-RMS rule (muon_update_rms below): per-element step = lr x rms
+    #     for EVERY shape. Keeping lr=0.02 under this rule silently made the
+    #     step 0.02 x 0.18 = 3.6e-3, seven times the tuned regime and ~18% of
+    #     the 0.02 init std per step (measured 2026-09-29).
+    # 3e-3 x 0.18 = 5.4e-4 reproduces the tuned per-element step under the
+    # committed rule. Moonlight's literal recipe (Muon lr == AdamW lr) would
+    # be 6e-4; treat that as the "colder" A/B, not the default. Both values
+    # are stamped into checkpoints and drift-checked on resume, and the first
+    # log line prints the implied per-element step next to the AdamW LR.
+    muon_lr: float = 3e-3
+    muon_min_lr: float = 3e-4
+    muon_momentum: float = 0.95
     # Per-head Muon (Kimi K3 §2.5): orthogonalise each attention head's block
     # of q_proj / kv_down / v_from_k separately instead of the full matrix, so
     # no single head dominates the shared update. Adds no params and the update
@@ -263,12 +289,12 @@ class PretrainConfig:
     router_gumbel_tau_final: float = 0.0
     router_gumbel_anneal_steps: int = 4_000
 
-    # Progressive seq_len curriculum
-    # Tokens per step per phase:
-    #   Phase 1 (foundation, 10K steps):  8 × 8  × 2048 = 131K tok/step → ~1.3B
-    #   Phase 2 (knowledge, 240K steps):  4 × 16 × 4096 = 262K tok/step → ~63B
-    #   Phase 3 (instruction, 50K steps): 2 × 32 × 8192 = 524K tok/step → ~26B
-    # Total budget: ~90B tokens if the full 300K schedule completes.
+    # Progressive seq_len curriculum. Tokens per step per phase at 18,000 steps
+    # (boundaries 900 / 15,300 / 18,000 — derived, see _resolve_phases):
+    #   foundation ( 5%): 16 x  4 x 2048 = 131,072 tok/step → 0.12B
+    #   knowledge  (80%):  6 x 11 x 4096 = 270,336 tok/step → 3.89B
+    #   anneal     (15%):  2 x 32 x 8192 = 524,288 tok/step → 1.42B
+    # Total 5.43B; `total_tokens()` is the source of truth, not this comment.
     _phase_spec: dict = {  # noqa: RUF012
         # Data plan: docs/specs/2026-09-02-data-plan.md §1. Every HF id and
         # column layout below was verified on 2026-09-02 (metadata server or a

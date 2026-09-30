@@ -376,8 +376,10 @@ tying across depth" + "iteration-specific conditioning" pattern.
 
 ### What we adopted
 
-- **Sandwich RMSNorm** (pre + post) in recurrent block — critical for
-  our 18-effective-layer stack
+- **Pre-norm RMSNorm on both sub-blocks plus an RMSNorm reset between
+  loops** — critical for our 18-effective-layer stack. (Older revisions
+  called this "sandwich RMSNorm (pre + post)"; OSRT has no post-sub-block
+  norm — see ARCHITECTURE.md §5.3.)
 - **QK-norm** standard
 - **Context progression** (pretrain at 4K, extend to 8K in decay)
 - **Local/global attention layout** (5:1) — noted as v7 consideration

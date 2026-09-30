@@ -9,7 +9,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-> Part of the OSRT-605M `docs/` architecture series. This chapter explains how
+> Part of the OSRT `docs/` architecture series. This chapter explains how
 > the model turns its final hidden state into token predictions, and the full
 > stack of training losses that shape it: the tied LM head and its
 > cross-entropy task loss, the per-loop auxiliary heads, the multi-token
@@ -26,7 +26,7 @@ discrepancy is flagged.** Two such drifts are called out below (MTP offsets, and
 "MTP heads add no params").
 
 Param counts come from `scripts/compute_budget.py`, which builds the canonical
-preset `OSRT_605M_A288M` on a meta device and counts real parameters.
+preset `OSRT_V7` on a meta device and counts real parameters.
 
 ---
 
@@ -539,7 +539,7 @@ against the dense path.
 
 ## 9. Parameter cost of the heads
 
-From `scripts/compute_budget.py` on the canonical `OSRT_605M_A288M` preset:
+From `scripts/compute_budget.py` on the canonical `OSRT_V7` preset:
 
 | Head / component        | Params       | Inference-active? | Notes |
 |-------------------------|--------------|-------------------|-------|

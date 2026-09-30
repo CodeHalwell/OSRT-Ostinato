@@ -62,16 +62,33 @@ def _flop_eq(arm):
     return tot, emb + (act - emb) * cfg.recursive_loops
 
 
-def test_nohra_is_an_iso_compute_ablation():
-    """Adapters are all-active params: dropping them drops FLOPs. The arm
-    reinvests them into the shared expert so the ONLY difference is the
+def test_hra_arm_is_an_iso_compute_ablation():
+    """Adapters are all-active params: adding them adds FLOPs. The E1 arm
+    takes the same count back out of the shared expert so the ONLY difference
+    from `a` (the trunk recipe: HRA off, shared expert reinvested) is the
     mechanism, not the budget. Both totals and FLOP-eq must match `a`."""
-    a, n = LADDER_ARMS["a"], LADDER_ARMS["nohra"]
-    diff = {k for k in set(a) | set(n) if a.get(k) != n.get(k)}
+    a, h = LADDER_ARMS["a"], LADDER_ARMS["hra"]
+    diff = {k for k in set(a) | set(h) if a.get(k) != h.get(k)}
     assert diff == {"use_hra", "shared_expert_hidden"}, diff
-    (ta, fa), (tn, fn) = _flop_eq(a), _flop_eq(n)
-    assert ta == tn, f"total drifted: {ta:,} vs {tn:,}"
-    assert fa == fn, f"compute drifted: {fa:,} vs {fn:,}"
+    assert a["use_hra"] is False and h["use_hra"] is True
+    (ta, fa), (th, fh) = _flop_eq(a), _flop_eq(h)
+    assert ta == th, f"total drifted: {ta:,} vs {th:,}"
+    assert fa == fh, f"compute drifted: {fa:,} vs {fh:,}"
+
+
+def test_ladder_base_is_the_trunk_recipe():
+    """Every arm inherits the committed recipe (SiTU-GLU, seq-balance,
+    Quantile Balancing, sqrt-softplus, MTP, HRA off, v7 token ids) and states
+    an expert_hidden that survives model.py's 64-multiple round-up, so an arm
+    explains the trunk rather than a different model."""
+    from osrt.presets import OSRT_V7
+    for name, arm in LADDER_ARMS.items():
+        for key in ("situ_glu", "router_seq_balance_loss_coeff",
+                    "router_balance_mode", "router_affinity", "mtp_heads",
+                    "eos_token_id", "user_token_id", "moe_grouped_gemm"):
+            assert arm[key] == OSRT_V7[key], (name, key)
+        assert arm["expert_hidden"] % 64 == 0, (name, arm["expert_hidden"])
+        assert arm["use_hra"] is (name == "hra"), name
 
 
 def test_g4_arm_holds_total_and_compute_within_two_percent():

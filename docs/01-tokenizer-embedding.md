@@ -289,7 +289,7 @@ and [`06-heads-and-losses.md`](06-heads-and-losses.md).
 ## 7. Parameter cost
 
 Counts come from `scripts/compute_budget.py`, which instantiates the canonical
-`OSRT_605M_A288M` preset on a meta device and sums real parameters
+`OSRT_V7` preset on a meta device and sums real parameters
 (`scripts/compute_budget.py:50-58`).
 
 ### The exact numbers

@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — OSRT-600M technical specification
+# ARCHITECTURE.md — OSRT v7 technical specification
 
 > ## Config-value spec — updated to v7 (2026-09-01)
 >
@@ -52,29 +52,28 @@ the technical details, then `src/osrt/` for the ground truth.
 
 ## 1. One-sentence overview
 
-**OSRT** = **Optimized Sparse Recursive Transformer**. OSRT-600M is a
-recursive Mixtral-style sparse MoE transformer with **3 physical
-decoder blocks applied 6 times via depth recurrence** (giving 18
-effective layers), using **HRA adapters (high-rank, rank 256)**,
-**GQA attention with a KDV (Key-Derived Value) compressed KV cache**,
-**manifold-constrained hyper-connections**, and **Muon-optimized
-weights** — totaling **601M physical params, 278M active per token
-at inference** (46.3% active fraction; see §2.1 for full breakdown),
-~2.5B FLOPs equivalent per token. "600M" in the name rounds the
-physical count.
+**OSRT** = **Optimized Sparse Recursive Transformer**: a recursive
+sparse-MoE transformer with **3 physical decoder blocks applied 6 times
+via depth recurrence** (giving 18 effective layers), **28 routed + 1
+shared SiTU-GLU experts per block (top-4)**, **GQA attention with a KDV
+(Key-Derived Value) compressed KV cache**, **Muon-optimized weights**,
+and an optional **rank-256 HRA adapter for post-training** — totaling
+**968M physical params, 263M active per token at inference** (27.2%
+active fraction; see §2.1 for the full breakdown), ~2.4B FLOPs per
+token (§2.3). mHC (manifold-constrained hyper-connections) was removed
+in v7 (§8).
 
 > ✅ **ACCOUNTING IS CODE-GENERATED & IMPLEMENTED.** This is no longer
 > a paper spec — `src/osrt/` builds the model and all numbers in §2.1
 > come from `PYTHONPATH=src python scripts/compute_budget.py`, which
-> instantiates the canonical `OSRT_605M_A288M` preset
+> instantiates the canonical `OSRT_V7` preset
 > (`src/osrt/presets.py`) on a meta device and counts real parameters.
 > Re-run it after any config change.
 
-> 🔧 **NAMING vs REALITY.** The preset is named `OSRT_605M_A288M` and
-> the repo `OSRT-605M-A269M`; both numbers predate the corrected count.
-> The instantiated model is **601M physical / 278M active (inference)**.
-> The names are kept (renaming the repo breaks clones; renaming the
-> preset churns code) — trust §2.1, not the names.
+> 🔧 **NAMING.** No parameter count appears in any name — repo, package,
+> preset or directory (`CLAUDE.md`). The v6 lineage's names drifted from
+> the real count four different ways, which is why the rule exists. The
+> preset is `OSRT_V7`; §2.1 is the only place a number lives.
 
 > 🔧 **NOT in the architecture:** "gated short convolutions" (claimed
 > in an early draft) were never specified or implemented — the spec is
@@ -84,68 +83,57 @@ physical count.
 
 ## 2. Parameter budget
 
-### 2.1 Exact accounting (generated 2026-06-08)
+### 2.1 Exact accounting (generated 2026-09-30)
 
 > ✅ **GENERATED** — run `PYTHONPATH=src python scripts/compute_budget.py`
-> (no args = the canonical `OSRT_605M_A288M` preset). The table below is
-> a transcription of that output, with two figures hand-adjusted by −72
-> for the dropped attention sink (see the note after the table). Do NOT
-> pass loose CLI overrides expecting to reproduce the preset — the CLI
-> starts from the full preset and only applies explicit `--override k=v`
-> on top.
+> (no args = the canonical `OSRT_V7` preset). The table below is that
+> script's output with a per-row explanation added; nothing is
+> hand-adjusted. Regenerate it, do not edit it. Do NOT pass loose CLI
+> overrides expecting to reproduce the preset — the CLI starts from the
+> full preset and only applies explicit `--override k=v` on top.
 
 ```
 COMPONENT                                       PHYSICAL        ACTIVE / TOKEN (inference)
 ─────────────────────────────────────────────────────────────────────────────────────
-Embedding (49,280 × 1,536, tied with LM head)    75,721,728     75,721,728
+Embedding (49,280 × 1,536, tied with LM head)    75,694,080     75,694,080
   -- one row per token at lookup; full matrix touched at the tied LM head
 
 Attention × 3 blocks (GQA + KDV, §6)            17,308,032     17,308,032
   -- per block: q_proj (1536×1536) + kv_down (1536×512)
      + v_from_k (512×512 +b) + out_proj (1536×1536) + QK/attn norms
   -- ~5.77M/block; the KDV (Key-Derived Value) latent is what makes attention this lean
-
-  -- per-sub-block A/B/C generators; shared across loop iterations
+  -- shared across the 6 loop iterations (params counted once, run 6×)
 
 Shared experts × 3 (SiTU-GLU, h=3,840)           53,084,160     53,084,160
   -- per block: 3 × 1,536 × 3,840 = 17,694,720; always active (absorbed HRA's 14,155,776 — E1)
 
 Routed experts: 3 × 28 × (SiTU-GLU, h=2,112)    817,496,064    116,785,152
-  -- per expert: 3 × 1,536 × 2,112 = 9,732,096
+  -- per expert: 3 × 1,536 × 2,112 = 9,732,096; per block 272,498,688
   -- top-4 of 28 active per token → 4/28 = 14.3% routing density
 
+Router × 3 (1,536 × 28, plus the scalar moe_gate)   129,027        129,027
+Loop embeddings (18 × 1,536)                         27,648         27,648
+Norms and misc                                        7,680          7,680
+
 HRA adapters (OFF in pretraining — E1 §18.1)              0              0
-  -- adapter_a (1,536 × 256) + adapter_b (256 × 1,536) = 786,432 each
-  -- ONE rank-256 parallel adapter per effective layer (3 blocks ×
-     6 loops = 18), applied on the attention sub-block input
-     (model.py _attention: x_in @ adapter_a @ adapter_b). Fully
-     active — no sparse split.
+  -- with use_hra=True: 18 × (1,536 × 256 + 256 × 1,536) = 14,155,776, fully active
 
 MTP heads × 2 (§9.3)                              4,721,664              0
   -- training-time only; dropped at deploy → 0 active at inference
 
-Router + loop embeddings + norms                    ~45,857        ~45,857
-
 ─────────────────────────────────────────────────────────────────────────────────────
 TOTAL PHYSICAL                                  968,468,355  →  ~968M
 ACTIVE / TOKEN (inference, excl. MTP)                          263,035,779  →  ~263M
-ACTIVE FRACTION                                                    ≈ 46.3%
+ACTIVE FRACTION                                                    ≈ 27.2%
 ```
 
-(With the training-only MTP heads counted, the train-time active figure
-is ~283M; the 278M headline is the inference forward.)
+With the training-only MTP heads counted, the train-time active figure
+is 267,757,443 (~268M). "Active" is a parameter count, not a FLOP count:
+the three blocks each run six times, so per-token compute is ~2.4 GFLOPs
+(§2.3), not 2 × 263M.
 
-> 🔧 **Attention sink DROPPED (−72 params).** The earlier table (and the
-> repo/preset names) carried the per-head learnable sink logits
-> (3 blocks × 24 heads = 72 params, in BOTH columns). The canonical
-> preset now sets `attention_sink=False` (`presets.py`), and the sink
-> `nn.Parameter` is only created `if config.attention_sink:`
-> (`model.py::RecursiveBlock.__init__`) — so it is no longer
-> instantiated. Physical and active both drop by 72
-> (601,444,465 → 601,444,393; 278,217,841 → 278,217,769) and "attn
-> sink" is removed from the misc-params line. These two figures were
-> hand-adjusted by −72 from the last `compute_budget.py` output pending
-> a clean regen; re-run the script to refresh the full table. See §6.6.
+The canonical preset sets `attention_sink=False`, so no per-head sink
+logits are instantiated (§6.6); the row that used to carry them is gone.
 
 ### 2.2 At-a-glance
 
@@ -156,14 +144,13 @@ is ~283M; the 278M headline is the inference forward.)
 - **Attention**: GQA 24 query heads / 8 KV heads / head_dim 64
 - **MoE**: 1 shared expert (h=3,840) + **28 routed (h=2,112)**, top-4, Quantile Balancing, SiTU-GLU
 - **HRA**: **off** in pretraining (E1, 2026-09-02); rank-256 adapter on the normalised input for SFT/GRPO
-  - 8 (not 12) for denser routing — see §2.5
 - **HRA adapter rank**: 256 (real high-rank, not LoRA-style 16)
 - **HRA injection points**: 18 (implementation-defined; see §2.4)
-- ~~**mHC expansion**~~ (REMOVED in v7, §8): 4× residual stream width in v6,
-  preset; pending GPU-phase stability test)
+- ~~**mHC expansion**~~ — removed in v7 (§8; roadmap §12.3). v6 ran a 4×
+  residual stream width; v7 keeps one ladder slot as insurance, nothing more
 - **Position encoding**: Partial RoPE (last 64 dims of Q and K)
-- **Activation**: SwiGLU (FFN), Sqrt(Softplus) (routing affinity)
-- **Norm**: RMSNorm pre + post sandwich
+- **Activation**: SiTU-GLU (FFN, v7; SwiGLU + clamp kept as the A/B), Sqrt(Softplus) (routing affinity)
+- **Norm**: RMSNorm pre-norm on both sub-blocks, plus an RMSNorm reset between loops and before the head (§5.3; there is no post-sub-block norm)
 
 ### 2.3 FLOP count per token (forward pass, one inference)
 
@@ -172,43 +159,46 @@ active MAC). Per effective layer (one block × one loop):
 
 ```
 18 effective layers × (
-    attention (q/kv_down/v_from_k/out, ~5.77M params)  : ~2 × 5.77M  = ~11.5M FLOPs
-  + shared expert (~12.98M params)                      : ~2 × 12.98M = ~26M FLOPs
-  + routed top-2 (2 × 17.69M/8 experts ≈ 4.42M active)  : ~2 × 4.42M  = ~8.8M FLOPs
-  + HRA adapter (786K params)                           : ~2 × 0.79M  = ~1.6M FLOPs
-  + norms                                               : ~1M FLOPs
-)  ≈ 18 × ~49M  = ~880M FLOPs
-+ embedding lookup (negligible) + tied LM head (~2 × 100.7M = ~200M)
+    attention (q/kv_down/v_from_k/out, ~5.77M params)  : ~2 × 5.77M   = ~11.5M FLOPs
+  + shared expert (17.69M params)                       : ~2 × 17.69M  = ~35.4M FLOPs
+  + routed top-4 (4 × 9.73M = 38.93M active)            : ~2 × 38.93M  = ~77.9M FLOPs
+  + router (43K) + norms                                :               ~1M FLOPs
+)  ≈ 18 × ~126M  = ~2.27B FLOPs
++ embedding lookup (negligible) + tied LM head (~2 × 75.7M = ~151M)
 
-TOTAL: ~1.1B FLOPs per token (forward); ~3.3B with backward
+TOTAL: ~2.4B FLOPs per token (forward); ~7.2B with backward
 
-(Approximate — FLOP definitions vary. Use as ratios. For exact param
-counts see §2.1; this FLOP estimate is hand-derived from them.)
+(Approximate — FLOP definitions vary, and attention's score/value
+products are excluded. Use as ratios. For exact param counts see §2.1;
+this estimate is hand-derived from them. HRA adds ~2 × 0.79M per
+effective layer when it is on.)
 ```
 
 ### 2.4 HRA injection enumeration
 
-The implementation injects **18 HRA adapter pairs** — one per
-*effective layer* (3 blocks × 6 loops = 18), applied on the attention
-sub-block (`model.py::_attention`: `x_in @ adapter_a @ adapter_b`).
+The implementation injects **18 HRA adapter pairs** when `use_hra=True` —
+one per *effective layer* (3 blocks × 6 loops = 18), applied on the
+attention sub-block (`model.py::_attention`: `x_in @ adapter_a @ adapter_b`).
 This is NOT per-projection (an early draft envisioned 132 across
 Q/K/V/O + every expert + router); it is one parallel rank-256 path
-per block forward. Verify in code:
+per block forward. The canonical preset pretrains with HRA **off**
+(E1, roadmap §18.1), so against `OSRT_V7` as shipped the count is 0.
+Verify both:
 
 ```bash
 PYTHONPATH=src python -c "from osrt.model import OSRTForCausalLM; \
-from osrt.config import OSRTConfig; from osrt.presets import OSRT_605M_A288M; \
-m = OSRTForCausalLM(OSRTConfig(**OSRT_605M_A288M)); \
+from osrt.config import OSRTConfig; from osrt.presets import OSRT_V7; \
+m = OSRTForCausalLM(OSRTConfig(**{**OSRT_V7, 'use_hra': True})); \
 print(sum(p.numel() for n,p in m.named_parameters() if 'adapter' in n))"
-# -> 14155776
+# -> 14155776   (0 with the preset as shipped)
 ```
 
-Total HRA params: 18 × (2 × 1,536 × 256) = 18 × 786,432 = **14,155,776**.
-All fully active per token — the adapters sit on the always-run
-attention path, not on the sparse routed experts, so there is no
-top-k masking of HRA.
+Total HRA params when on: 18 × (2 × 1,536 × 256) = 18 × 786,432 =
+**14,155,776**. All fully active per token — the adapters sit on the
+always-run attention path, not on the sparse routed experts, so there is
+no top-k masking of HRA.
 
-### 2.5 Why "OSRT-600M" (name vs physical count)
+### 2.5 The name
 
 `OSRT` = **Optimized Sparse Recursive Transformer**:
 - **O**ptimized — Muon optimizer + AlphaQ + TurboQuant deployment stack
@@ -216,20 +206,14 @@ top-k masking of HRA.
 - **R**ecursive — 3 physical blocks × 6 loops = 18 effective layers
 - **T**ransformer — standard pre-norm decoder backbone
 
-`600M` (in the old repo name) rounded v6's **601,444,393**; v7 is **968,468,355** and no count appears in any name, by rule (§19)
-(601M). Active per token at inference is **278M** (46.3%). (The count
-dropped by 72 from 601,444,465 when the per-head attention-sink logits
-were removed — see §2.1 / §6.6.)
-
-**Naming note:** the GitHub repo is `OSRT-605M-A269M` and the canonical
-preset `OSRT_605M_A288M`; both numbers were locked at earlier points
-before the count was generated cleanly (the "605/607" came from a
-compute_budget CLI run that fell back to MHA defaults; the "288"
-included an attention overcount + the training-only MTP heads). The
-instantiated model is 601M / 278M. The names are kept — renaming the
-repo breaks clones, renaming the preset churns `app.py`/training
-imports — but **§2.1 is authoritative, not the names.** An alias
-`OSRT_605M_A279M` is also kept for back-compat with older imports.
+No parameter count appears in the repo, package, preset or directory
+name, by rule (`CLAUDE.md`; §19). The v6 lineage carried four mutually
+inconsistent stale counts at once — `OSRT-605M-A269M` (repo),
+`nano-osrt-100m` (checkout), `OSRT_605M_A288M` (preset) and "~608M/~279M"
+(pyproject) — against an actual 601M/278M. `scripts/compute_budget.py` is
+the only source for a count: v7 instantiates at **968,468,355 physical /
+263,035,779 active** (27.2%, §2.1). The old names survive only as history
+in `CodeHalwell/OSRT-605M-A269M`.
 
 ---
 
@@ -245,72 +229,62 @@ imports — but **§2.1 is authoritative, not the names.** An alias
 - **Pre-tokenization**: GPT-2 style regex (handles contractions,
   numbers, punctuation)
 
-> 🔧 **PARTIALLY BUILT — `tokenizer/tokenizer.json` has 14 of 21
-> spec tokens.** The on-disk v6 tokenizer was rebuilt with the correct
-> base IDs (PAD=0, BOS=1, EOS=2, FIM 4-6, think/answer 7-10,
-> user/assistant/system 11-13). **Still missing IDs 14-20:**
-> `<|end_turn|>`, `<|tool_call|>`/`<|/tool_call|>`,
-> `<|tool_result|>`/`<|/tool_result|>`, `<|image|>`, `<|audio|>`.
-> Basic chat works; **tool-use and multimodal will silently mis-tokenize
-> until these are added** (the strings get byte-BPE'd into fragments).
-> Add them + a `tokenizer_contract_test.py` asserting
-> `tok("<|end_turn|>") == [14]` before any tool-use / vision training.
-> The IDs below are the full v6 contract (✓ = on disk now).
+### 3.2 Special tokens (v7 contract — all 32 on disk)
 
-### 3.2 Special tokens (reserved IDs — v6 contract)
+The v7 tokenizer keeps SmolLM2's 49,152 base rows byte-for-byte (ids 0–49,151,
+including SmolLM2's own `<|endoftext|>`/`<|im_start|>`/`<repo_name>`... control
+tokens, which the pretraining stream never emits as control ids — raw text is
+encoded with `split_special_tokens=True`) and appends the 32 OSRT specials at
+49,152–49,183. `osrt.tokenizer_contract.validate_tokenizer_contract` pins the
+size and these ids before any model is built; `osrt.presets.OSRT_V7` carries
+the same ids into the model config (the v6 ids 0–13 that `OSRTConfig` still
+defaults to are SmolLM2 control tokens in this tokenizer).
 
-IDs 0-13 are ✓ on disk (`tokenizer/tokenizer.json` + the HF config
-`bos=1, eos=2, pad=0`); IDs 14-20 are the contract but NOT yet built.
+| token | id | role |
+|---|---|---|
+| `<|begin_of_text|>` | 49152 | BOS |
+| `<|end_of_text|>` | 49153 | EOS (document separator in the packed stream) |
+| `<|padding|>` | 49154 | PAD |
+| `<|unknown|>` | 49155 | unk |
+| `<|fim_prefix|>` / `<|fim_middle|>` / `<|fim_suffix|>` | 49156–49158 | FIM markers |
+| `<|think|>` / `<|/think|>` | 49159 / 49160 | reasoning block |
+| `<|answer|>` / `<|/answer|>` | 49161 / 49162 | answer block |
+| `<|user|>` / `<|assistant|>` / `<|system|>` | 49163 / 49164 / 49165 | turn openers |
+| `<|end_turn|>` | 49166 | end of an assistant turn |
+| `<|tool_call|>` / `<|/tool_call|>` | 49167 / 49168 | tool invocation |
+| `<|tool_result|>` / `<|/tool_result|>` | 49169 / 49170 | tool result |
+| `<|image|>` / `<|audio|>` | 49171 / 49172 | reserved (vision / audio retrofit) |
+| `<|reserved_21|>` … `<|reserved_31|>` | 49173–49183 | free slots |
 
-| token | id | role | on disk? |
-|---|---|---|---|
-| `<|padding|>` | 0 | PAD | ✓ |
-| `<|begin_of_text|>` | 1 | BOS | ✓ |
-| `<|end_of_text|>` | 2 | EOS | ✓ |
-| `<|unknown|>` | 3 | unk | ✓ |
-| `<|fim_prefix|>` | 4 | FIM prefix marker | ✓ |
-| `<|fim_middle|>` | 5 | FIM middle marker | ✓ |
-| `<|fim_suffix|>` | 6 | FIM suffix marker | ✓ |
-| `<|think|>` | 7 | reasoning block open | ✓ |
-| `<|/think|>` | 8 | reasoning block close | ✓ |
-| `<|answer|>` | 9 | answer block open | ✓ |
-| `<|/answer|>` | 10 | answer block close | ✓ |
-| `<|user|>` | 11 | user turn open | ✓ |
-| `<|assistant|>` | 12 | assistant turn open | ✓ |
-| `<|system|>` | 13 | system prompt open | ✓ |
-| `<|end_turn|>` | 14 | turn separator (ChatML style) | ✗ missing |
-| `<|tool_call|>` | 15 | tool invocation open | ✗ missing |
-| `<|/tool_call|>` | 16 | tool invocation close | ✗ missing |
-| `<|tool_result|>` | 17 | tool result open | ✗ missing |
-| `<|/tool_result|>` | 18 | tool result close | ✗ missing |
-| `<|image|>` | 19 | reserved for vision retrofit | ✗ missing |
-| `<|audio|>` | 20 | reserved for future audio | ✗ missing |
-
-IDs 21-31 reserved for future expansion. Real vocab begins at id 32.
+Embedding rows 49,184–49,279 are padding to a multiple of 128; every loss and
+every generation path slices logits to the real 49,184, so they are never
+targets and never sampled.
 
 ### 3.3 Chat template
 
+The canonical form has **no newlines between markers**. Every marker is a
+single token, so a newline there would be an extra token the model has to
+learn to emit at every boundary, and `<|end_turn|>` detection would depend
+on whitespace. The pretraining stream (`osrt.data`, via
+`osrt.chat_format.render_chat`) and the tokenizer's `chat_template`
+(`osrt.chat_format.CHAT_TEMPLATE`, shipped in `tokenizer/tokenizer_config.json`)
+produce this exact byte form; content is whitespace-trimmed. Each block
+below is one contiguous string.
+
 ```
-<|system|>{system_message}
-<|user|>{user_question}
-<|assistant|><|think|>{reasoning}<|/think|><|answer|>{final_answer}<|/answer|>
-<|end_turn|>
+<|system|>{system_message}<|user|>{user_question}<|assistant|><|think|>{reasoning}<|/think|><|answer|>{final_answer}<|/answer|><|end_turn|>
 ```
 
-Multi-turn:
+Multi-turn (the system prefix is optional; a trailing user turn without a
+reply is dropped in training, and a generation prompt ends with `<|assistant|>`):
 ```
-<|system|>{system}
-<|user|>{q1}<|assistant|>{a1}<|end_turn|>
-<|user|>{q2}<|assistant|>{a2}<|end_turn|>
+<|system|>{system}<|user|>{q1}<|assistant|>{a1}<|end_turn|><|user|>{q2}<|assistant|>{a2}<|end_turn|>
 ```
 
-Tool use:
+Tool use (the tool markers are reserved for post-training; `tool` roles are
+not rendered in pretraining):
 ```
-<|user|>{question_needing_calc}<|assistant|>
-<|think|>I need to compute 17 × 23.<|/think|>
-<|tool_call|>calculator("17 * 23")<|/tool_call|>
-<|tool_result|>391<|/tool_result|>
-<|answer|>The answer is 391.<|/answer|><|end_turn|>
+<|user|>{question_needing_calc}<|assistant|><|think|>I need to compute 17 × 23.<|/think|><|tool_call|>calculator("17 * 23")<|/tool_call|><|tool_result|>391<|/tool_result|><|answer|>The answer is 391.<|/answer|><|end_turn|>
 ```
 
 ---
@@ -383,14 +357,21 @@ Capping at `min(r, 7)` means hard wall at R=8. Model trained for R=6
 will function (with quality degradation) at R=3-5; cannot safely
 extend beyond R=6 without retraining loop embeddings.
 
-### 5.3 Sandwich RMSNorm
+### 5.3 Normalisation ("sandwich" in older text)
 
-Two RMSNorm layers per physical block per sub-block:
-- `RMSNorm_pre[b]` before attention
-- `RMSNorm_post[b]` before MoE FFN
+What the code does (`RecursiveBlock`, `OSRTModel`):
+- `norm_attn` — RMSNorm on the block input before attention (pre-norm)
+- `norm_moe` — RMSNorm on the residual before the MoE FFN (pre-norm)
+- `norm_q` / `norm_k` — per-head QK-norm before RoPE
+- `norm_loop` — RMSNorm reset of the residual stream between recursive loops
+- `norm_out` — RMSNorm before the (tied) LM head and the MTP heads
 
-Each is `RMSNorm(d_model=1536, eps=1e-6)` with learnable scale, no
-bias. Total norm params per block: 2 × 1536 = 3,072.
+Each stream norm is `nn.RMSNorm(1536)` (torch's default eps, i.e. dtype
+epsilon) with learnable scale, no bias. **There is no post-sub-block norm**:
+earlier revisions called this stack "sandwich RMSNorm" and cited Gemma 3,
+whose sandwich is pre- *and* post-norm around each sub-block. What v6 proved
+stable across 18 effective layers is pre-norm plus the per-loop reset; a true
+post-norm variant would be a ladder arm, not a documented feature.
 
 Gemma 3's "sandwich" placement validated for deep stacks; Huginn used
 similar to survive 32+ recursive iterations.
@@ -602,33 +583,35 @@ HRA adapter applied to `W_O` output additively.
 Each MoE block has:
 - 1 always-active shared expert (h=3,840; was 2,816 before E1 moved HRA's budget here)
 - **28 routed experts** (h=2,112), top-4 active per token
-- 1 router (linear projection + sqrt-softplus affinity)
+- 1 router (linear projection + sqrt-softplus affinity + the Quantile Balancing bias)
 
 > **v7:** 28 routed × h2,112, top-4 = 14.3% density, Quantile Balancing,
 > SiTU-GLU. The re-grain holds active params while adding total; see
 > `docs/03-moe-and-routing.md` §12 and roadmap §14.3. The paragraph below is
 > the **v6** rationale, kept because it explains why 8 was chosen then.
 
-8 routed (not the 12 of an early draft): top-2 of 8 = 25% routing
+v6 ran 8 routed (not the 12 of an early draft): top-2 of 8 = 25% routing
 density vs 16.7% for top-2 of 12 — denser routing, more capacity per
-token, less expert under-utilization at 601M scale. Each of the 8 is
-wider (h=3,840) to absorb the capacity.
+token, less expert under-utilization at v6's 601M scale, each of the 8
+wider (h=3,840) to absorb the capacity. v7 trades that for a finer grain:
+more, narrower experts at a lower density (roadmap §14.3, gate G3).
 
-### 7.2 Shared expert (SwiGLU)
+### 7.2 Shared expert (SiTU-GLU)
 
 ```
 w_gate ∈ ℝ^(1536 × 3840)       # 5.90M params
 w_up ∈ ℝ^(1536 × 3840)         # 5.90M params
 w_down ∈ ℝ^(3840 × 1536)       # 5.90M params
 
-shared_output(x) = w_down @ (SiLU(w_gate @ x) ⊙ (w_up @ x))
+shared_output(x) = w_down @ (act(w_gate @ x) ⊙ (w_up @ x))
+# act = the SiTU-GLU activation (v7 default); SiLU in the SwiGLU A/B arm
 ```
 
-Per shared expert: ~12.98M params. Across 3 blocks: 38.93M.
-(h=2,816 chosen by `compute_budget.py` to land the overall ~601M
-target; revisit at GPU phase.)
+Per shared expert: 17,694,720 params. Across 3 blocks: 53,084,160.
+(h=3,840 is where E1 reinvested HRA's 14,155,776 pretraining params —
+roadmap §18.1; v6 used h=2,816.)
 
-### 7.3 Routed experts (SwiGLU)
+### 7.3 Routed experts (SiTU-GLU)
 
 Per routed expert:
 ```
@@ -637,26 +620,30 @@ w_up ∈ ℝ^(1536 × 2112)         # 3.24M params
 w_down ∈ ℝ^(2112 × 1536)       # 3.24M params
 ```
 
-Per expert: ~17.69M. Per block (8 experts): 141.56M. Across 3 blocks:
-424.67M (the dominant param term — ~71% of physical; ~25% active per
-token via top-2 routing).
+Per expert: 9,732,096. Per block (28 experts): 272,498,688. Across 3
+blocks: 817,496,064 — the dominant param term, 84.4% of physical. Top-4
+routing keeps 4/28 = 14.3% of them (116,785,152) active per token.
 
 ### 7.4 Router
 
 ```
-W_route ∈ ℝ^(1536 × 8)         # 12,288 params per block
-b_route_bias ∈ ℝ^(8)           # per-expert bias for load balancing
+W_route ∈ ℝ^(1536 × 28)        # 43,008 params per block
+b_route_bias ∈ ℝ^(28)          # per-expert bias for load balancing
                                 # (not in gradient; nudged by load deviation)
 ```
 
 Affinity score:
 ```
-affinity = sqrt(softplus(W_route @ x))      # sqrt(softplus) — DeepSeek-V4
-balanced_affinity = affinity + b_route_bias  # static bias for balancing
-top_2_indices = argmax(balanced_affinity, k=2)
+affinity = sqrt(softplus(W_route @ x))      # sqrt(softplus) — DeepSeek-V4; fp32
+balanced_affinity = affinity + b_route_bias  # controller bias, selection only
+top_k_indices = topk(balanced_affinity, k=4)
 
-normalized_weights = softmax(balanced_affinity[top_2_indices])
-# (DeepSeek-style: bias only in TOP-K selection, not in gating weights)
+gates = affinity[top_k_indices] / sum(affinity[top_k_indices])
+# DeepSeek-V3 §2.1.2: the bias picks WHICH experts; the gate that multiplies
+# each expert's output comes from the ORIGINAL affinity. This is what
+# `router_bias_in_gates=False` (the default) implements; the v6 behaviour
+# (gates from the biased, Gumbel-noised distribution) is the True setting.
+# The router matmul runs in fp32 regardless of autocast (Switch §2.4).
 ```
 
 ### 7.5 Hash routing for blocks 0 and 1
@@ -683,50 +670,41 @@ Block 2 uses normal learned routing.
 
 ### 7.6 Aux-loss-free load balancing
 
-Per-expert balancing bias `b_route_bias[i]` accumulates per training
-step:
+The per-expert bias `b_route_bias[e]` steers expert **selection** only:
+gates are computed from the pre-bias affinity (`router_bias_in_gates=False`,
+DeepSeek-V3 semantics), and the bias is not in the gradient. Two
+controllers exist (`router_balance_mode`); the canonical preset uses
+**Quantile Balancing**, which roadmap §14.6 makes required, not optional:
+
 ```
-mean_load = (1/8) × total_tokens_in_batch
-for i in range(8):
-    deviation = expert_load[i] - mean_load
-    if deviation > 0:
-        b_route_bias[i] -= γ              # nudge down
-    else:
-        b_route_bias[i] += γ              # nudge up
-# γ = 0.001 (per DeepSeek-V3)
-# This bias is HEURISTIC — not in the gradient
-```
+# "quantile" (v7 preset; Kimi K3) — re-solved from accumulated router scores
+p = top_k / num_routed                     # 4/28: the target selection fraction
+for e in experts:
+    t[e] = the score threshold with fraction p of expert e's OWN score mass above it
+b_route_bias = mean(t) - t                 # centred (only differences steer top-k)
+clamp(±router_balance_bias_max)
+# every expert then presents the same fraction of its distribution above the
+# common selection threshold, so load equalises in one shot — no rate to tune
 
-Combined with a small sequence-balance loss (weight 0.0001) to prevent
-extreme imbalance within single sequences.
-
-### 7.6 Aux-loss-free load balancing
-
-> 🔧 **Duplicate heading** — this section repeats §7.6 above (8 experts);
-> kept as-is to preserve numbering. Numbers below corrected from the
-> stale 12-expert form.
-
-Per-expert balancing bias `b_route_bias[i]` accumulates per training
-step:
-```
-mean_load = (1/8) × total_tokens_in_batch
-for i in range(8):
-    deviation = expert_load[i] - mean_load
-    if deviation > 0:
-        b_route_bias[i] -= γ              # nudge down
-    else:
-        b_route_bias[i] += γ              # nudge up
-# γ = 0.001 (per DeepSeek-V3)
-# This bias is HEURISTIC — not in the gradient
+# "heuristic" (config default; the legacy controller, tuned at E=8)
+frac = EMA(clean load fraction per expert)         # router_balance_bias_ema_rate
+b_route_bias -= router_balance_bias_update_rate × (frac - 1/num_routed)
+clamp(±router_balance_bias_max)
 ```
 
-Combined with a small sequence-balance loss (weight 0.0001) to prevent
-extreme imbalance within single sequences.
+Both accumulate the per-loop *clean* load (before any capacity drop) and
+apply once per optimizer step (`MoELayer.apply_balance_update`). The
+heuristic step was tuned at 8 experts; at 28 it has to move 3.5× as many
+biases on 3.5× less load signal each, which is why the preset does not use
+it (`config.py` warns when it is combined with more than 8 experts).
+Combined with a small sequence-balance loss
+(`router_seq_balance_loss_coeff` = 1e-4 in the preset) to prevent extreme
+imbalance within single sequences.
 
 ### 7.7 MoE output
 
 ```
-moe_output(x) = shared_output(x) + Σ_{i ∈ top2} weight_i × routed_output_i(x)
+moe_output(x) = shared_output(x) + Σ_{i ∈ top4} weight_i × routed_output_i(x)
 ```
 
 > ✅ **DISPATCH: grouped-GEMM (B4), loop retained as fallback.** Two
@@ -1237,7 +1215,6 @@ genuinely different representations.
 | Routed experts | **FP4 (MXFP4)** | AlphaQ-allocated bit budget |
 | HRA adapters | bf16 | kept full precision (small, sensitive) |
 | Router projections | bf16 | kept full precision |
-| mHC matrices | bf16 | kept full precision |
 | Loop embeddings | bf16 | kept full precision |
 | LayerNorms / biases | bf16 | always bf16 |
 | K cache (per layer) | **int4** | TurboQuant random-rotation + per-block |
@@ -1246,31 +1223,35 @@ genuinely different representations.
 
 Numbers below are decimal MB (1 MB = 1,000,000 bytes), no allocator
 overhead, no per-tensor quantization metadata. Param counts are the
-real §2.1 figures (MTP heads dropped at deploy):
+real §2.1 figures (MTP heads dropped at deploy, HRA off):
 
 ```
-Embedding (int8, 100.7M params × 1 byte):            101 MB
+Embedding (int8, 75.7M params × 1 byte):              76 MB
 Attention (int8, 17.3M params):                       17 MB
-Shared experts (int8, 38.9M params):                  39 MB
-Routed experts (FP4 @ ~3.5 bit avg, 424.7M params):
-    424.7M × 3.5 bits / 8 ≈ 186 MB (+~2% AlphaQ meta) ~190 MB
-HRA adapters (bf16, 14.2M params × 2 bytes):          28 MB
-mHC + router + norms + loop_emb (bf16):               ~2 MB
+Shared experts (int8, 53.1M params):                  53 MB
+Routed experts (FP4 @ ~3.5 bit avg, 817.5M params):
+    817.5M × 3.5 bits / 8 ≈ 358 MB (+~2% AlphaQ meta) ~365 MB
+HRA adapter (post-training only; off in pretraining)    0 MB
+router + norms + loop_emb (bf16, 0.16M params):        <1 MB
 (MTP heads dropped at deploy)                            0 MB
 
-TOTAL ON DISK (all loaded into RAM):                 ~377 MB
+TOTAL ON DISK (all loaded into RAM):                 ~510 MB
 ```
 
-To fit a tighter (~150-250 MB) envelope, the levers are:
+To fit a tighter envelope, the levers are:
 
-- Routed experts to 2-bit average (~190 MB → ~110 MB) — they're 71%
+- Routed experts to 2-bit average (~365 MB → ~210 MB) — they're 84%
   of physical, so this is the dominant lever
-- Embedding to int4 (101 MB → 50 MB)
-- HRA folded into base weights post-RL (eliminates 28 MB) or int8-ed
+- Embedding to int4 (76 MB → ~38 MB)
+- A post-training HRA adapter folded into the base weights (0 MB) or int8-ed
 
-A "active-only resident" figure (loading just the top-2 routed experts
-per layer + paging the rest from disk/CPU) is an inference-system
-choice, not a weight choice — state the assumption when quoting it.
+Stacked, those land near **~320 MB** of weights. The ~150–250 MB band
+that v6's 424.7M routed pool reached is not reachable for v7 on weight
+formats alone: it needs the "active-only resident" scheme (loading just
+the top-4 routed experts per block and paging the rest from disk/CPU),
+which is an inference-system choice, not a weight choice — state the
+assumption when quoting it. With it, the stack is ~140 MB at 2-bit
+routed and ~200 MB with the baseline formats. `docs/09` has the arithmetic.
 
 ### 14.3 AlphaQ bit allocation (routed experts)
 
@@ -1283,7 +1264,8 @@ Per AlphaQ:
 - Layer-wise allocation (each up/gate/down independently)
 
 Expected quality: near-lossless at 3.5-bit average (per AlphaQ
-results on Qwen1.5-MoE; our 8-experts-per-block is a similar regime).
+results on Qwen1.5-MoE, a fine-grained many-expert regime; v7's 28
+routed per block, top-4, is closer to it than v6's 8 were).
 
 ---
 
@@ -1291,48 +1273,58 @@ results on Qwen1.5-MoE; our 8-experts-per-block is a similar regime).
 
 ### 15.1 Training compute and budget
 
-Per token, per forward pass: ~810M FLOPs (§2.3)
-Backward is ~2× forward: ~1.6B FLOPs
-Total per token per training step: ~2.4 BFLOPs
+Per token, per forward pass: ~2.4B FLOPs (§2.3)
+Backward is ~2× forward: ~4.8B FLOPs
+Total per token per training step: ~7.2 BFLOPs
 
-**Base-pretrain budget (`train_config.py::PretrainConfig`):** the LR
-cosine horizon is sized to a **~$100 Modal H100 run** (≈ $3.95/hr ≈ 25
-H100-hr):
+**Base-pretrain budget (`train_config.py::PretrainConfig`):** one
+continuous WSD schedule, with the phase boundaries derived from
+`total_steps` so the two cannot disagree:
 ```
-total_steps  = 18,000         # ≈5.43B tokens; WSD decays over the last 15%
-warmup_steps = 400            # ~11% — spins up Muon + the MoE balance bias
-peak_lr      = 6e-4  →  min_lr = 6e-5    # WSD: flat trunk, linear decay branch
+total_steps  = 18,000         # ≈5.43B tokens; WSD decays over the last 15% (wsd_decay_frac)
+warmup_steps = 400            # ~2% — spins up Muon + the balance bias
+peak_lr      = 6e-4  →  min_lr = 6e-5    # AdamW groups; Muon 3e-3 → 3e-4 on the same shape
 ```
-At ~5k tok/s on the seq-2048 foundation phase (131K tok/step) that is
-**~455M tokens** by step 3,500, when the cosine has fully decayed
-peak→min_lr and the run self-terminates at the budget with a clean,
-annealed base. Long-context (4096/8192) phases and SFT/RL are separate
-chunks layered on top (`PretrainExtendConfig`, `SFTConfig`, etc.).
+Phases: foundation seq-2048 to step 900 (131K tok/step, 0.12B tokens),
+knowledge seq-4096 to 15,300 (270K tok/step, 3.89B), instruction
+seq-8192 to 18,000 (524K tok/step, 1.42B) — **≈5.43B tokens**, ~3.9e19
+training FLOPs. Whether the token requirement tracks active or total
+params is still open (gate G3a); wall-clock is measured, not estimated
+— the smoke run and the notebook's probe step report tok/s on the actual
+card (`RUNBOOK.md`). Post-training (SFT / RL) is being redesigned for v7
+and is not part of this schedule (roadmap §14).
 
-**Memory (80GB H100):** gradient (activation) checkpointing is required
-to fit (the trainer flips the private `OSRTModel._osrt_grad_ckpt` gate),
-and the fused linear-CE for the aux/MTP heads is **available** to cut
-the (B, S, vocab) fp32 logit peak (`fused_cross_entropy_chunks`,
-routed through `osrt.fused_ce` in `train.py`; default 0 = off, opt-in
-per stage). With the canonical preset, seq-8192/batch-2 sits at
-**~35.9GB** (the flash SDPA path — the dropped attention sink's manual
-path OOMed here, §6.6). The knowledge phase (seq-4096) runs batch-6 at
-~59GB. `torch.compile` is on by default in the trainer
-(`compile_enabled`, default True).
+**Memory:** gradient (activation) checkpointing is on (the trainer flips
+the private `OSRTModel._osrt_grad_ckpt` gate), the fused linear-CE
+(`fused_cross_entropy_chunks` > 0, with `fused_main_head` covering the
+main head) removes the (B, S, vocab) fp32 logit peak, and `torch.compile`
+is on by default (`compile_enabled`). The v6 H100 figures that used to
+sit here (seq-8192/batch-2 at ~35.9 GB, seq-4096/batch-6 at ~59 GB) were
+measured on the 601M v6 model and do not transfer to v7's 968M on the
+96 GB RTX PRO 6000; `train_main.py` scales the micro-batch to the GPU's
+memory and the notebook's probe step measures the real footprint.
 
 ### 15.2 Inference compute per token (generation)
 
-Just the forward pass: ~810M FLOPs
-On H100 (consumer-equivalent at int8): ~200 GFLOPs effective
-→ ~250K tokens/sec single-token decode (unrealistic — bandwidth bound)
-→ Realistic on CPU (Snapdragon 8 Elite, int8): ~50-100 tokens/sec
+Just the forward pass: ~2.4B FLOPs (§2.3). Decode is bandwidth- and
+latency-bound, not FLOP-bound: at bf16 a decode step reads the ~263M
+active parameters (~0.53 GB); on a ~1.8 TB/s card that is a ~3,400 tok/s
+single-stream ceiling against the ~136 tok/s recorded in
+`docs/09-quantization-deployment.md`. Sequential depth (18 effective
+layers) and launch count bind first, which is why the loop-count
+recommender and a persistent megakernel outrank weight quantization on
+the decode lever list. On CPU (Snapdragon 8 Elite class, int8) expect
+tens of tokens/sec.
 
 ### 15.3 Memory at inference (full deployment)
 
-Weights: ~150-200 MB
-KV cache (4K context, full stack): ~5 MB
+Weights: ~510 MB as specified (§14.2); ~320 MB with the §14.2 levers;
+~140–200 MB only with active-only expert residency
+KV cache (4K context, int4 TurboQuant): ~9–18 MB (§13); ~2–5 MB with a 1K sliding window
 Activations (transient): ~50 MB
-Total: **~250 MB** — fits comfortably on phones / Raspberry Pi 5.
+Total: **~380 MB** with the levers and the full KV cache. The v6 "~250 MB,
+fits comfortably on phones / Raspberry Pi 5" headline needs the residency
+assumption for v7 — say which when quoting it.
 
 ---
 

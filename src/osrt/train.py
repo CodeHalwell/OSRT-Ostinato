@@ -1,31 +1,39 @@
-"""Pre-training loop for OSRT.
+"""Pre-training loop for OSRT (v7 trunk).
 
-Simpler than v4_train.py because v5 removes:
-  - Soft warmup / blend / routing_mode switching
-  - router_noise anneal
+One loop: WSD (or cosine) LR applied per param group, phase transitions
+(seq_len + dataset swap + micro-batch shape), held-out eval at a fixed
+context, atomic checkpoints with fail-closed resume, W&B, torch.compile,
+the 23h Modal rescue, annealed Gumbel top-k exploration and the per-expert
+balance-bias update after every optimizer step.
 
-What remains: cosine LR, phase transitions (seq_len + dataset swap),
-eval, checkpointing, W&B, compile, resume, 23h rescue, and annealed
-Gumbel top-k exploration plus a DeepSeek-style per-expert bias controller
-to prevent early dead experts.
-
-v5-specific telemetry (new metrics, all logged to W&B and stdout):
+Telemetry (all logged to W&B and stdout on logging steps):
   - per_token_entropy — the real router-sharpness signal
   - marginal_entropy — balance proxy (stays high if globally balanced)
   - assignment_entropy — hard f entropy
   - raw_max_prob — pre-renormalisation top-1 confidence
   - top_margin — gap between rank 0 and rank 1 probs
-  - drop_rate — fraction of token-expert pairs dropped by capacity cap
-  - dense_gate removed (no dense FFN in v5); log moe_gate per block
+  - drop_rate — capacity drops (identically 0 on the dropless grouped path)
+  - loop/update_norm_l*, loop/hidden_norm_ratio — recursion health
+  - muon/ortho_err, muon/update_rms_* — optimizer health
+  - train/grad_norm, train/nonfinite_steps, train/dead_sources
 
-Early-stop check: at `early_stop_check_step`, verifies the router has
-made the four v5 success criteria. If not, prints a clear diagnosis and
-stops so further compute isn't wasted on a known-bad run.
+Health checks: the router-sharpening gate runs once at
+`early_stop_check_step`; loop collapse, residual explosion and (after the
+gate) the whole router-health set are re-checked on every logging step and
+stop the run once they fail `health_check_patience` checks in a row. Failed
+runs write `osrt_failed_step_N.pt`, which the resume scan ignores.
+
+`run_training` returns a status string: "complete", "already_complete",
+"early_stop", "rescued" (23h boundary, re-invoke to continue) or
+"data_dead" (every data source failed permanently; rescue written).
 """
 
 import glob
+import hashlib
+import json
 import math
 import os
+import shutil
 import sys
 import time
 
@@ -39,7 +47,7 @@ except ImportError:
     wandb = None
 
 from osrt.config import OSRTConfig
-from osrt.data import make_loader  # reused unchanged
+from osrt.data import DataSourceDead, make_loader
 from osrt.model import OSRTForCausalLM
 from osrt.train_config import PretrainConfig
 
@@ -76,40 +84,59 @@ def get_lr(step: int, cfg: PretrainConfig) -> float:
 def _set_param_group_lrs(
     optimizer, step: int, cfg: PretrainConfig,
 ) -> float:
-    """Apply the LR schedule to every param group, respecting the
-    per-group `_peak_lr` / `_min_lr` tags written at construction.
+    """Apply `get_lr`'s schedule to every param group, respecting the
+    per-group `_peak_lr` / `_min_lr` tags (see `_stamp_schedule_tags`).
 
-    Returns the AdamW/Lion-scale LR for logging. Muon groups (when
-    present) have their own peak_lr/min_lr stored on the group dict and
-    are scaled along the same cosine ratio so all optimizers reach
-    their min at the end of training.
+    Returns the AdamW/Lion-scale LR for logging. Muon groups carry their own
+    peak/floor and follow the SAME schedule shape — warmup from 0, then the
+    position between floor and peak that `get_lr` gives the AdamW scale — so
+    a WSD run is flat for every optimizer through the stable phase and every
+    optimizer reaches its floor together at the end.
 
-    `lr_anchor_step` (optional cfg attr, default 0) lets a resumed
-    extension run re-warm without an LR jump-up: the warmup/cosine
-    treats `step - anchor` as the effective step, so a continuation
-    starts cleanly from warmup again instead of recomputing cosine
-    progress against the new total_steps (which would jump LR back to
-    near-peak mid-cool). Same mechanism as GRPOConfig.lr_anchor_step.
+    History: until 2026-09-30 this function computed its own cosine and never
+    consulted `cfg.lr_schedule`, so `get_lr`'s WSD branch was tested but never
+    applied — the trunk decayed from step 400. Routing through `get_lr` keeps
+    the two from drifting apart again; tests pin them equal mid-stable-phase.
     """
-    anchor = getattr(cfg, "lr_anchor_step", 0)
-    eff_step = max(step - anchor, 0)
-    eff_total = max(cfg.total_steps - anchor, 1)
-    if eff_step < cfg.warmup_steps:
-        ratio = eff_step / cfg.warmup_steps
+    base = get_lr(step, cfg)
+    if step < cfg.warmup_steps:
+        ratio = base / cfg.peak_lr if cfg.peak_lr > 0 else 0.0
         for pg in optimizer.param_groups:
-            peak = pg.get("_peak_lr", cfg.peak_lr)
-            pg["lr"] = peak * ratio
-        return cfg.peak_lr * ratio
+            pg["lr"] = pg.get("_peak_lr", cfg.peak_lr) * ratio
+        return base
 
-    progress = (eff_step - cfg.warmup_steps) / max(
-        eff_total - cfg.warmup_steps, 1,
-    )
-    cosine_half = 0.5 * (1 + math.cos(math.pi * progress))
+    span = cfg.peak_lr - cfg.min_lr
+    frac = (base - cfg.min_lr) / span if span > 0 else 1.0   # 1 = peak, 0 = floor
     for pg in optimizer.param_groups:
         peak = pg.get("_peak_lr", cfg.peak_lr)
         floor = pg.get("_min_lr", cfg.min_lr)
-        pg["lr"] = floor + (peak - floor) * cosine_half
-    return cfg.min_lr + (cfg.peak_lr - cfg.min_lr) * cosine_half
+        pg["lr"] = floor + (peak - floor) * frac
+    return base
+
+
+def _stamp_schedule_tags(optimizer, train_cfg: PretrainConfig) -> None:
+    """(Re)write the per-group `_peak_lr` / `_min_lr` tags the schedule reads,
+    from the CURRENT config.
+
+    Called at construction and again right after `optimizer.load_state_dict`:
+    torch restores every param-group key except `params` from the checkpoint,
+    so without the re-stamp a resumed session silently kept the previous
+    session's Muon/AdamW peak and floor (verified 2026-09-29: a config change
+    from 0.02 to 0.015 came back as 0.02 after load). The strict recipe check
+    fails closed on such a change anyway; this makes the applied LR match the
+    config that passed the check.
+    """
+    muon = getattr(optimizer, "muon", None)
+    if muon is not None:
+        muon_lr = getattr(train_cfg, "muon_lr", train_cfg.peak_lr)
+        muon_min = getattr(train_cfg, "muon_min_lr", muon_lr * 0.1)
+        for pg in muon.param_groups:
+            pg["_peak_lr"], pg["_min_lr"] = muon_lr, muon_min
+        groups = optimizer.adamw.param_groups
+    else:
+        groups = optimizer.param_groups
+    for pg in groups:
+        pg["_peak_lr"], pg["_min_lr"] = train_cfg.peak_lr, train_cfg.min_lr
 
 
 def get_router_gumbel_tau(step: int, cfg: PretrainConfig) -> float:
@@ -148,21 +175,93 @@ def get_phase(step: int, cfg: PretrainConfig) -> tuple[str, dict]:
 
 # Training semantics that must not silently change across a resume. A v7 trunk
 # run is months of drip-funded sessions; if a resumed session quietly uses a
-# different schedule, batch or Muon recipe than the one that produced the
+# different schedule, data plan or Muon recipe than the one that produced the
 # checkpoint, the loss curve is a splice of two experiments and nothing
 # downstream is interpretable. Checked fail-closed on resume.
+#
+# Deliberately NOT here: the micro-batch shape (`scale_micro_batches` moves a
+# run between a 192 GB B200 and a 96 GB RTX PRO 6000 at constant tokens/step —
+# the per-phase tokens/step ARE checked, via the phase plan) and operational
+# knobs such as dataloader workers or logging intervals.
 _STRICT_TRAIN_RECIPE_KEYS = (
-    "batch_size", "grad_accum_steps", "total_steps", "warmup_steps",
+    "total_steps", "warmup_steps",
     "lr_schedule", "wsd_decay_frac", "peak_lr", "min_lr",
     "weight_decay", "grad_clip",
+    "optimizer_name", "muon_lr", "muon_min_lr", "muon_momentum",
     "per_head_muon", "muon_ns_steps", "muon_ns_stable_steps",
-    "muon_update_rms", "dataloader_num_workers",
+    "muon_update_rms",
+)
+
+# Dataset-entry fields that define WHAT is trained on. Order-insensitive keys
+# only; a re-ordered but identical list is the same plan.
+_PHASE_DATASET_KEYS = (
+    "name", "hf_id", "hf_config", "split", "weight", "format", "filter",
+    "subsample", "max_tokens", "skip",
 )
 
 
-def _training_recipe_metadata(cfg) -> dict:
+def _phase_plan_digest(cfg) -> str:
+    """Canonical JSON of the phase plan: boundaries, seq_len, tokens/step and
+    the dataset entries. Compared as a whole on resume."""
+    plan = []
+    for name, ph in cfg.phases.items():
+        bs = ph.get("batch_size", cfg.batch_size)
+        ga = ph.get("grad_accum_steps", cfg.grad_accum_steps)
+        plan.append({
+            "name": name,
+            "start": ph.get("start"),
+            "end": ph.get("end"),
+            "seq_len": ph["seq_len"],
+            "tokens_per_step": bs * ga * ph["seq_len"],
+            "datasets": [
+                {k: d.get(k) for k in _PHASE_DATASET_KEYS if d.get(k) is not None}
+                for d in ph.get("datasets") or []
+            ],
+        })
+    return json.dumps(plan, sort_keys=True, default=str)
+
+
+def _tokenizer_digest(tokenizer_name: str | None) -> str | None:
+    """sha256 of tokenizer.json when `tokenizer_name` is a local directory —
+    the vocab and merges a checkpoint's embeddings were trained against.
+    A rebuilt tokenizer with the same size and special ids passes the contract
+    check; only this catches a changed merge table."""
+    if not tokenizer_name:
+        return None
+    path = os.path.join(tokenizer_name, "tokenizer.json")
+    if not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _training_recipe_metadata(cfg, tokenizer_name: str | None = None) -> dict:
     """Serialisable training semantics stamped into every checkpoint."""
-    return {k: getattr(cfg, k, None) for k in _STRICT_TRAIN_RECIPE_KEYS}
+    meta = {k: getattr(cfg, k, None) for k in _STRICT_TRAIN_RECIPE_KEYS}
+    if getattr(cfg, "phases", None):
+        meta["phase_plan"] = _phase_plan_digest(cfg)
+    digest = _tokenizer_digest(tokenizer_name)
+    if digest is not None:
+        meta["tokenizer_sha256"] = digest
+    return meta
+
+
+def _optimizer_lr_tags(opt_state: dict | None) -> dict:
+    """Peak-LR tags recorded inside a saved optimizer state. Lets the drift
+    check catch a changed Muon/AdamW LR even on checkpoints written before
+    `muon_lr` joined the recipe metadata."""
+    out: dict = {}
+    if not isinstance(opt_state, dict):
+        return out
+    for key, name in (("muon", "muon_lr"), ("adamw", "peak_lr")):
+        groups = (opt_state.get(key) or {}).get("param_groups") or []
+        tags = {g.get("_peak_lr") for g in groups if g.get("_peak_lr") is not None}
+        if len(tags) == 1:
+            out[name] = tags.pop()
+    return out
 
 
 def _model_shape_metadata(cfg) -> dict:
@@ -188,33 +287,59 @@ def assert_no_resume_drift(
     train_cfg=None,
     stage: str | None = None,
     path: str = "<checkpoint>",
+    tokenizer_name: str | None = None,
 ) -> None:
     """Fail closed if a checkpoint was produced by a different experiment.
 
     Silence here is the expensive failure: the run continues, the numbers look
     plausible, and the drift is only discovered when a result cannot be
     reproduced.
+
+    Escape hatch for a DELIBERATE mid-run recipe change (e.g. lowering the
+    Muon LR after a documented instability): set OSRT_ALLOW_RECIPE_DRIFT=1 and
+    the differences are printed as a warning instead of raising. The new
+    values are stamped into the next checkpoint, so the change is on record.
     """
+    allow = os.environ.get("OSRT_ALLOW_RECIPE_DRIFT", "") == "1"
+
+    def _fmt(k: str, a, b) -> str:
+        if k == "phase_plan":
+            return ("    phase_plan: data mix, seq_len, tokens/step or phase "
+                    "boundaries differ from the checkpoint")
+        return f"    {k}: checkpoint={a!r} current={b!r}"
+
     def _diff(saved: dict | None, current: dict, label: str) -> None:
         if not saved:
             return                       # pre-metadata checkpoint; nothing to check
         bad = {k: (saved.get(k), v) for k, v in current.items()
                if k in saved and saved.get(k) != v}
-        if bad:
-            lines = "\n".join(
-                f"    {k}: checkpoint={a!r} current={b!r}" for k, (a, b) in bad.items())
-            raise RuntimeError(
-                f"{label} drift in {path}:\n{lines}\n"
-                f"  Resuming would splice two different experiments. Either point at "
-                f"a fresh --ckpt-dir, or restore the config that produced this file."
-            )
+        if not bad:
+            return
+        lines = "\n".join(_fmt(k, a, b) for k, (a, b) in bad.items())
+        msg = (
+            f"{label} drift in {path}:\n{lines}\n"
+            f"  Resuming would splice two different experiments. Either point at "
+            f"a fresh --ckpt-dir, restore the config that produced this file, or "
+            f"set OSRT_ALLOW_RECIPE_DRIFT=1 to continue deliberately."
+        )
+        if allow:
+            print(f"WARNING (OSRT_ALLOW_RECIPE_DRIFT=1): {msg}", flush=True)
+            return
+        raise RuntimeError(msg)
 
     if model_config is not None:
         _diff(ckpt.get("model_shape"), _model_shape_metadata(model_config),
               "MODEL SHAPE")
     if train_cfg is not None:
-        _diff(ckpt.get("training_recipe"), _training_recipe_metadata(train_cfg),
+        _diff(ckpt.get("training_recipe"),
+              _training_recipe_metadata(train_cfg, tokenizer_name),
               "TRAINING RECIPE")
+        # Checkpoints written before muon_lr/peak_lr joined the recipe keys
+        # still carry the LR tags inside the optimizer state.
+        _diff(_optimizer_lr_tags(ckpt.get("optimizer_state_dict")),
+              {"muon_lr": getattr(train_cfg, "muon_lr", None),
+               "peak_lr": train_cfg.peak_lr},
+              "OPTIMIZER LR")
     saved_stage = ckpt.get("training_stage")
     if stage is not None and saved_stage is not None and saved_stage != stage:
         raise RuntimeError(
@@ -230,12 +355,17 @@ def save_checkpoint(
     model_config=None,
     train_cfg=None,
     stage: str = "pretrain_v7",
+    *,
+    data_state: dict | None = None,
+    tokenizer_name: str | None = None,
 ) -> None:
     """Save a training checkpoint.
 
     Stamps model-shape and training-recipe metadata so a later resume can fail
     closed on drift (`assert_no_resume_drift`) instead of silently splicing two
-    experiments together."""
+    experiments together. `data_state` (the streaming loader's position, see
+    `osrt.data.TokenStream.state_dict`) rides along so a resumed session
+    continues the data stream instead of restarting every source at row 0."""
     inner = model._orig_mod if hasattr(model, "_orig_mod") else model
     # Atomic save: serialize to a temp file, then os.replace onto the final
     # name. torch.save writes directly, and a ~4.9GB checkpoint takes several
@@ -253,7 +383,9 @@ def save_checkpoint(
             "model_shape": (
                 _model_shape_metadata(model_config) if model_config else None),
             "training_recipe": (
-                _training_recipe_metadata(train_cfg) if train_cfg else None),
+                _training_recipe_metadata(train_cfg, tokenizer_name)
+                if train_cfg else None),
+            "data_state": data_state,
         },
         tmp_path,
     )
@@ -285,12 +417,29 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     path: str,
     device: torch.device,
-) -> int:
-    """Load from checkpoint. Returns step to resume from (0 if path missing)."""
+    *,
+    model_config=None,
+    train_cfg=None,
+    tokenizer_name: str | None = None,
+    stage: str | None = None,
+) -> tuple[int, dict | None]:
+    """Load from checkpoint. Returns (step to resume from, saved data state);
+    (0, None) if the path is missing.
+
+    One `torch.load`: the drift check reads the metadata from the same dict
+    the weights come from (the old code loaded a multi-GB file twice, once to
+    CPU just for two small dicts). Fails closed when the optimizer state does
+    not match the configured optimizer — silently "starting fresh" would
+    splice two runs — and re-stamps the schedule tags from the current config
+    (see `_stamp_schedule_tags`)."""
     if not os.path.exists(path):
-        return 0
+        return 0, None
     print(f"Resuming from {path}...")
     ckpt = torch.load(path, map_location=device, weights_only=True)
+    assert_no_resume_drift(
+        ckpt, model_config=model_config, train_cfg=train_cfg,
+        stage=stage, path=path, tokenizer_name=tokenizer_name,
+    )
     load_model_state_or_raise(
         model,
         ckpt["model_state_dict"],
@@ -298,22 +447,26 @@ def load_checkpoint(
     )
     try:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    except (ValueError, RuntimeError) as e:
-        print(f"  Optimizer state mismatch, starting fresh: {e}")
+    except (KeyError, ValueError, RuntimeError) as e:
+        raise RuntimeError(
+            f"optimizer state in {path} does not fit the configured optimizer "
+            f"({type(e).__name__}: {e}). Resuming with a fresh optimizer would "
+            "splice two runs; restore optimizer_name or use a fresh --ckpt-dir."
+        ) from e
+    if train_cfg is not None:
+        _stamp_schedule_tags(optimizer, train_cfg)
     start_step = ckpt["step"] + 1
-    print(f"  Resumed at step {start_step}")
-    return start_step
+    data_state = ckpt.get("data_state")
+    print(f"  Resumed at step {start_step}"
+          f"{' (data position restored)' if data_state else ''}")
+    return start_step, data_state
 
 
 # Eval batches are materialised once per process and replayed on every
-# subsequent call. `ds.skip(N)` is O(N) iteration through FineWeb-Edu's
-# streaming shards, so paying the skip cost every eval interval was
-# wasting hours across a long run. The skip offset (see run_eval
-# docstring) is also deliberately large — it has to sit past the full
-# training-budget consumption so cached eval samples never leak back
-# into the training set late in the run. Caching amortises that
-# one-time cost and guarantees identical samples across steps, making
-# loss curves strictly comparable.
+# subsequent call, so the held-out set is identical at every eval and the
+# stream/tokenise cost is paid once. Keyed on (tokenizer, seq_len, batch,
+# steps): the trainer passes the FIXED eval_seq_len/eval_batch_size so the
+# set does not change at phase boundaries.
 _EVAL_BATCH_CACHE: dict[tuple, list[tuple[Tensor, Tensor]]] = {}
 
 
@@ -325,29 +478,25 @@ def run_eval(
     batch_size: int,
     eval_steps: int,
     device: torch.device,
-    real_vocab_size: int,
+    real_vocab_size: int | None = None,
 ) -> dict:
     """Run held-out evaluation on a cached FineWeb-Edu slice.
 
-    FineWeb-Edu has no upstream validation split, so we carve out a
-    held-out subset by starting the stream at a 100M-example skip
-    offset. Budget math: the schedule consumes ~32B FineWeb tokens
-    (0.8B in phase 1 + 31.5B in phase 2, see PretrainConfig:63). At
-    ~1000 tokens per FineWeb-Edu record that's ~32M training records,
-    so a 100M skip leaves a ~3x safety margin over the full planned
-    budget. The previous 500k skip was blown past within hours of
-    phase-2 training, meaning cached eval samples could re-appear as
-    training data later in the run.
+    FineWeb-Edu has no upstream validation split, so the held-out set is the
+    newest dump as its own config (`CC-MAIN-2025-26`, skip 1,000 rows: O(1)
+    to open). Training streams the `default` config; its shard order is
+    shuffled per session, so a training shard from that dump is possible but
+    the overlap is a few shards in thousands — small, not zero.
 
-    `ds.skip(N)` is O(N) iteration, so this first-call cost is real
-    (~10-20 min on Modal, depending on HF streaming throughput). The
-    first call materialises `eval_steps` batches and caches them on
-    CPU; every subsequent call replays the cache, so we pay the skip
-    and tokenisation cost exactly once per process. This also
-    guarantees identical samples across steps, making loss curves
-    strictly comparable.
+    The first call materialises `eval_steps` batches and caches them on CPU;
+    every subsequent call replays the cache, so the stream/tokenise cost is
+    paid once per process and the samples are identical at every eval.
+    Callers pass a FIXED seq_len/batch_size (train_config.eval_seq_len /
+    eval_batch_size) so the set is also identical across phases.
 
     Switches model to inference mode (drops off, aux loss excluded).
+    `real_vocab_size` is accepted for call-site compatibility and unused: the
+    model slices its own logits.
     """
     was_training = model.training
     model.train(False)  # disable capacity drops + dropout-like behaviour
@@ -358,13 +507,11 @@ def run_eval(
         loader = make_loader(
             dataset_configs=[
                 {
-                    # Held-out = the NEWEST dump as its own config. Training
-                    # streams the `default` config (dumps in order from 2013)
-                    # and consumes ~1.3M FineWeb-Edu docs in the whole run, so
-                    # it never reaches 2025-26. The previous `skip: 100_000_000`
-                    # on `default` iterated 100M rows through the HF stream:
-                    # the 2026-09-02 trunk sat >1 h at step 1000 with no
-                    # checkpoint (the save came after the eval). O(1) now.
+                    # Held-out = the NEWEST dump as its own config. The
+                    # previous `skip: 100_000_000` on `default` iterated 100M
+                    # rows through the HF stream: the 2026-09-02 trunk sat
+                    # >1 h at step 1000 with no checkpoint (the save came
+                    # after the eval). O(1) now.
                     "name": "fineweb-edu-eval",
                     "hf_id": "HuggingFaceFW/fineweb-edu",
                     "hf_config": "CC-MAIN-2025-26",
@@ -727,6 +874,10 @@ def _average_moe_snapshots(
         for snap in snapshots:
             total += snap.get(k, 0.0)
         avg[k] = total / n
+    # Residual-stream growth inside the recursion (roadmap §17.3). Put it in
+    # the logged metrics too — until 2026-09-30 it existed only in the gate's
+    # summary, so RUNBOOK's "watch loop_hidden_norm_ratio" had nothing to watch.
+    avg["loop/hidden_norm_ratio"] = _hidden_norm_ratio(avg)
 
     summary = {
         "per_token_H": avg.get("moe/per_token_entropy_mean", 0.0),
@@ -764,7 +915,7 @@ def _average_moe_snapshots(
         "prebias_expert_min": avg.get("moe/prebias_expert_min_mean", 0.0),
         "loop_update_norm_min": avg.get("loop/update_norm_min", 0.0),
         "loop_update_norm_mean": avg.get("loop/update_norm_mean", 0.0),
-        "loop_hidden_norm_ratio": _hidden_norm_ratio(avg),
+        "loop_hidden_norm_ratio": avg["loop/hidden_norm_ratio"],
         "loop_update_norm_last": avg.get("loop/update_norm_last", 0.0),
         "dead_experts_total": avg.get("moe/dead_experts_total", 0.0),
     }
@@ -773,8 +924,44 @@ def _average_moe_snapshots(
 
 def _check_early_stop_criteria(
     step: int, summary: dict, cfg: PretrainConfig, model_cfg: OSRTConfig,
+    *, scope: str = "full",
 ) -> list[str]:
-    """Return list of failing criteria (empty means all pass)."""
+    """Return list of failing criteria (empty means all pass).
+
+    scope="full": router sharpening + balance + recursion health (the gate at
+    `early_stop_check_step`, and every logging step after it).
+    scope="loop": recursion health only (loop collapse, residual explosion) —
+    what can be judged before the router has had time to sharpen.
+    """
+    if scope not in ("full", "loop"):
+        raise ValueError(f"scope must be 'full' or 'loop', got {scope!r}")
+    failures: list[str] = []
+    if scope == "full":
+        failures.extend(_router_health_failures(summary, cfg, model_cfg))
+    # Recursive-loop health (roadmap §17.3). Both thresholds existed in
+    # PretrainConfig and both values were computed into the summary, but
+    # nothing compared them — the first ladder ran with these guards inert.
+    lu_min = summary.get("loop_update_norm_min")
+    if lu_min is not None and lu_min < cfg.min_loop_update_norm:
+        failures.append(
+            f"loop_update_norm_min {lu_min:.2e} < {cfg.min_loop_update_norm:.2e} "
+            "(a loop's residual write has vanished — loop collapse)"
+        )
+    hn_ratio = summary.get("loop_hidden_norm_ratio")
+    if hn_ratio is not None and hn_ratio > cfg.max_loop_hidden_norm_ratio:
+        failures.append(
+            f"loop_hidden_norm_ratio {hn_ratio:.1f} > "
+            f"{cfg.max_loop_hidden_norm_ratio:.1f} "
+            "(residual stream inflates across the recursion — FLT §17.3)"
+        )
+    return failures
+
+
+def _router_health_failures(
+    summary: dict, cfg: PretrainConfig, model_cfg: OSRTConfig,
+) -> list[str]:
+    """The router-health criteria (v5's four-metric gate plus the pre-bias and
+    bias-saturation checks), resolved relative to this model's expert count."""
     failures: list[str] = []
     per_token_h = summary.get("clean_per_token_H", summary["per_token_H"])
     raw_max = summary.get("clean_raw_max", summary["raw_max"])
@@ -843,23 +1030,59 @@ def _check_early_stop_criteria(
                 f"{bias_limit:.3f} "
                 "(bias controller is near saturation and may be masking collapse)"
             )
-    # Recursive-loop health (roadmap §17.3). Both thresholds existed in
-    # PretrainConfig and both values were computed into the summary, but
-    # nothing compared them — the first ladder ran with these guards inert.
-    lu_min = summary.get("loop_update_norm_min")
-    if lu_min is not None and lu_min < cfg.min_loop_update_norm:
-        failures.append(
-            f"loop_update_norm_min {lu_min:.2e} < {cfg.min_loop_update_norm:.2e} "
-            "(a loop's residual write has vanished — loop collapse)"
-        )
-    hn_ratio = summary.get("loop_hidden_norm_ratio")
-    if hn_ratio is not None and hn_ratio > cfg.max_loop_hidden_norm_ratio:
-        failures.append(
-            f"loop_hidden_norm_ratio {hn_ratio:.1f} > "
-            f"{cfg.max_loop_hidden_norm_ratio:.1f} "
-            "(residual stream inflates across the recursion — FLT §17.3)"
-        )
     return failures
+
+
+def _health_scope(step: int, cfg: PretrainConfig) -> str | None:
+    """Which criteria to evaluate at `step` (None = none).
+
+    * at `early_stop_check_step`: the full set, one-shot semantics (the
+      caller stops immediately on failure, as v5's gate always did);
+    * after it: the full set, with `health_check_patience`;
+    * before it, once warmup is over and `continuous_health_checks` is on:
+      recursion health only — the router is not expected to be sharp yet.
+    """
+    gate = cfg.early_stop_check_step
+    if step == gate:
+        return "full"
+    if not getattr(cfg, "continuous_health_checks", True):
+        return None
+    if step > gate:
+        return "full"
+    if step >= cfg.warmup_steps:
+        return "loop"
+    return None
+
+
+def _alias_checkpoint(src: str, dst: str) -> None:
+    """Expose `src` under a second name (hard link; copy where links are not
+    supported, e.g. some network volumes). Used at the end of a run so the
+    final checkpoint is also visible as `osrt_step_{total_steps}.pt`: the
+    resume scan and the HF sync only look at step-numbered names, so without
+    the alias a re-invocation of a FINISHED run resumed from the last interval
+    save and re-trained the tail."""
+    if os.path.exists(dst):
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
+@torch.no_grad()
+def _reset_router_balance_accumulators(model: nn.Module) -> None:
+    """Drop the per-step routing statistics after a skipped (non-finite)
+    optimizer step, so the next balance-bias update is not solved from a
+    forward whose activations may have been garbage."""
+    inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+    base = inner.model if hasattr(inner, "model") else inner
+    for block in base.blocks:
+        moe = block.moe
+        for name in ("balance_count_accum", "balance_total_accum",
+                     "qb_hist", "qb_token_count"):
+            buf = getattr(moe, name, None)
+            if buf is not None:
+                buf.zero_()
 
 
 def run_training(
@@ -867,18 +1090,20 @@ def run_training(
     train_cfg: PretrainConfig,
     vol,
     tokenizer_name: str,
-    ckpt_dir: str = "/vol/checkpoints/v5",
-) -> None:
-    """Execute the v5 pre-training loop.
+    ckpt_dir: str = "/vol/checkpoints/v7",
+) -> str:
+    """Execute the v7 pre-training loop.
 
     Args:
-        model_config: v5 model configuration.
+        model_config: model configuration (the committed preset + tokenizer ids).
         train_cfg: training hyperparameters + phase schedule.
-        vol: Modal Volume for checkpoints.
+        vol: Modal Volume for checkpoints (anything with `.commit()`).
         tokenizer_name: path or HF id of the tokenizer.
-        ckpt_dir: directory for checkpoints. Defaults to v5 production dir;
-            sanity/test runs should pass a distinct dir to avoid colliding
-            with real checkpoints.
+        ckpt_dir: directory for checkpoints. Sanity/test runs should pass a
+            distinct dir to avoid colliding with real checkpoints.
+
+    Returns a status string: "complete", "already_complete", "early_stop",
+    "rescued" or "data_dead" (see the module docstring).
     """
     # Fail closed on an inconsistent recipe before any compute is spent.
     train_cfg.validate()
@@ -1056,24 +1281,29 @@ def run_training(
             betas=(0.9, 0.95),
             eps=1e-8,
         )
-        # Tag each group with its peak/min for the cosine schedule.
-        muon_min = getattr(train_cfg, "muon_min_lr", muon_lr * 0.1)
-        for pg in muon.param_groups:
-            pg["_peak_lr"] = muon_lr
-            pg["_min_lr"] = muon_min
-        for pg in adamw.param_groups:
-            pg["_peak_lr"] = train_cfg.peak_lr
-            pg["_min_lr"] = train_cfg.min_lr
         optimizer = HybridMuonAdamW(muon, adamw)
+        # Tag each group with its peak/floor for the schedule (re-stamped
+        # after a checkpoint load, which would otherwise restore old tags).
+        _stamp_schedule_tags(optimizer, train_cfg)
         n_muon = sum(len(g["params"]) for g in muon.param_groups)
         n_adamw = sum(len(g["params"]) for g in adamw_groups)
         per_head = getattr(train_cfg, "per_head_muon", False)
+        rms = getattr(train_cfg, "muon_update_rms", None)
+        per_elem = (
+            f"{muon_lr * rms:.2e} (lr x update_rms {rms})" if rms
+            else f"~{muon_lr / model_config.dim ** 0.5:.2e} (shape heuristic)"
+        )
         print(
             f"Using Muon+AdamW hybrid: {n_muon} matrix tensors → Muon "
-            f"(lr={muon_lr}{', per-head attn' if per_head else ''}), "
-            f"{n_adamw} other tensors → AdamW "
-            f"(lr={train_cfg.peak_lr}, wd={train_cfg.weight_decay} "
-            f"on non-norm/non-embed only)"
+            f"(lr={muon_lr}{', per-head attn' if per_head else ''}, "
+            f"decoupled wd={train_cfg.weight_decay}), "
+            f"{n_adamw} other tensors → AdamW (lr={train_cfg.peak_lr}, wd=0: "
+            f"embedding, norms, biases, router, loop_embeddings, moe_gate)"
+        )
+        print(
+            f"Muon per-element step at peak LR: {per_elem}; "
+            f"AdamW peak_lr={train_cfg.peak_lr}. The two should be on the "
+            f"same scale — see train_config.muon_lr."
         )
     else:
         router_params = []
@@ -1112,6 +1342,7 @@ def run_training(
                 eps=1e-8,
             )
             print(f"Using AdamW (wd={train_cfg.weight_decay}, router_wd=0.0)")
+        _stamp_schedule_tags(optimizer, train_cfg)
 
     # Checkpoint resume.
     # Three kinds of checkpoints with different naming:
@@ -1163,18 +1394,26 @@ def run_training(
         )
 
     start_step = 0
+    resume_data_state: dict | None = None
     if best_step > 0 and best_ckpt is not None:
         print(f"Found checkpoint at step {best_step}: {best_ckpt}")
-        # Fail closed BEFORE loading: a months-long drip run resumes many
-        # times, and a silent config change makes the loss curve a splice of
-        # two experiments rather than one result.
-        assert_no_resume_drift(
-            torch.load(best_ckpt, map_location="cpu", weights_only=False),
-            model_config=model_config,
-            train_cfg=train_cfg,
-            path=best_ckpt,
+        # Fails closed BEFORE the weights are applied: a months-long drip run
+        # resumes many times, and a silent config change makes the loss curve
+        # a splice of two experiments rather than one result.
+        start_step, resume_data_state = load_checkpoint(
+            model, optimizer, best_ckpt, device,
+            model_config=model_config, train_cfg=train_cfg,
+            tokenizer_name=tokenizer_name,
         )
-        start_step = load_checkpoint(model, optimizer, best_ckpt, device)
+    if start_step >= train_cfg.total_steps:
+        print(
+            f"Run already complete: checkpoint step {start_step - 1} >= "
+            f"total_steps {train_cfg.total_steps}. Nothing to do.",
+            flush=True,
+        )
+        if use_wandb:
+            wandb.finish()
+        return "already_complete"
 
     # ------------------------------------------------------------------
     # Training loop
@@ -1188,6 +1427,45 @@ def run_training(
     current_batch_size = train_cfg.batch_size
     grad_accum = train_cfg.grad_accum_steps
     early_stop_triggered = False
+    run_status: str | None = None
+    health_fail_streak = 0
+    nonfinite_streak = 0
+    nonfinite_total = 0
+    dead_sources_seen: list[str] = []
+    max_nonfinite = max(1, getattr(train_cfg, "max_consecutive_nonfinite_steps", 5))
+
+    def _data_state() -> dict | None:
+        """The streaming loader's position, for the checkpoint (None when the
+        loader cannot report one, e.g. worker processes)."""
+        ds = getattr(current_loader, "dataset", None)
+        fn = getattr(ds, "state_dict", None)
+        if fn is None:
+            return None
+        try:
+            state = fn()
+        except Exception as e:  # noqa: BLE001 — never let this cost a checkpoint
+            print(f"  [warn] data position not captured: {type(e).__name__}: {e}",
+                  flush=True)
+            return None
+        return {"phase": current_phase, "state": state} if state is not None else None
+
+    def _save(path: str, at_step: int) -> None:
+        save_checkpoint(
+            model, optimizer, at_step, path,
+            model_config=model_config, train_cfg=train_cfg,
+            data_state=_data_state(), tokenizer_name=tokenizer_name,
+        )
+        vol.commit()
+
+    def _stop_failed(reason: str) -> None:
+        """Failed-state checkpoint under a name the resume scan ignores."""
+        print(
+            f"\n  {reason} Saving failed-state checkpoint (not auto-resumable) "
+            "and exiting so compute isn't wasted. Review telemetry before "
+            "retrying.",
+            flush=True,
+        )
+        _save(f"{ckpt_dir}/osrt_failed_step_{step}.pt", step)
 
     while step < train_cfg.total_steps and not early_stop_triggered:
         phase_name, phase_cfg = get_phase(step, train_cfg)
@@ -1242,19 +1520,34 @@ def run_training(
                 current_loader = None
                 gc.collect()
             load_t = time.time()
+            # Honor the config's worker count (default 0). make_loader
+            # defaults to 4, but 4 workers × N streams opens too many
+            # concurrent HF connections from one container, which triggers
+            # SSL BAD_RECORD_MAC / "Bad file descriptor" / connection-reset
+            # storms under any HF flakiness.
+            loader_kwargs: dict = {
+                "num_workers": getattr(train_cfg, "dataloader_num_workers", 0),
+            }
+            # Continue the data stream where the checkpoint left it — only
+            # for the phase the checkpoint was taken in, and only for the
+            # first loader after a resume. Otherwise every source restarts
+            # at row 0 of a freshly permuted shard list.
+            if (
+                resume_data_state
+                and resume_data_state.get("phase") == phase_name
+                and step == start_step
+                and resume_data_state.get("state") is not None
+            ):
+                loader_kwargs["resume_state"] = resume_data_state["state"]
+                print("    Restoring the data stream position from the checkpoint")
+            resume_data_state = None
             current_loader = make_loader(
                 phase_cfg["datasets"],
                 current_seq_len,
                 tokenizer_name,
                 current_batch_size,
                 step,
-                # Honor the config's worker count (default 1). make_loader
-                # defaults to 4, but 4 workers × N streams opens too many
-                # concurrent HF connections from one container, which
-                # triggers SSL BAD_RECORD_MAC / "Bad file descriptor" /
-                # connection-reset storms under any HF flakiness. 1 worker
-                # = far fewer simultaneous streams = robust.
-                num_workers=getattr(train_cfg, "dataloader_num_workers", 1),
+                **loader_kwargs,
             )
             loader_iter = iter(current_loader)
             print(f"    DataLoader ready in {time.time() - load_t:.1f}s")
@@ -1335,21 +1628,35 @@ def run_training(
 
         for micro in range(grad_accum):
             try:
-                input_ids, labels = next(loader_iter)
-            except StopIteration:
-                _, p_cfg = get_phase(step, train_cfg)
-                if current_loader is not None:
-                    del current_loader
-                current_loader = make_loader(
-                    p_cfg["datasets"],
-                    p_cfg["seq_len"],
-                    tokenizer_name,
-                    p_cfg.get("batch_size", train_cfg.batch_size),
-                    step,
-                    num_workers=getattr(train_cfg, "dataloader_num_workers", 1),
-                )
-                loader_iter = iter(current_loader)
-                input_ids, labels = next(loader_iter)
+                try:
+                    input_ids, labels = next(loader_iter)
+                except StopIteration:
+                    _, p_cfg = get_phase(step, train_cfg)
+                    if current_loader is not None:
+                        del current_loader
+                    current_loader = make_loader(
+                        p_cfg["datasets"],
+                        p_cfg["seq_len"],
+                        tokenizer_name,
+                        p_cfg.get("batch_size", train_cfg.batch_size),
+                        step,
+                        num_workers=getattr(train_cfg, "dataloader_num_workers", 0),
+                    )
+                    loader_iter = iter(current_loader)
+                    input_ids, labels = next(loader_iter)
+            except DataSourceDead as e:
+                # Every source has failed permanently (revoked gate, schema
+                # change, HF outage). Until 2026-09-30 the stream spun
+                # forever here with no step, no checkpoint and no error. Save
+                # the last COMPLETED step (this one has no optimizer step yet)
+                # and exit with a status the launcher can act on.
+                optimizer.zero_grad(set_to_none=True)
+                print(f"\n>>> DATA SOURCES DEAD at step {step}: {e}", flush=True)
+                if step > start_step:
+                    _save(f"{ckpt_dir}/osrt_rescue_step_{step - 1}.pt", step - 1)
+                if use_wandb:
+                    wandb.finish()
+                return "data_dead"
 
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -1383,14 +1690,45 @@ def run_training(
                 micro_metrics, _ = _collect_moe_metrics(model)
                 moe_snapshots.append(micro_metrics)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-        # §18.2: Newton-Schulz orthogonality error costs a matmul per param, so
-        # collect it only on the steps that get logged.
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(
+            model.parameters(), train_cfg.grad_clip,
+        ))
+        # §18.2: Muon's stats (RMS + Newton-Schulz orthogonality error) cost
+        # host syncs and a matmul per param, so collect them only on the steps
+        # that get logged. (Until 2026-09-30 this was keyed on step+1, so the
+        # value was computed on step 49 and discarded before the log at 50.)
         _muon = getattr(optimizer, "muon", None)
         if _muon is not None:
-            _muon.collect_ortho_error = ((step + 1) % train_cfg.log_interval == 0)
-        optimizer.step()
-        apply_router_balance_updates(model)
+            _muon.collect_ortho_error = should_log_this_step
+        if math.isfinite(grad_norm):
+            nonfinite_streak = 0
+            optimizer.step()
+            apply_router_balance_updates(model)
+        else:
+            # Skip the step: with a NaN/inf norm clip_grad_norm_ has scaled
+            # every gradient by NaN and the update would poison the weights
+            # (and the next checkpoint). Keep the weights, drop the routing
+            # statistics of this forward, and count it.
+            nonfinite_streak += 1
+            nonfinite_total += 1
+            optimizer.zero_grad(set_to_none=True)
+            _reset_router_balance_accumulators(model)
+            print(
+                f"  [warn] non-finite grad norm ({grad_norm}) at step {step}: "
+                f"optimizer step skipped ({nonfinite_streak}/{max_nonfinite} "
+                f"consecutive, {nonfinite_total} total)",
+                flush=True,
+            )
+            if nonfinite_streak >= max_nonfinite:
+                print(
+                    f"\n>>> EARLY STOP at step {step}: {nonfinite_streak} "
+                    "consecutive non-finite gradient norms.",
+                    flush=True,
+                )
+                _stop_failed("The optimisation has diverged.")
+                early_stop_triggered = True
+                run_status = "early_stop"
+                break
 
         # Average snapshots once per step. Used for both logging and the
         # early-stop gate so both see the same grad-accum-averaged values.
@@ -1429,14 +1767,31 @@ def run_training(
             # moe_metrics / moe_summary are already computed above as the
             # average over grad_accum micro-batches. No need to re-collect.
 
+            # Sources the streaming loader has given up on (see
+            # osrt.data.TokenStream): a change here means the realised mix no
+            # longer matches the phase table. Loud, once per change.
+            ds_obj = getattr(current_loader, "dataset", None)
+            dead_sources = list(getattr(ds_obj, "dead_sources", None) or [])
+            if dead_sources != dead_sources_seen:
+                print(
+                    f"\n>>> DATA SOURCES DROPPED (permanent failures): "
+                    f"{dead_sources} — the realised mix now differs from the "
+                    f"phase table. Investigate before trusting this phase.",
+                    flush=True,
+                )
+                dead_sources_seen = dead_sources
+
             print(
                 f"step {step:>7d}/{train_cfg.total_steps} | "
                 f"task {accum_task_loss.item():.4f} | "
                 f"bal {accum_balance_norm.item():.4f} | "
-                f"lr {lr:.2e} | gumbel {router_gumbel_tau:.3f} | "
+                f"lr {lr:.2e} | gnorm {grad_norm:.3f} | "
+                f"gumbel {router_gumbel_tau:.3f} | "
                 f"vram {vram_gb:.1f}GB | "
                 f"tok/s {tok_per_sec:,.0f} | "
-                f"phase {current_phase} | seq_len {current_seq_len}",
+                f"phase {current_phase} | seq_len {current_seq_len}"
+                + (f" | nonfinite {nonfinite_total}" if nonfinite_total else "")
+                + (f" | dead_sources {len(dead_sources)}" if dead_sources else ""),
                 flush=True,
             )
             print(
@@ -1494,8 +1849,12 @@ def run_training(
                 f"           collapse: loop_upd min={lu_min:.3f} "
                 f"last={lu_last:.3f} "
                 f"mean={lu_mean:.3f} | "
+                f"hidden_norm_ratio={moe_summary['loop_hidden_norm_ratio']:.2f} | "
                 f"dead_experts={int(moe_summary['dead_experts_total'])} | "
-                f"bias_abs_max={moe_summary['bias_abs_max']:.3f}",
+                f"bias_abs_max={moe_summary['bias_abs_max']:.3f}"
+                + (f" | ortho_err={_muon.last_stats['muon/ortho_err']:.4f}"
+                   if _muon is not None and "muon/ortho_err" in _muon.last_stats
+                   else ""),
                 flush=True,
             )
 
@@ -1504,6 +1863,9 @@ def run_training(
                     "train/task_loss": accum_task_loss.item(),
                     "train/balance_loss_normalised": accum_balance_norm.item(),
                     "train/lr": lr,
+                    "train/grad_norm": grad_norm,
+                    "train/nonfinite_steps": nonfinite_total,
+                    "train/dead_sources": len(dead_sources),
                     "moe/gumbel_tau": router_gumbel_tau,
                     "train/vram_gb": vram_gb,
                     "train/tok_per_sec": tok_per_sec,
@@ -1523,66 +1885,76 @@ def run_training(
                 sys.stdout.flush()
 
 
-        # --- Phase-1 early-stop check (router health) ---
+        # --- Health checks (router + recursion) ---
         # MUST run BEFORE the numbered checkpoint save on the same step.
         # Otherwise a failed run writes osrt_step_N.pt and a later launch
         # would resume past the gate and ignore the failure diagnosis.
         # On failure we save a DIFFERENT filename (osrt_failed_step_N.pt)
         # that the resume scanner explicitly ignores.
-        if step == train_cfg.early_stop_check_step:
-            # Use the grad-accum-averaged summary from this step — not a
-            # single-batch snapshot — so the gate isn't tripped by sample
-            # noise on a 16k-token micro-batch.
+        #
+        # The grad-accum-averaged summary exists on logging steps and at the
+        # gate step; `_health_scope` decides what applies at this step (until
+        # 2026-09-30 everything ran exactly once, at step 5,000, and a run
+        # that collapsed at 6,000 trained to the end). The gate keeps its
+        # one-shot semantics; every other check needs `health_check_patience`
+        # consecutive failures so one noisy average cannot end a 45 h run.
+        scope = _health_scope(step, train_cfg) if moe_summary else None
+        if scope is not None:
             failures = _check_early_stop_criteria(
-                step, moe_summary, train_cfg, model_config,
+                step, moe_summary, train_cfg, model_config, scope=scope,
             )
+            at_gate = step == train_cfg.early_stop_check_step
+            patience = 1 if at_gate else max(
+                1, getattr(train_cfg, "health_check_patience", 3))
             if failures:
+                health_fail_streak += 1
                 print(
-                    f"\n>>> EARLY STOP at step {step}: "
-                    f"router-health criteria failed:",
+                    f"\n>>> HEALTH CHECK at step {step} ({scope}): "
+                    f"{len(failures)} criteria failing "
+                    f"[{health_fail_streak}/{patience} consecutive]:",
                     flush=True,
                 )
                 for f in failures:
                     print(f"      - {f}")
-                print(
-                    "\n  The v5 architecture bets are not paying off on "
-                    "this run. Saving failed-state checkpoint (not "
-                    "auto-resumable) and exiting so compute isn't wasted. "
-                    "Review telemetry and consider architecture changes "
-                    "before retrying.",
-                    flush=True,
-                )
-                failed_path = f"{ckpt_dir}/osrt_failed_step_{step}.pt"
-                save_checkpoint(model, optimizer, step, failed_path,
-                            model_config=model_config,
-                            train_cfg=train_cfg)
-                vol.commit()
-                early_stop_triggered = True
-                break
+                if health_fail_streak >= patience:
+                    print(f"\n>>> EARLY STOP at step {step}: health criteria "
+                          "failed.", flush=True)
+                    _stop_failed(
+                        "The architecture bets are not paying off on this run."
+                        if at_gate else
+                        "The run has drifted into collapse after the gate.")
+                    early_stop_triggered = True
+                    run_status = "early_stop"
+                    break
             else:
-                print(
-                    f"\n>>> Router health check at step {step}: "
-                    f"all criteria PASS. Continuing training.",
-                    flush=True,
-                )
+                if health_fail_streak:
+                    print(f"\n>>> health check at step {step}: recovered "
+                          f"after {health_fail_streak} failing check(s).",
+                          flush=True)
+                health_fail_streak = 0
+                if at_gate:
+                    print(
+                        f"\n>>> Router health gate at step {step}: "
+                        f"all criteria PASS. Continuing training "
+                        f"(re-checked every {train_cfg.log_interval} steps).",
+                        flush=True,
+                    )
 
         # --- Checkpoints (numbered, resumable) ---
-        # Runs AFTER early-stop check so failed runs never produce a
+        # Runs AFTER the health check so failed runs never produce a
         # step_N.pt that would bypass the gate on resume.
         if step > 0 and step % train_cfg.ckpt_interval == 0:
-            path = f"{ckpt_dir}/osrt_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, path,
-                            model_config=model_config,
-                            train_cfg=train_cfg)
-            vol.commit()
+            _save(f"{ckpt_dir}/osrt_step_{step}.pt", step)
 
         # --- Eval on held-out FineWeb-Edu --- AFTER the checkpoint save, so a
         # slow eval can never again cost a checkpoint (2026-09-02 trunk).
+        # Fixed context/batch so the cached set is the same in every phase.
         if step > 0 and step % train_cfg.eval_interval == 0:
             eval_metrics = run_eval(
-                model, tokenizer_name, current_seq_len,
-                current_batch_size, train_cfg.eval_steps,
-                device, model_config.real_vocab_size,
+                model, tokenizer_name,
+                getattr(train_cfg, "eval_seq_len", current_seq_len),
+                getattr(train_cfg, "eval_batch_size", current_batch_size),
+                train_cfg.eval_steps, device,
             )
             print(
                 f"  EVAL step {step} | "
@@ -1596,11 +1968,7 @@ def run_training(
         # Rescue filename includes the step so resume scanner can rank it
         # against numbered checkpoints.
         if time.time() - start_time > 82_800:
-            rescue_path = f"{ckpt_dir}/osrt_rescue_step_{step}.pt"
-            save_checkpoint(model, optimizer, step, rescue_path,
-                            model_config=model_config,
-                            train_cfg=train_cfg)
-            vol.commit()
+            _save(f"{ckpt_dir}/osrt_rescue_step_{step}.pt", step)
             print(
                 f"\n23h boundary reached at step {step}. "
                 f"Rescue checkpoint saved; exiting cleanly for resume.",
@@ -1608,12 +1976,13 @@ def run_training(
             )
             if use_wandb:
                 wandb.finish()
-            return
+            return "rescued"
 
         step += 1
 
     # Final checkpoint (full run completed or early stopped)
     if not early_stop_triggered:
+        run_status = "complete"
         elapsed_total = time.time() - start_time
         print(
             f"\nPretrain complete. {step:,} steps in "
@@ -1625,11 +1994,13 @@ def run_training(
         # osrt_final.pt that would clobber a real run's final on the volume.
         if getattr(train_cfg, "save_final_checkpoint", True):
             final_path = f"{ckpt_dir}/osrt_final.pt"
-            save_checkpoint(model, optimizer, step, final_path,
-                            model_config=model_config,
-                            train_cfg=train_cfg)
+            _save(final_path, step)
+            # Step-numbered alias so the resume scan / HF sync recognise a
+            # finished run instead of re-training its last interval.
+            _alias_checkpoint(final_path, f"{ckpt_dir}/osrt_step_{step}.pt")
             vol.commit()
-            print(f"Final checkpoint: {final_path}", flush=True)
+            print(f"Final checkpoint: {final_path} "
+                  f"(alias osrt_step_{step}.pt)", flush=True)
         else:
             print(
                 "Final checkpoint save skipped (save_final_checkpoint=False).",
@@ -1637,6 +2008,7 @@ def run_training(
             )
     if use_wandb:
         wandb.finish()
+    return run_status or "early_stop"
 
 
 # ============================================================================

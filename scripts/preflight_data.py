@@ -1,7 +1,12 @@
 """Pre-flight every dataset entry of every pretraining phase, CPU-only on Modal
-with hf-secret: open the stream, pull rows until three pass the entry's
-filter + formatter, report text length / tokens or FAIL. Phases 2 and 3 are
-otherwise first touched 40 minutes and ~2 days into the trunk.
+with hf-secret: open the stream and pull rows until three pass the entry's
+filter + formatter through the SAME per-row pipeline the trainer runs
+(`osrt.data.process_row`). Per source it reports the path taken (format key
+or extractor branch), token counts, the rejection-reason histogram and a
+200-char repr of the rendered text — so a wrong format (a `role: content`
+fallback, a missing `<|end_turn|>`, no markers at all) is visible before
+compute is spent. Phases 2 and 3 are otherwise first touched 40 minutes and
+~2 days into the trunk.
 
     MODAL_PROFILE=danielhalwell uv run modal run scripts/preflight_data.py
 """
@@ -27,6 +32,10 @@ image = (
 )
 app = modal.App("osrt-data-preflight", image=image)
 
+MAX_ROWS = 400          # rows to inspect before declaring a source WEAK/FAIL
+WANT_PASSED = 3
+SAMPLE_CHARS = 200
+
 
 @app.function(secrets=[modal.Secret.from_name("hf-secret")], timeout=3600, cpu=4)
 def preflight(phase_filter: str) -> str:
@@ -34,18 +43,18 @@ def preflight(phase_filter: str) -> str:
     import random
     import sys
     import time
+    from collections import Counter
 
     sys.path.insert(0, "/root/src")
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    from osrt.data import FORMAT_FN_PRETRAIN, TokenStream, row_passes
+    from osrt.data import process_row
     from osrt.train_config import PretrainConfig
 
     tok = AutoTokenizer.from_pretrained("/root/tokenizer")
     token = os.environ.get("HF_TOKEN")
     cfg = PretrainConfig()
-    ts = TokenStream.__new__(TokenStream)   # only for _extract_text
     rng = random.Random(0)
     out, bad = [], 0
     for pname, ph in cfg.phases.items():
@@ -59,35 +68,57 @@ def preflight(phase_filter: str) -> str:
                 if d.get("hf_config"):
                     kw["name"] = d["hf_config"]
                 ds = load_dataset(d["hf_id"], **kw)
-                fmt = FORMAT_FN_PRETRAIN.get(d["format"]) if d.get("format") else None
                 seen = passed = 0
+                reasons: Counter[str] = Counter()
+                paths: Counter[str] = Counter()
                 lens: list[int] = []
+                sample: str | None = None
+                first_error: str | None = None
+                state: dict = {}          # per-source formatter scratch
                 for row in ds:
                     seen += 1
-                    if not row_passes(d, row, rng):
-                        if seen >= 400:
-                            break
-                        continue
-                    text = fmt(row) if fmt else ts._extract_text(row, tok)
-                    if not text or not text.strip():
-                        if seen >= 400:
-                            break
-                        continue
-                    n = len(tok.encode(text, add_special_tokens=False))
-                    if d.get("max_tokens") and n > d["max_tokens"]:
-                        if seen >= 400:
+                    res = process_row(d, row, tok, rng, state)
+                    paths[res.path] += 1
+                    if res.tokens is None:
+                        reasons[res.reason] += 1
+                        if res.error is not None and first_error is None:
+                            first_error = (
+                                f"{type(res.error).__name__}: {str(res.error)[:120]} "
+                                f"(row keys: {sorted(row)})"
+                            )
+                        if seen >= MAX_ROWS:
                             break
                         continue
                     passed += 1
-                    lens.append(n)
-                    if passed >= 3:
+                    lens.append(len(res.tokens))
+                    if sample is None:
+                        sample = res.text
+                    if passed >= WANT_PASSED:
                         break
-                status = "OK " if passed >= 3 else "WEAK" if passed else "FAIL"
+                if passed >= WANT_PASSED:
+                    status = "OK "
+                else:
+                    status = "WEAK" if passed else "FAIL"
+                # A chat-shaped rendering must close its assistant turn: the
+                # 2026-09-30 review found three coexisting formats, none of
+                # which ever emitted <|end_turn|>.
+                chatty = sample is not None and "<|user|>" in sample
+                if chatty and not sample.endswith("<|end_turn|>"):
+                    status = "FMT?"
                 if status != "OK ":
                     bad += 1
                 out.append(
                     f"  {status} {d['name']:24} rows_seen={seen:4d} passed={passed} "
-                    f"tokens/row={lens} {time.time() - t0:5.1f}s")
+                    f"tokens/row={lens} path={'/'.join(sorted(paths)) or '-'} "
+                    f"rejected={dict(reasons) or '-'} {time.time() - t0:5.1f}s")
+                if sample is not None:
+                    head = repr(sample[:SAMPLE_CHARS])
+                    tail = ""
+                    if len(sample) > SAMPLE_CHARS:
+                        tail = f" ... {sample[-60:]!r}"
+                    out.append(f"       sample: {head}{tail}")
+                if first_error:
+                    out.append(f"       first error: {first_error}")
             except Exception as e:  # noqa: BLE001
                 bad += 1
                 out.append(

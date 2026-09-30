@@ -7,26 +7,35 @@ and persistent disk) don't need any of that — `run_training` is pure
 PyTorch and only touches `vol.commit()` after each save, which becomes
 a no-op when the underlying disk is already persistent.
 
-Usage (Lightning Studio, EC2, or local with a CUDA GPU):
+Usage (Colab, Lightning Studio, EC2, or local with a CUDA GPU):
 
     # Required env: WANDB_API_KEY, HF_TOKEN
     python -m osrt.train_main \\
         --tokenizer-path ./tokenizer \\
-        --ckpt-dir ./checkpoints/v5
+        --ckpt-dir ./checkpoints/v7 \\
+        --hf-repo user/osrt-v7-ckpt        # off-VM checkpoints (Colab)
 
 Resumes automatically from the highest `osrt_step_N.pt` /
-`osrt_rescue_step_N.pt` in `--ckpt-dir`. To start fresh, point at
-an empty directory.
+`osrt_rescue_step_N.pt` in `--ckpt-dir` (pulled from `--hf-repo` first
+when set). To start fresh, point at an empty directory.
 
-For a 1200-step Foundation-matched smoke test (~1h on H100, ~1.6h on
-A100 80GB), pass `--total-steps 1200` and a separate ckpt dir to keep
-it isolated from the production run.
+`--micro-batch-scale` defaults from the card's memory (1.0 on a 192 GB
+B200, 0.5 on a 96 GB RTX PRO 6000, 0.25 on an 80 GB H100) — tokens per
+step are unchanged, only micro-batch x accumulation moves. The W&B run
+id is kept in `<ckpt-dir>/wandb_run_id.txt` (and mirrored through
+`--hf-repo`), so re-runs continue ONE W&B run unless `--wandb-run-id`
+says otherwise.
+
+For a short smoke run pass `--total-steps N` with a separate `--ckpt-dir`
+and `--no-wandb`; the launch gate of the real shape is
+`modal run app.py --sanity` (see app.py).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import sys
 
 import torch
@@ -52,6 +61,47 @@ class _LocalVol:
 
     def commit(self) -> None:  # noqa: D401 — verbatim shim for Modal API
         return None
+
+
+# Lives beside the checkpoints so it travels with them: scripts/hf_ckpt_sync.py
+# lists the same name in SIDE_FILES (pulled before the run, pushed with it).
+WANDB_RUN_ID_FILE = "wandb_run_id.txt"
+
+
+def persisted_wandb_run_id(ckpt_dir: str, explicit: str | None = None) -> str:
+    """One W&B run per checkpoint directory.
+
+    Reads `<ckpt_dir>/wandb_run_id.txt`, or mints a random 8-char id and
+    writes it, so every re-run against the same checkpoints — a Colab session
+    that died, a Modal link re-spawned at the 23h boundary — continues the
+    same dashboard run instead of opening a new one per session. An explicit
+    id wins and is persisted in turn, so later re-runs follow it too.
+    """
+    path = os.path.join(ckpt_dir, WANDB_RUN_ID_FILE)
+    current = ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            current = f.read().strip()
+    except FileNotFoundError:
+        pass
+    run_id = explicit or current or secrets.token_hex(4)
+    if run_id != current:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(run_id + "\n")
+    return run_id
+
+
+def _default_micro_batch_scale(total_memory_bytes: int) -> float:
+    """The largest of the three measured shapes that fits the card:
+    B200-class (>= 150 GiB) 1.0, RTX PRO 6000-class (>= 90 GiB) 0.5,
+    everything smaller (80 GB H100/A100) 0.25."""
+    gib = total_memory_bytes / 2**30
+    if gib >= 150:
+        return 1.0
+    if gib >= 90:
+        return 0.5
+    return 0.25
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -82,8 +132,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--total-steps",
         type=int,
         default=None,
-        help="Override PretrainConfig.total_steps (default 300000). Useful "
-             "for sanity / partial-budget runs.",
+        help=f"Override PretrainConfig.total_steps (default "
+             f"{PretrainConfig().total_steps:,}). Useful for sanity / "
+             f"partial-budget runs; never change it mid-run.",
     )
     p.add_argument(
         "--wandb-run-name",
@@ -93,8 +144,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--wandb-run-id",
         default=None,
-        help="Resume an existing W&B run by id (e.g. when resuming after a "
-             "credit-driven kill so the dashboard stays one continuous run).",
+        help="W&B run id to log to. Default: the id in <ckpt-dir>/"
+             f"{WANDB_RUN_ID_FILE}, minted on the first run, so re-runs "
+             "continue one dashboard run. An explicit id replaces it.",
     )
     p.add_argument(
         "--no-wandb",
@@ -104,11 +156,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--micro-batch-scale",
         type=float,
-        default=1.0,
+        default=None,
         help=(
             "Scale every phase's micro-batch (accumulation adjusts to hold "
-            "tokens/step). Defaults fit a 192 GB B200; use 0.5 on a 96 GB "
-            "RTX PRO 6000, 0.25 on an 80 GB H100."
+            "tokens/step). Default: chosen from the card's memory — 1.0 at "
+            ">= 150 GiB (B200), 0.5 at >= 90 GiB (RTX PRO 6000), else 0.25 "
+            "(80 GB H100). An explicit value wins."
         ),
     )
     return p.parse_args(argv)
@@ -166,6 +219,20 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
     )
 
 
+# What each `run_training` status means for the person at the keyboard.
+_STATUS_HINTS = {
+    "complete": "done; osrt_final.pt (+ its step alias) written",
+    "already_complete": "nothing to do — a checkpoint at/after total_steps "
+                        "already exists in --ckpt-dir",
+    "early_stop": "health criteria failed; osrt_failed_step_N.pt holds the "
+                  "state, and is NOT resumed",
+    "rescued": "time boundary; rescue checkpoint written — re-run this "
+               "command to continue",
+    "data_dead": "every data source failed permanently; rescue checkpoint "
+                 "written — fix the data, then re-run",
+}
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
@@ -184,11 +251,17 @@ def main(argv: list[str] | None = None) -> None:
     train_cfg = PretrainConfig()
     if args.total_steps is not None:
         train_cfg.total_steps = args.total_steps
-    train_cfg.scale_micro_batches(args.micro_batch_scale)
+    scale = args.micro_batch_scale
+    if scale is None:
+        mem = torch.cuda.get_device_properties(0).total_memory
+        scale = _default_micro_batch_scale(mem)
+        print(f"micro-batch scale {scale} (auto: {mem / 2**30:.0f} GiB card; "
+              f"--micro-batch-scale overrides)", flush=True)
+    else:
+        print(f"micro-batch scale {scale} (explicit)", flush=True)
+    train_cfg.scale_micro_batches(scale)
     if args.wandb_run_name is not None:
         train_cfg.wandb_run_name = args.wandb_run_name
-    if args.wandb_run_id is not None:
-        train_cfg.wandb_run_id = args.wandb_run_id
     if args.no_wandb:
         train_cfg.wandb_log = False
 
@@ -202,7 +275,15 @@ def main(argv: list[str] | None = None) -> None:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
         from scripts import hf_ckpt_sync as sync
         print(f"HF ckpt sync: {args.hf_repo} (prefix 'osrt')", flush=True)
+        # Also pulls wandb_run_id.txt, so the id below is the previous
+        # session's, not a fresh one on a wiped Colab disk.
         sync.pull_latest(args.hf_repo, args.ckpt_dir, "osrt")
+    if train_cfg.wandb_log:
+        train_cfg.wandb_run_id = persisted_wandb_run_id(
+            args.ckpt_dir, args.wandb_run_id)
+        print(f"W&B run id: {train_cfg.wandb_run_id}", flush=True)
+    if sync is not None:
+        # Raises here — before any GPU time — if the token cannot write.
         sync.start_push_daemon(args.hf_repo, args.ckpt_dir, "osrt")
     print(
         f"Pretrain (Muon hybrid + aux). Tokenizer={args.tokenizer_path}, "
@@ -210,8 +291,9 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
 
+    status = None
     try:
-        run_training(
+        status = run_training(
             model_config=model_config,
             train_cfg=train_cfg,
             vol=_LocalVol(),
@@ -226,7 +308,12 @@ def main(argv: list[str] | None = None) -> None:
         # Colab pre-emption still persists the tail. (ckpt-sync §2)
         if sync is not None:
             print("flushing checkpoints to HF...", flush=True)
-            sync.flush(args.hf_repo, args.ckpt_dir, "osrt")
+            if not sync.flush(args.hf_repo, args.ckpt_dir, "osrt"):
+                print("WARNING: flush incomplete — the newest checkpoint may "
+                      "exist only on this disk", flush=True)
+    hint = _STATUS_HINTS.get(status)
+    print(f"run_training -> {status}" + (f": {hint}" if hint else ""),
+          flush=True)
 
 
 if __name__ == "__main__":

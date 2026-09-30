@@ -3,7 +3,8 @@ volume and score the SAME knowledge-mix batches under (a) eager train mode,
 (b) torch.compile train mode (trainer flags), (c) eager eval mode, plus a
 random-token batch (a causal LM must score ~ln(V) = 10.8; far lower = leak).
 
-    MODAL_PROFILE=inference-syn uv run modal run scripts/diag_eager_vs_compiled.py --step 1000
+    MODAL_PROFILE=inference-syn uv run modal run \\
+        scripts/diag_eager_vs_compiled.py --step 1000
 """
 from __future__ import annotations
 
@@ -76,6 +77,9 @@ def diag(step: int, n_batches: int) -> str:
 
     a = score(model, True, "eager, train mode")
     c = score(model, False, "eager, eval mode")
+    # train vs eval on the same weights and batches: only the Gumbel router
+    # noise and any train-only regulariser differ, so a large gap is a bug.
+    out.append(f"  train-vs-eval gap (eager):     {a - c:+.4f} nats")
     # random tokens: causal LM ~ ln(V); a leak scores far lower
     torch.manual_seed(0)
     rnd = torch.randint(0, cfg.real_vocab_size, (2, 4096))

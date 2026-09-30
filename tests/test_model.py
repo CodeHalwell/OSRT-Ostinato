@@ -947,12 +947,23 @@ def test_kv_cache_extend_matches_full_pass():
 # ── Parameter count & architecture sanity ──────────────────────────────
 
 
-def test_param_count_in_expected_range():
-    """Full-config v5 should be in the 350-500M range."""
-    cfg = OSRTConfig()
-    model = OSRTForCausalLM(cfg)
-    n = sum(p.numel() for p in model.parameters())
-    assert 350_000_000 < n < 500_000_000, f"Unexpected param count: {n:,}"
+def test_compute_budget_categories_cover_every_parameter():
+    """scripts/compute_budget.py is the only trusted source for parameter
+    counts (CLAUDE.md), so its category sum must equal a direct count of the
+    instantiated model, and its echo must report the hidden size the model
+    actually built (model.py rounds expert_hidden up to a multiple of 64)."""
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from scripts.compute_budget import _counts, budget
+
+    cfg = tiny_config(expert_hidden=100)          # rounds to 128
+    cats = budget(OSRTConfig(**cfg.to_dict()))
+    direct = sum(p.numel() for p in OSRTForCausalLM(cfg).parameters())
+    assert sum(_counts(cats).values()) == direct
+    assert cats["_h_routed_actual"] == 128
+    assert cats["loop_emb"] == cfg.num_blocks * cfg.recursive_loops * cfg.dim
 
 
 def test_no_dense_ffn_in_block():
@@ -1297,65 +1308,9 @@ def test_generate_pads_finished_rows_until_all_done():
     )
 
 
-# ── Pretrain label alignment ──────────────────────────────────────────
-
-
-def test_pretrain_loader_yields_aligned_labels_not_double_shifted():
-    """Regression: data.py used to yield labels = chunk[1:] while model.py
-    shifts internally (model.py:895-897). That double-shifted training so
-    position i was scored against token i+2 instead of i+1, silently
-    making every pretrain run learn the wrong target. Lock the loader to
-    aligned labels so model + loader agree on the shift convention.
-
-    The loader needs streaming infrastructure, so we exercise the chunk
-    yield path directly with a stub iterator instead of HF datasets.
-    """
-    import torch
-
-    from osrt.data import TokenStream
-
-    # A token stream that just returns one big "document" of known IDs.
-    # The TokenStream then chunks it into (input_ids, labels) of seq_len.
-    seq_len = 4
-    doc = list(range(100, 100 + 32))  # 32 token ids: 100, 101, ..., 131
-
-    class _StubTokenizer:
-        eos_token_id = 0
-        pad_token = "<pad>"
-        eos_token = "<eos>"
-
-        def encode(self, text, add_special_tokens=False):
-            return doc
-
-        def apply_chat_template(self, msgs, tokenize=False):
-            raise NotImplementedError
-
-    # Build a TokenStream and short-circuit its setup to yield from doc.
-    stream = TokenStream(
-        dataset_configs=[{"name": "stub", "hf_id": "stub", "weight": 1.0}],
-        seq_len=seq_len,
-        tok_name="stub",
-        seed=0,
-    )
-    # Replicate the chunk loop minimally to verify alignment semantics.
-    buffer = doc + [_StubTokenizer.eos_token_id]
-    chunks: list[tuple[list[int], list[int]]] = []
-    while len(buffer) >= stream.seq_len + 1:
-        chunk = buffer[: stream.seq_len + 1]
-        buffer = buffer[stream.seq_len :]
-        # Mirror data.py:190-200 yield exactly so this test fails if the
-        # alignment regresses there.
-        input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
-        labels = input_ids.clone()
-        chunks.append((input_ids.tolist(), labels.tolist()))
-
-    assert chunks, "stub chunk loop produced no batches"
-    for input_ids, labels in chunks:
-        assert input_ids == labels, (
-            "Pretrain labels must equal input_ids; the model shifts "
-            "internally. Yielding chunk[1:] would double-shift and silently "
-            "train every position to predict 2 tokens ahead."
-        )
+# ── Pretrain label alignment: covered by tests/test_token_stream.py, which
+# drives the real TokenStream.__iter__ over in-memory datasets (the previous
+# test here re-implemented the chunk loop in the test body and could not fail).
 
 
 # ── Z-loss / seq-balance / QK-Norm / softplus gate ─────────────────────
@@ -1488,15 +1443,34 @@ def test_qk_norm_present_and_bounds_attention_logits():
         assert blk.norm_q.normalized_shape == (cfg.head_dim,)
         assert blk.norm_k.normalized_shape == (cfg.head_dim,)
 
-    # Drive an extreme embedding to amplify activations through qkv.
+    # Inflate the q/k PROJECTIONS (the pre-attention RMSNorm sits before them,
+    # so scaling the embedding would be undone before q_proj/kv_down) and
+    # record what the QK norms receive and emit. Finiteness alone cannot fail
+    # (fp32 SDPA is finite regardless); the bound is the property: whatever
+    # magnitude q/k arrive at, the normalised vectors have RMS ~ 1 per head.
     with torch.no_grad():
-        model.model.embedding.weight.mul_(50.0)
+        for blk in model.model.blocks:
+            blk.q_proj.weight.mul_(50.0)
+            blk.kv_down.weight.mul_(50.0)
+    seen: list[tuple[float, float]] = []
+
+    def hook(_mod, inputs, output):
+        seen.append((
+            inputs[0].float().pow(2).mean(-1).sqrt().mean().item(),
+            output.float().pow(2).mean(-1).sqrt().mean().item(),
+        ))
+
+    handles = [blk.norm_q.register_forward_hook(hook) for blk in model.model.blocks]
+    handles += [blk.norm_k.register_forward_hook(hook) for blk in model.model.blocks]
     x = torch.randint(0, cfg.vocab_size, (1, 8))
     out = model(input_ids=x)
-    assert torch.isfinite(out.logits).all(), (
-        "QK-Norm should keep attention logits finite even with inflated "
-        "embeddings; got non-finite output."
-    )
+    for h in handles:
+        h.remove()
+    assert torch.isfinite(out.logits).all()
+    assert seen, "QK norms were not exercised"
+    assert max(rms_in for rms_in, _ in seen) > 5.0, "input was not inflated"
+    for rms_in, rms_out in seen:
+        assert abs(rms_out - 1.0) < 0.05, (rms_in, rms_out)
 
 
 def test_moe_gate_softplus_initialises_at_one():
@@ -2106,7 +2080,9 @@ def test_gradient_checkpointing_loss_and_grad_parity():
     m_off.train()
     loss_off = m_off(ids, labels=labels).loss
     loss_off.backward()
-    g_off = next(p.grad.clone() for p in m_off.parameters() if p.grad is not None)
+    g_off = {
+        n: p.grad.clone() for n, p in m_off.named_parameters() if p.grad is not None
+    }
 
     torch.manual_seed(0)
     m_on = OSRTForCausalLM(tiny_config(**cfg_kw))
@@ -2114,10 +2090,24 @@ def test_gradient_checkpointing_loss_and_grad_parity():
     m_on.train()
     loss_on = m_on(ids, labels=labels).loss
     loss_on.backward()
-    g_on = next(p.grad.clone() for p in m_on.parameters() if p.grad is not None)
+    g_on = {
+        n: p.grad.clone() for n, p in m_on.named_parameters() if p.grad is not None
+    }
 
     assert torch.allclose(loss_off, loss_on, atol=1e-4, rtol=1e-4)
-    assert torch.allclose(g_off, g_on, atol=1e-3, rtol=1e-3)
+    # Every parameter that received a gradient must receive the SAME gradient
+    # under recomputation — not just the first one (the embedding), which is
+    # what the previous version of this test checked. A checkpointing bug that
+    # dropped or double-counted an expert's or a router's gradient would leave
+    # the embedding grad untouched and slip through a first-parameter check.
+    assert g_off.keys() == g_on.keys(), (
+        f"grad coverage differs: {sorted(g_off.keys() ^ g_on.keys())}"
+    )
+    assert any("moe" in n for n in g_off), "expected MoE parameters to receive grads"
+    for name, g in g_off.items():
+        assert torch.allclose(g, g_on[name], atol=1e-3, rtol=1e-3), (
+            f"grad mismatch under checkpointing for {name}"
+        )
 
 
 def test_fused_ce_plus_checkpointing_bf16():

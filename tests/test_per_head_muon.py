@@ -37,17 +37,32 @@ def test_perhead_reshape_matches_blockwise_ns():
     assert torch.allclose(out, ref, atol=1e-5)
 
 
-def test_perhead_blocks_are_normalized():
-    # NS5 (bf16, 5 steps) pulls each block's singular values toward 1, so an
-    # orthonormal-rows block has Frobenius norm ~ sqrt(head_dim). Checks each
-    # head-block was independently normalised (not left at its raw random scale).
-    head_dim, n_heads, cols = 8, 4, 32   # head_dim < cols → orthonormal rows
-    g = torch.randn(n_heads * head_dim, cols) * 7.0  # arbitrary raw scale
-    out = newton_schulz5_perhead(g, head_dim).float()
-    target = head_dim ** 0.5
+def test_perhead_blocks_equal_each_heads_own_polar_factor():
+    """The property that distinguishes per-head from full-matrix Muon.
+
+    Any row-slice of a semi-orthogonal matrix is itself row-orthonormal, so
+    "each head block has Frobenius norm ~sqrt(head_dim)" (the previous check)
+    held for the FULL-matrix update too and could not fail. What per-head
+    orthogonalisation actually guarantees is that each head's block equals the
+    polar factor (U Vᵀ from the SVD) of THAT head's own gradient slice, while
+    the full-matrix update's slices do not.
+    """
+    torch.manual_seed(0)
+    head_dim, n_heads, cols = 16, 6, 96
+    g = torch.randn(n_heads * head_dim, cols)
+    # Give the heads very different scales: exactly the situation where the
+    # full-matrix update lets the loud heads dominate.
+    g[:head_dim] *= 20.0
+    per_head = newton_schulz5_perhead(g, head_dim, steps=8, stable_steps=2).float()
+    full = newton_schulz5(g, steps=8).float()
     for h in range(n_heads):
-        blk = out[h * head_dim:(h + 1) * head_dim]
-        assert 0.75 * target <= blk.norm().item() <= 1.25 * target, f"head {h}"
+        sl = slice(h * head_dim, (h + 1) * head_dim)
+        u, _, vh = torch.linalg.svd(g[sl], full_matrices=False)
+        polar = u @ vh
+        err_per_head = (per_head[sl] - polar).norm() / polar.norm()
+        err_full = (full[sl] - polar).norm() / polar.norm()
+        assert err_per_head < 0.06, f"head {h}: per-head err {err_per_head:.3f}"
+        assert err_full > 0.2, f"head {h}: full-matrix slice unexpectedly polar"
 
 
 def test_perhead_requires_divisible_out_dim():

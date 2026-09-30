@@ -2,6 +2,7 @@
   "add_prefix_space": false,
   "backend": "tokenizers",
   "bos_token": "<|begin_of_text|>",
+  "chat_template": "{%- set ns = namespace(n=messages|length, has_assistant=false) -%}{%- if not add_generation_prompt and ns.n > 0 and messages[-1]['role'] == 'user' -%}{%- set ns.n = ns.n - 1 -%}{%- endif -%}{%- for m in messages[:ns.n] -%}{%- if m['role'] == 'assistant' -%}{%- set ns.has_assistant = true -%}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt or ns.has_assistant -%}{%- for m in messages[:ns.n] -%}{%- if m['role'] == 'system' and loop.first -%}<|system|>{{ m['content'] | trim }}{%- elif m['role'] == 'user' -%}<|user|>{{ m['content'] | trim }}{%- elif m['role'] == 'assistant' -%}<|assistant|>{{ m['content'] | trim }}<|end_turn|>{%- else -%}{{ raise_exception('OSRT chat template: unsupported role ' ~ m['role']) }}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}{%- endif -%}",
   "clean_up_tokenization_spaces": false,
   "eos_token": "<|end_of_text|>",
   "errors": "replace",

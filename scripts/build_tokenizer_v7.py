@@ -24,9 +24,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from transformers import AutoTokenizer
+
+try:
+    from osrt.chat_format import CHAT_TEMPLATE
+except ImportError:  # run without PYTHONPATH=src
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from osrt.chat_format import CHAT_TEMPLATE
 
 BASE = "HuggingFaceTB/SmolLM2-1.7B"
 NAME = "OSRT-Ostinato"
@@ -65,7 +72,22 @@ def main() -> None:
 
     out = Path(args.out)
     tk.name_or_path = NAME
-    tk.save_pretrained(out)
+    # The chat contract ships WITH the tokenizer, as the `chat_template` key
+    # of tokenizer_config.json (save_jinja_files=False keeps it there rather
+    # than in a separate chat_template.jinja, which would take priority over
+    # the key on load). It is the byte-identical Jinja twin of
+    # osrt.chat_format.render_chat, which the pretraining stream uses.
+    tk.chat_template = CHAT_TEMPLATE
+    tk.save_pretrained(out, save_jinja_files=False)
+    cfg_path = out / "tokenizer_config.json"
+    cfg = json.loads(cfg_path.read_text())
+    if cfg.get("chat_template") != CHAT_TEMPLATE:
+        cfg["chat_template"] = CHAT_TEMPLATE
+        cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    stray = out / "chat_template.jinja"
+    if stray.exists():
+        stray.unlink()
+        print(f"  removed {stray} (template lives in tokenizer_config.json)")
     (out / "osrt_vocab.json").write_text(json.dumps({
         "name": f"{NAME} tokenizer",
         "base": BASE,

@@ -9,14 +9,14 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-*Part of the OSRT-605M `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
+*Part of the OSRT `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
 
 This document explains the **mixture-of-experts (MoE)** sub-block of the
 OSRT-605M model — the part that replaces the dense feed-forward network of a
 vanilla transformer with a small set of *experts* and a *router* that sends
 each token to only a few of them. Everything here is grounded in
 `src/osrt/model.py` (the `MoELayer` class, roughly lines 163–860) and the
-canonical preset `OSRT_605M_A288M` in `src/osrt/presets.py`.
+canonical preset `OSRT_V7` in `src/osrt/presets.py`.
 
 > **A note on ground truth.** Three sources describe this block and they do
 > *not* fully agree. The **code** wins. `ARCHITECTURE.md §7` contains stale
@@ -155,7 +155,7 @@ A few things worth teaching here:
   preset as the fallback for the G3 ladder's SiTU-vs-clamp A/B.
 - **`hidden` is rounded up to a multiple of 64** (`model.py:101`) for
   tensor-core alignment. Both preset widths (3,840 and 2,816) are already
-  multiples of 64, so nothing changes for OSRT-605M.
+  multiples of 64, so nothing changes for OSRT.
 
 Shapes per routed expert (preset): `w_gate, w_up ∈ ℝ^(1536×2112)`,
 `w_down ∈ ℝ^(2112×1536)` — 9,732,096 params per expert; `h2112 = 33 × 64`
@@ -710,7 +710,7 @@ zero.
 ## 12. Parameter and compute cost
 
 Do not hand-derive these — `scripts/compute_budget.py` is the source of
-truth. Running it on the canonical preset (`OSRT_605M_A288M`) reports:
+truth. Running it on the canonical preset (`OSRT_V7`) reports:
 
 ```
 cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
@@ -737,7 +737,7 @@ Takeaways:
   training-only MTP heads.
 
 > **Stale preset docstring.** `presets.py` claims "~607M physical / ~288.3M
-> active" and ships an `OSRT_605M_A279M` alias. The *actual* `compute_budget`
+> active" and ships an `OSRT_V7` alias. The *actual* `compute_budget`
 > output is **601M / 278M (46.3%)**. The headline name and docstring drifted
 > from a stale solve; trust the live `compute_budget.py` numbers above.
 

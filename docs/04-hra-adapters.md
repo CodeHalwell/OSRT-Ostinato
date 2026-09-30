@@ -22,7 +22,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-*Part of the `docs/` OSRT-605M architecture series.*
+*Part of the `docs/` OSRT architecture series.*
 
 This document explains the **HRA (High-Rank Adapter)** block of OSRT-605M:
 what it is, the (honest) story behind the name, the math, where the 18
@@ -258,14 +258,25 @@ stapled on at the end.
 Contrast this with the retrofit path. `hra.py`'s `inject_hra` exists precisely
 to add adapters to a model that was *not* born with them: it walks the module
 tree and replaces target `nn.Linear`s with `HRALinear` wrappers after the fact
-(`hra.py:91-145`). OSRT's SFT/RL stages do exactly this — they inject HRA into
-a *pretrained checkpoint* before loading weights (`train.py:1338-1350`):
+(`hra.py:91-145`). This is the v7 post-training path: the trunk trains with
+`use_hra=False` (E1), and the SFT/RL stage — not yet written in v7; the v6
+code quoted below was removed — loads the pretrained checkpoint **first** and
+injects afterwards (injection renames `q_proj.weight` to
+`q_proj.original.weight`, so a strict load into an injected model fails):
 
 ```python
-# ── HRA injection (BEFORE state_dict load) ──
-if extend_cfg.hra_enabled:
-    inject_hra(model, rank=extend_cfg.hra_rank, scale=..., freeze_pretrained=False)
+# ── v7 order: load the frozen base, THEN inject ──
+load_model_state_or_raise(model, ckpt["model_state_dict"], context="sft")
+hra_params = inject_hra(model, rank=256, scale=1.0, freeze_pretrained=True)
 ```
+
+> **Grouped-GEMM note (fixed 2026-09-30).** The routed experts run through a
+> grouped GEMM that stacks the experts' weight *tensors* rather than calling
+> the modules, so an `HRALinear` wrapper's forward was bypassed and adapters
+> injected into `w_gate`/`w_up`/`w_down` were silently dead (no gradient, no
+> effect). `model._effective_weight` now folds `W + scale·(A@B)ᵀ` into the
+> stacked weights, so injected experts train under every dispatch path
+> (`tests/test_review_regressions.py`).
 
 The zero-init `B` (section 3) is what makes both paths safe: whether an
 adapter is born with the model or grafted onto a trained checkpoint, it begins
@@ -280,10 +291,17 @@ adding **fresh, freezable capacity** at post-training time (next section).
 
 ## 7. HRA-only RL (GRPO): freeze the base, train the adapters
 
-During RL, OSRT uses the classic "adapters-only" recipe — the same pattern
+> **v6 record.** Everything in this section describes the v6 GRPO stage,
+> whose code (`grpo_train.py`, the `hra_only_training` config, the
+> `_freeze_hra_params` helper) was removed from this repo — see CLAUDE.md.
+> It is kept because the *lesson* (freeze the base, train the delta) carries
+> into the v7 post-training design, which is not written yet. The line
+> references below point at the archived `CodeHalwell/OSRT-605M-A269M`.
+
+During RL, v6 used the classic "adapters-only" recipe — the same pattern
 DPO/PPO/GRPO commonly use with LoRA. The base weights are frozen and only the
-adapter delta receives gradient. In OSRT-605M's GRPO-v2 this is the **central
-architectural fix** (`train_config.py:1842-1866`):
+adapter delta receives gradient. In v6's GRPO-v2 this was the **central
+architectural fix** (`train_config.py:1842-1866`, archived):
 
 ```python
 hra_only_training: bool = True

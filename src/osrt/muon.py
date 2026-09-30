@@ -5,7 +5,8 @@ Reference: Keller Jordan's modded-NanoGPT speedrun + the
 
 Why Muon over Lion/AdamW for transformer hidden weights:
   - The 2D weight matrices in attention (qkv, out_proj) and MoE
-    (router, expert SwiGLU projections) have a strong matrix structure
+    (expert SwiGLU projections; the router itself stays on AdamW, see
+    `build_param_groups`) have a strong matrix structure
     that scalar adaptive optimizers ignore. Muon takes the SGD-momentum
     update and projects it onto the nearest semi-orthogonal matrix via
     a quintic Newton-Schulz iteration. That update equalises the
@@ -26,9 +27,16 @@ with AdamW (or Lion). The training loop wires this split via
 `build_param_groups` below.
 
 Implementation is intentionally minimal: SGD-Nesterov-momentum on the
-gradient, Newton-Schulz on the resulting update, scale by
-`max(1, rows/cols)**0.5` so the step magnitude matches Adam-scale
-expectations (Keller Jordan's heuristic).
+gradient, Newton-Schulz on the resulting update, then one of two step
+scalings:
+
+  * `update_rms=None`  — Keller Jordan's shape heuristic
+    `max(1, rows/cols)**0.5`; per-element step ≈ lr / sqrt(cols).
+  * `update_rms=r`     — the Moonlight / DeepSeek-V4 rule
+    `sqrt(max(rows, cols)) * r`; per-element step ≈ lr * r for EVERY
+    shape, which is what lets one lr serve q_proj and a 2112x1536 expert
+    alike. Under this rule the Muon lr is on the AdamW scale, not the
+    0.02-ish scale the heuristic needed (see train_config.muon_lr).
 """
 
 from __future__ import annotations
@@ -144,6 +152,32 @@ def newton_schulz5_perhead(
     return ortho.reshape(out, cols)
 
 
+def _ortho_residual(o: Tensor, head_dim: int | None) -> Tensor:
+    """||O O^T - I||_F / sqrt(k) of an orthogonalised update, as a 0-d tensor.
+
+    With `head_dim` set (per-head Muon) the residual is taken per head block
+    and averaged: the blocks are orthogonalised independently and are NOT
+    mutually orthogonal, so the Gram of the reassembled matrix reads ~0.9 even
+    when every block is perfectly converged — measured 0.79-0.93 at the v7
+    attention shapes — and would make the metric uninterpretable.
+    """
+    o = o.float()
+    if head_dim is not None and o.shape[0] % head_dim == 0:
+        blocks = o.reshape(o.shape[0] // head_dim, head_dim, o.shape[1])
+        if blocks.shape[1] > blocks.shape[2]:
+            blocks = blocks.transpose(1, 2)
+        k = blocks.shape[1]
+        gram = torch.bmm(blocks, blocks.transpose(1, 2))
+        eye = torch.eye(k, device=o.device, dtype=o.dtype)
+        return ((gram - eye).flatten(1).norm(dim=1) / k ** 0.5).mean()
+    if o.shape[0] > o.shape[1]:
+        o = o.T
+    k = o.shape[0]
+    gram = o @ o.T
+    eye = torch.eye(k, device=o.device, dtype=o.dtype)
+    return (gram - eye).norm() / k ** 0.5
+
+
 class Muon(torch.optim.Optimizer):
     """Muon optimizer for 2D matrix parameters.
 
@@ -151,10 +185,13 @@ class Muon(torch.optim.Optimizer):
         params: Iterable of parameters or param groups. EVERY parameter
             in this optimizer must be 2D — pass scalars/embeddings/
             norms to a separate AdamW instance.
-        lr: Base learning rate. Muon's effective step is much smaller
-            than AdamW's per-parameter scale, so the typical Muon LR is
-            about 30-50× the AdamW LR (e.g. 0.02 for transformer hidden
-            weights vs 6e-4 for AdamW). Tune with a sanity run.
+        lr: Base learning rate. Its meaning depends on the step scaling:
+            with `update_rms=None` (shape heuristic) the per-element step
+            is ~lr/sqrt(cols), so lr sits ~30-50x above the AdamW LR
+            (0.02 vs 6e-4); with `update_rms=r` the per-element step is
+            lr*r for every shape, so lr belongs on the AdamW scale
+            (a few e-3 at r=0.18). Mixing the two conventions silently
+            changes the step size ~7x — see train_config.muon_lr.
         momentum: SGD momentum coefficient (default 0.95).
         nesterov: Whether to use Nesterov momentum (default True). The
             Muon recipe uses Nesterov by default.
@@ -194,9 +231,12 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
-        # Telemetry for the §17.3 stability analysis. Filled on every step
-        # (cheap RMS) with the orthogonality residual added only when
-        # `collect_ortho_error` is set, since that costs a matmul per param.
+        # Telemetry for the §17.3 stability analysis. The update-RMS stats are
+        # accumulated on-device and cost ONE host sync per step (the old code
+        # paid one per parameter, ~300 per step at the v7 shape); the
+        # orthogonality residual costs a matmul per parameter and is added only
+        # when `collect_ortho_error` is set (the trainer sets it on logging
+        # steps). `last_stats` is rebuilt every step.
         self.collect_ortho_error: bool = False
         self.last_stats: dict[str, float] = {}
         # Validate at construction so a wrong param group fails loudly
@@ -217,9 +257,12 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        pre_sq = post_sq = 0.0
+        collect = self.collect_ortho_error
+        # Accumulate on-device; a single host sync at the end of the step.
+        pre_sq: Tensor | float = 0.0
+        post_sq: Tensor | float = 0.0
         n_el = 0
-        ortho_err_sum = 0.0
+        ortho_err_sum: Tensor | float = 0.0
         n_ortho = 0
         for group in self.param_groups:
             lr = group["lr"]
@@ -256,7 +299,8 @@ class Muon(torch.optim.Optimizer):
                 # independently so no single head dominates the shared update.
                 rows, cols = p.shape
                 head_dim = group.get("head_dim")
-                if head_dim and rows % head_dim == 0 and rows > head_dim:
+                per_head = bool(head_dim and rows % head_dim == 0 and rows > head_dim)
+                if per_head:
                     ortho = newton_schulz5_perhead(
                         update,
                         head_dim,
@@ -288,17 +332,15 @@ class Muon(torch.optim.Optimizer):
                 # pre: RMS of the momentum-blended update Muon receives.
                 # post: RMS after Newton-Schulz, before shape_scale — how far
                 # from the raw step the orthogonalised step sits.
-                pre_sq += float(update.float().pow(2).sum())
-                post_sq += float(ortho.float().pow(2).sum())
+                # ortho_err (logging steps only): per-block residual under
+                # per-head Muon, full-matrix residual otherwise.
+                pre_sq = pre_sq + update.float().pow(2).sum()
+                post_sq = post_sq + ortho.float().pow(2).sum()
                 n_el += update.numel()
-                if self.collect_ortho_error:
-                    o = ortho.float()
-                    if o.shape[0] > o.shape[1]:
-                        o = o.T
-                    k = o.shape[0]
-                    gram = o @ o.T
-                    eye = torch.eye(k, device=o.device, dtype=o.dtype)
-                    ortho_err_sum += float((gram - eye).norm() / (k ** 0.5))
+                if collect:
+                    ortho_err_sum = ortho_err_sum + _ortho_residual(
+                        ortho, head_dim if per_head else None,
+                    )
                     n_ortho += 1
 
                 # Decoupled weight decay (AdamW-style — applied to the
@@ -307,13 +349,14 @@ class Muon(torch.optim.Optimizer):
                     p.mul_(1.0 - lr * wd)
                 p.add_(ortho, alpha=-lr * shape_scale)
 
+        self.last_stats = {}
         if n_el:
             self.last_stats = {
-                "muon/update_rms_pre": (pre_sq / n_el) ** 0.5,
-                "muon/update_rms_post": (post_sq / n_el) ** 0.5,
+                "muon/update_rms_pre": (float(pre_sq) / n_el) ** 0.5,
+                "muon/update_rms_post": (float(post_sq) / n_el) ** 0.5,
             }
             if n_ortho:
-                self.last_stats["muon/ortho_err"] = ortho_err_sum / n_ortho
+                self.last_stats["muon/ortho_err"] = float(ortho_err_sum) / n_ortho
         return loss
 
 
@@ -327,9 +370,9 @@ class HybridMuonAdamW:
     concatenated so a single `lr` update touches both.
 
     Save/load uses a single dict with two sub-keys so checkpoints stay
-    one-file. If you swap optimiser type mid-run (Lion → Muon), the
-    train.py resume-load already wraps in try/except and starts the
-    optimiser fresh on mismatch.
+    one-file. Swapping optimiser type mid-run (Lion → Muon) is a recipe
+    change: train.py's resume fails closed on it rather than silently
+    starting the optimiser fresh.
     """
 
     def __init__(
@@ -349,12 +392,18 @@ class HybridMuonAdamW:
         self.adamw.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):  # noqa: ANN001
-        # Run Muon first, then AdamW. The order doesn't matter for
-        # correctness because the two optimisers touch disjoint params,
-        # but Muon-then-AdamW gives a nicer wall-clock profile (Muon's
-        # NS iteration is the longer step, so kick it off first).
+        # Evaluate the closure (if any) ONCE, before either optimiser
+        # touches a parameter, then run Muon and AdamW. The order of the
+        # two does not matter for correctness (disjoint params); Muon
+        # first gives a nicer wall-clock profile (its NS iteration is the
+        # longer step, so kick it off first).
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         self.muon.step()
-        return self.adamw.step(closure)
+        self.adamw.step()
+        return loss
 
     def state_dict(self) -> dict:
         return {
@@ -386,25 +435,27 @@ def build_param_groups(
     Routing rules — kept here so the choice is reviewable in one
     place rather than scattered through train.py:
 
-      - 2D parameters that are NOT embeddings → Muon
-        (linear weights of attention, MoE router, experts, HRA adapters)
-      - nn.Embedding weights → AdamW
+      - 2D parameters that are NOT embeddings and NOT the router → Muon
+        (linear weights of attention, experts, MTP projections, HRA
+        adapters); decoupled weight decay is applied there, by Muon.
+      - nn.Embedding weights → AdamW, wd=0
         (sparse-ish updates, Muon's orthogonal projection is the wrong
         operator on lookup tables)
-      - 1D parameters → AdamW
-        (RMSNorm scales, including QK-Norm)
-      - 0-D scalars → AdamW
+      - 1D parameters → AdamW, wd=0
+        (RMSNorm scales, including QK-Norm; biases)
+      - 0-D scalars → AdamW, wd=0
         (moe_gate)
-      - Router and loop_embeddings keep wd=0 (matches Lion path).
+      - Router and loop_embeddings → AdamW, wd=0 (matches Lion path).
 
-    AdamW gets two groups (decay vs no-decay) so weight decay only
-    touches matrix-style params, not norms/embeddings.
+    Every AdamW-owned tensor is therefore in the no-decay group: nothing
+    that is not a Muon matrix is decayed. `weight_decay` is accepted for
+    signature stability and applies only if a future change adds a 2D
+    non-Muon parameter class here.
     """
     # Names are needed both to detect embeddings and to apply the
     # router/loop_embedding wd=0 carve-out, so iterate named_parameters.
     muon_params: list[torch.nn.Parameter] = []
     muon_attn: list[torch.nn.Parameter] = []  # per-head group (opt-in)
-    adamw_decay: list[torch.nn.Parameter] = []
     adamw_no_decay: list[torch.nn.Parameter] = []
     split_attn = per_head_attn and head_dim is not None
 
@@ -423,12 +474,8 @@ def build_param_groups(
             continue
 
         if is_norm_or_scalar or is_embedding:
-            # AdamW with weight decay applied only to non-embedding
-            # 2D params — embeddings are excluded by convention.
-            if is_embedding or is_norm_or_scalar:
-                adamw_no_decay.append(param)
-            else:
-                adamw_decay.append(param)
+            # Norms, biases, scalars and the tied embedding: AdamW, no decay.
+            adamw_no_decay.append(param)
             continue
 
         if param.ndim == 2:
@@ -446,8 +493,6 @@ def build_param_groups(
             )
 
     adamw_groups: list[dict] = []
-    if adamw_decay:
-        adamw_groups.append({"params": adamw_decay, "weight_decay": weight_decay})
     if adamw_no_decay:
         adamw_groups.append({"params": adamw_no_decay, "weight_decay": 0.0})
 

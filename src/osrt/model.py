@@ -19,10 +19,9 @@ Kept from v4:
   - Loop embeddings for per-loop routing preferences.
   - HuggingFace PreTrainedModel compatibility.
 
-Default config (measured on the actual model):
-  Physical params      : 362,720,259 (~363M, LM head tied with embedding)
-  Active / token (body): ~192M       (shared expert + 2 of 8 routed + attn + embed)
-  Block applications    : 18          (num_blocks × recursive_loops)
+Parameter counts are deliberately not stated here: `scripts/compute_budget.py`
+instantiates the real model on a meta device and is the only trusted source
+(CLAUDE.md). The committed v7 shape is `osrt.presets.OSRT_V7`.
 """
 
 import math
@@ -129,6 +128,25 @@ def _glu_combine(
         gate = gate.clamp(max=clamp)
         up = up.clamp(min=-clamp, max=clamp)
     return F.silu(gate) * up
+
+
+def _effective_weight(lin: nn.Module) -> Tensor:
+    """The (out, in) weight a linear layer applies, adapters included.
+
+    The grouped-GEMM and bmm dispatch paths stack the routed experts' weight
+    TENSORS instead of calling the modules, so anything a wrapper adds in its
+    forward is bypassed. `osrt.hra.HRALinear` (the post-training adapter)
+    exposes `.weight` as the frozen base weight plus `adapter_a @ adapter_b`
+    in its forward — under the grouped path its adapters were silently dead
+    (no gradient, no effect on the output; verified 2026-09-29). Fold the
+    adapter into the stacked weight instead: W + scale * (A @ B)^T, which is
+    differentiable in A and B, so injected experts train under every path.
+    """
+    w = lin.weight
+    a = getattr(lin, "adapter_a", None)
+    if a is not None:
+        w = w + lin.scale * (a @ lin.adapter_b).t()
+    return w
 
 
 # Quantile-Balancing score range. Brackets both router-score conventions
@@ -270,8 +288,14 @@ class MoELayer(nn.Module):
         # B4: grouped-GEMM dispatch (vs the per-expert .nonzero() loop).
         self.grouped_gemm = getattr(config, "moe_grouped_gemm", False)
         self.expert_hidden = config.expert_hidden
+        # Per-expert capacity cap. Only the per-expert .nonzero() loop applies
+        # it; the grouped-GEMM path (the v7 preset) is dropless by construction
+        # and ignores it, so `drop_rate` telemetry is identically 0 there.
         self.capacity_factor = config.router_capacity_factor
         self.num_loops = config.recursive_loops
+        # DeepSeek-V3 semantics by default: the balance bias (and Gumbel noise)
+        # steer top-k SELECTION; gating weights come from the pre-bias affinity.
+        self.bias_in_gates = getattr(config, "router_bias_in_gates", False)
         # Save seed for deferred orthogonal init (applied after post_init).
         self._moe_seed = moe_seed
         self._orthogonal_init_requested = config.expert_orthogonal_init
@@ -703,7 +727,7 @@ class MoELayer(nn.Module):
         likely already hoists the constant stack/cast, and/or decode is
         host-bound); kept because it is cheap at load time, value-identical,
         and may pay once CUDA-graph replay removes the host overhead. Costs
-        ~791 MiB of extra bf16 buffers on the 605M preset.
+        one bf16 copy of the routed experts (~1.6 GiB on the v7 preset).
         The weights are frozen at inference, so build the exact same
         (E, in, out) bf16 tensors ONCE and reuse. Non-persistent buffers:
         excluded from state_dict (checkpoint layout unchanged), moved by
@@ -712,21 +736,25 @@ class MoELayer(nn.Module):
         change every step). Stale after any weight update; re-call to refresh.
         """
         cdt = torch.bfloat16
-        self.register_buffer(
-            "_packed_w_gate",
-            torch.stack([e.w_gate.weight.t() for e in self.experts]).to(cdt),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_packed_w_up",
-            torch.stack([e.w_up.weight.t() for e in self.experts]).to(cdt),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_packed_w_down",
-            torch.stack([e.w_down.weight.t() for e in self.experts]).to(cdt),
-            persistent=False,
-        )
+        with torch.no_grad():
+            self.register_buffer(
+                "_packed_w_gate",
+                torch.stack([_effective_weight(e.w_gate).t()
+                             for e in self.experts]).to(cdt),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_packed_w_up",
+                torch.stack([_effective_weight(e.w_up).t()
+                             for e in self.experts]).to(cdt),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_packed_w_down",
+                torch.stack([_effective_weight(e.w_down).t()
+                             for e in self.experts]).to(cdt),
+                persistent=False,
+            )
 
     def _invalidate_packed_weights(self) -> None:
         """Drop the prepacked buffers (fast path falls back to per-call
@@ -789,9 +817,10 @@ class MoELayer(nn.Module):
             )
             return torch._grouped_mm(h.to(cdt), w_down_b, offs=offs)
         # nn.Linear weight is (out, in); grouped_mm wants b = (E, in, out).
-        w_gate = torch.stack([e.w_gate.weight.t() for e in self.experts])
-        w_up = torch.stack([e.w_up.weight.t() for e in self.experts])
-        w_down = torch.stack([e.w_down.weight.t() for e in self.experts])
+        # _effective_weight folds any injected HRA adapter into the stack.
+        w_gate = torch.stack([_effective_weight(e.w_gate).t() for e in self.experts])
+        w_up = torch.stack([_effective_weight(e.w_up).t() for e in self.experts])
+        w_down = torch.stack([_effective_weight(e.w_down).t() for e in self.experts])
         if use_kernel:
             # torch._grouped_mm (compiled) supports only bf16/fp16. The model
             # trains under bf16 autocast, so casting tokens + weights to bf16
@@ -881,15 +910,18 @@ class MoELayer(nn.Module):
         N, D = x_flat.shape
         K = self.top_k
         pair_expert = top_idx.reshape(-1)                    # (N*K,)
-        w_gate = getattr(self, "_packed_w_gate", None)
+        # The bf16 prepacked stacks are used on CUDA only, exactly like
+        # _grouped_ffn: on CPU (fp32 tests / reference runs) they would put
+        # the decode path in bf16 while prefill stayed fp32.
+        w_gate = getattr(self, "_packed_w_gate", None) if x_flat.is_cuda else None
         if w_gate is None:
             cdt = x_flat.dtype
             w_gate = torch.stack(
-                [e.w_gate.weight.t() for e in self.experts]).to(cdt)
+                [_effective_weight(e.w_gate).t() for e in self.experts]).to(cdt)
             w_up = torch.stack(
-                [e.w_up.weight.t() for e in self.experts]).to(cdt)
+                [_effective_weight(e.w_up).t() for e in self.experts]).to(cdt)
             w_down = torch.stack(
-                [e.w_down.weight.t() for e in self.experts]).to(cdt)
+                [_effective_weight(e.w_down).t() for e in self.experts]).to(cdt)
         else:
             w_up, w_down = self._packed_w_up, self._packed_w_down
         cdt = w_gate.dtype
@@ -954,10 +986,25 @@ class MoELayer(nn.Module):
                 )
             return self._hash_route(x, x_flat, shared_out, token_ids, loop_idx)
 
-        # Router: add loop embedding, project to expert scores
+        # Router: add loop embedding, project to expert scores. The router runs
+        # in fp32 regardless of autocast (Switch Transformer §2.4 "selective
+        # precision", DeepSeek-V3): under bf16 a top-k tie inside one ulp
+        # (2^-8 relative) is decided by rounding, and the Quantile-Balancing
+        # histogram's 0.0078-wide bins are narrower than bf16's spacing at
+        # |score| >= 2. It is an (N, D) x (D, E) matmul — negligible.
         loop_emb = self.loop_embeddings.weight[loop_idx].view(1, 1, D)
-        router_input = x + loop_emb
-        router_logits = self.router(router_input.reshape(N, D))  # (N, E)
+        router_input = (x + loop_emb).reshape(N, D)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            if isinstance(self.router, nn.Linear):
+                bias = self.router.bias
+                router_logits = F.linear(
+                    router_input.float(), self.router.weight.float(),
+                    None if bias is None else bias.float(),
+                )  # (N, E) fp32
+            else:
+                # A swapped-in router module (tests, research probes): run it
+                # outside autocast and upcast whatever it returns.
+                router_logits = self.router(router_input).float()
 
         # The routing math below operates on a per-expert "probability-like"
         # view of three router states — raw (pre-bias, no Gumbel), clean (bias,
@@ -966,15 +1013,19 @@ class MoELayer(nn.Module):
         #
         #   "softmax"       — historical Mixtral/v5 path. The balance bias is
         #                     added to the LOGITS pre-softmax; each view is a
-        #                     softmax over its logits. Bit-identical to before.
+        #                     softmax over its logits.
         #   "sqrt_softplus" — DeepSeek-V4. affinity = sqrt(softplus(logits)) is
         #                     always non-negative; the balance bias is added to
-        #                     the AFFINITY (not the logits); top-k selection and
-        #                     the renormalised gating weights operate on that
-        #                     balanced affinity. Telemetry and the Switch balance
-        #                     loss consume an affinity-normalised probability
-        #                     view (affinity / affinity.sum) so every downstream
+        #                     the AFFINITY (not the logits); top-k selection
+        #                     operates on that balanced affinity. Telemetry and
+        #                     the Switch balance loss consume an
+        #                     affinity-normalised probability view
+        #                     (affinity / affinity.sum) so every downstream
         #                     entropy/fraction/z-loss stays well-defined.
+        # Gating weights (what multiplies each chosen expert's output) come
+        # from the PRE-BIAS view by default (`router_bias_in_gates=False`,
+        # DeepSeek-V3 §2.1.2): the controller steers WHICH experts, the
+        # learned router alone says HOW MUCH. See the top_probs block below.
         # Inference fast path (eval + telemetry off): only the deployed
         # routing decision is needed — balanced affinity -> ONE top-k ->
         # renormalised gates -> dispatch. The clean/prebias top-k views and
@@ -1066,20 +1117,34 @@ class MoELayer(nn.Module):
                 clean_top_idx, loop_idx, score=prebias_score,
             )
 
-        # Renormalise so the K chosen gates sum to 1. Without this, the MoE
-        # output would be down-weighted when K > 1 just because softmax is
-        # spread across E>K experts. Renormalisation keeps the MoE branch
-        # at a consistent magnitude regardless of K.
-        top_probs = raw_top_probs / raw_top_probs.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-9)
+        # Gating weights for the K chosen experts, renormalised to sum to 1.
+        # Without renormalisation the MoE output would be down-weighted when
+        # K > 1 just because the distribution is spread across E > K experts.
+        if self.bias_in_gates:
+            # v6 behaviour: gates from the bias-adjusted, Gumbel-noised
+            # selection distribution.
+            gate_vals = raw_top_probs
+        else:
+            # DeepSeek-V3: gates from the ORIGINAL affinity at the selected
+            # indices. The bias re-solved by Quantile Balancing every step
+            # then changes which experts fire, never by how much.
+            if affinity_mode == "sqrt_softplus":
+                gate_source = affinity
+            else:
+                gate_source = (
+                    raw_router_probs if compute_aux
+                    else F.softmax(router_logits, dim=-1)
+                )
+            gate_vals = gate_source.gather(-1, top_idx)
+        top_probs = gate_vals / gate_vals.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
-        # Per-expert capacity. In training, enforce the cap to force
+        # Per-expert capacity (loop dispatch only; the grouped path is
+        # dropless and never reads it). In training, enforce the cap to force
         # balancing pressure. In eval/inference, disable drops entirely so
         # generation is chunk-stable (prefill-then-decode must match a full
         # forward). Inference non-determinism across chunks was a documented
         # v4 failure mode — v5 makes eval drop-free by construction.
-        if self.training:
+        if self.training and not self.grouped_gemm:
             capacity = max(
                 1,
                 int(math.ceil(self.capacity_factor * self.top_k * N / self.num_routed)),
@@ -1349,7 +1414,7 @@ class StaticKVCache:
     static tensor shapes/addresses: the prerequisite for CUDA-graph capture.
 
     Cost: 2x the latent cache's memory (K and V vs one latent), ~150 MB at
-    B=1/ctx-4096 on the 605M preset. Historical K/V are position-frozen, so
+    B=1/ctx-4096 on the v7 preset. Historical K/V are position-frozen, so
     caching them is mathematically exact; bf16 GEMV-vs-GEMM accumulation order
     on the new token's v_from_k differs from the latent path -> gate with
     ppl/logit error, not token identity.
@@ -1572,8 +1637,10 @@ class RecursiveBlock(nn.Module):
             # Attention sink (docs/ARCHITECTURE.md §6.6): the sink adds an extra term
             # to the softmax denominator only, which SDPA cannot express. Use
             # the manual path so we can apply the exact log-sum-exp rescale.
+            # It honours the key-padding mask (left-padded batches) too.
             attn_out = self._attention_with_sink(
                 q, k, v, S, total_len, past_len,
+                key_padding_mask=key_padding_mask,
             )
         elif key_padding_mask is not None:
             # Left-padded batch (eval): combine causal + key-padding into one
@@ -1712,6 +1779,7 @@ class RecursiveBlock(nn.Module):
         S: int,
         total_len: int,
         past_len: int,
+        key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         """Manual GQA attention with a per-head learnable sink (§6.6/§6.7).
 
@@ -1748,13 +1816,20 @@ class RecursiveBlock(nn.Module):
         # Causal masking — identical semantics to the SDPA path. For the
         # cached-decode case the S query positions occupy [past_len:total_len],
         # so a key j is visible to query i iff j <= past_len + i. With S == 1
-        # (single-token decode) all `total_len` keys are visible and no mask is
-        # needed (matches SDPA's is_causal=False branch).
-        if S > 1:
+        # (single-token decode) all `total_len` keys are visible and no causal
+        # mask is needed (matches SDPA's is_causal=False branch). A key-padding
+        # mask (left-padded batch, 1 = real) additionally hides pad keys, with
+        # each query's own position kept visible so a pad-query row is never
+        # fully masked (same rule as the SDPA branch).
+        if S > 1 or key_padding_mask is not None:
             row = torch.arange(S, device=scores.device).view(S, 1)
             col = torch.arange(total_len, device=scores.device).view(1, total_len)
-            causal = col <= (past_len + row)  # (S, total_len) bool, True = keep
-            scores = scores.masked_fill(~causal, float("-inf"))
+            keep = (col <= (past_len + row)).view(1, 1, S, total_len)
+            if key_padding_mask is not None:
+                real = (key_padding_mask != 0).view(B, 1, 1, total_len)
+                self_pos = (col == (past_len + row)).view(1, 1, S, total_len)
+                keep = (keep & real) | self_pos
+            scores = scores.masked_fill(~keep, float("-inf"))
 
         # Per-query log-sum-exp of the (masked) scores, then standard softmax.
         # Compute in fp32 for a stable exp/log; the sink rescale is sensitive to
@@ -2155,14 +2230,16 @@ class OSRTModel(OSRTPreTrainedModel):
                     def _block_fn(
                         _x, _a, _b, _cos, _sin,
                         _block=block, _scale=self.adapter_scale, _loop=loop,
-                        _tok=input_ids,
+                        _tok=input_ids, _mask=attention_mask,
                     ):
-                        # token_ids is captured (closure default), not a
-                        # checkpoint input — it carries no gradient and only
-                        # hash-routing blocks read it.
+                        # token_ids and the key-padding mask are captured
+                        # (closure defaults), not checkpoint inputs — neither
+                        # carries a gradient. The mask used to be dropped here,
+                        # so a padded batch trained unmasked whenever
+                        # checkpointing was on (verified 2026-09-29).
                         return _block(
                             _x, _a, _b, _scale, _cos, _sin, _loop,
-                            token_ids=_tok,
+                            token_ids=_tok, key_padding_mask=_mask,
                         )[0]
 
                     def _context_fn(_block=block):
@@ -2330,7 +2407,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
              .item() calls graph-break torch.compile.
           2. prepack_expert_weights() per block — value-identical; throughput-
              neutral under fullgraph compile so far (see its docstring), kept
-             for the post-CUDA-graph regime. ~791 MiB extra bf16 buffers.
+             for the post-CUDA-graph regime. One extra bf16 expert copy.
           3. torch.compile(self.forward, fullgraph=True, dynamic=True) into
              self._compiled_forward. MEASURED end-to-end generate(): decode
              b1 5.0 -> 24.2 tok/s, b32 153 -> 705.6, prefill 196 -> 46 ms.
@@ -2455,8 +2532,24 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             attention_mask=attention_mask,
         )
 
+        # Fused chunked linear-CE (memory). 0 = off (bit-identical to the
+        # F.linear+CE path); > 0 routes the aux/MTP head losses — and, with
+        # fused_main_head, the main +1 loss — through osrt.fused_ce so only
+        # ~1/chunks of the (N, vocab) logits live at once. Same loss +
+        # gradients — tests/test_fused_ce.py. When the main head is fused the
+        # forward returns logits=None: the full (tokens, vocab) bf16 logits,
+        # their fp32 copy and the saved log-softmax were ~16 GB per 32K-token
+        # micro-batch at the v7 vocab. `return_logits=True` opts back in.
+        fused_ce_chunks = getattr(self.config, "fused_cross_entropy_chunks", 0)
+        fuse_main = (
+            labels is not None
+            and self.training
+            and fused_ce_chunks > 0
+            and getattr(self.config, "fused_main_head", True)
+            and not kwargs.get("return_logits", False)
+        )
         # Weight-tied LM head
-        logits = F.linear(hidden, self.model.embedding.weight)
+        logits = None if fuse_main else F.linear(hidden, self.model.embedding.weight)
 
         # Reset loss attributes (prevent stale values in eval-without-labels)
         self.last_task_loss = None
@@ -2473,14 +2566,24 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :self.config.real_vocab_size]
-            shift_logits = shift_logits.contiguous().float()
             shift_labels = labels[..., 1:].contiguous()
-            task_loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.real_vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            if fuse_main:
+                task_loss = fused_linear_cross_entropy(
+                    hidden[:, :-1, :].reshape(-1, hidden.shape[-1]),
+                    self.model.embedding.weight,
+                    shift_labels.reshape(-1),
+                    real_vocab_size=self.config.real_vocab_size,
+                    ignore_index=-100,
+                    n_chunks=fused_ce_chunks,
+                )
+            else:
+                shift_logits = logits[..., :-1, :self.config.real_vocab_size]
+                shift_logits = shift_logits.contiguous().float()
+                task_loss = F.cross_entropy(
+                    shift_logits.view(-1, self.config.real_vocab_size),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
             # Normalise each aux loss by num MoE applications so the
             # coefficient matches per-layer weight (not per-whole-model sum).
             #
@@ -2513,13 +2616,6 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             aux_weight = getattr(self.config, "aux_loop_loss_weight", 0.0)
             per_loop_weights = getattr(
                 self.config, "per_loop_aux_weights", None,
-            )
-            # Fused chunked linear-CE (memory). 0 = off (bit-identical to the
-            # F.linear+CE path below); > 0 routes the aux/MTP head losses
-            # through osrt.fused_ce so only ~1/chunks of the (N, vocab) logits
-            # live at once. Same loss + gradients — tests/test_fused_ce.py.
-            fused_ce_chunks = getattr(
-                self.config, "fused_cross_entropy_chunks", 0,
             )
             if (
                 self.training
@@ -2705,7 +2801,7 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         Unsupported with attention_mask (left-padded batches) or speculative.
 
         The model's forward already supports past_key_values + use_cache
-        (per-effective-layer KV cache, 18 layers for default v5). This
+        (per-effective-layer KV cache, num_blocks x loops entries). This
         method does the prefill + decode loop: one full forward over the
         prompt to seed the cache, then one single-token forward per step
         consuming the cache. That turns O(N) per-step attention cost into
@@ -2798,6 +2894,20 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
         attn = None
         if attention_mask is not None:
             attn = attention_mask[:, -self.config.max_position_embeddings:]
+            # Only LEFT padding is supported: decode reads logits[:, -1] for
+            # every row, so the last prompt position must be a real token in
+            # every row. Right-padded rows were silently decoded from a pad
+            # position (verified 2026-09-29); HF tokenizers pad right by default.
+            if not bool(attn[:, -1].all()):
+                raise ValueError(
+                    "generate() requires LEFT padding: attention_mask[:, -1] "
+                    "must be 1 for every row (tokenizer.padding_side='left')."
+                )
+        if cache_impl == "static" and self.config.attention_sink:
+            raise ValueError(
+                "cache_impl='static' does not implement the attention sink; "
+                "use cache_impl='latent' with attention_sink=True."
+            )
         out = self._fwd(
             context, use_cache=True, num_loops=num_loops, attention_mask=attn,
         )
@@ -2814,10 +2924,12 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                 )
             latents = cast("list[Tensor]", past_key_values)
             B, prompt_len = context.shape
-            max_len = min(
-                self.config.max_position_embeddings,
-                prompt_len + max_new_tokens,
-            )
+            # Sized to the whole generation, like the latent path: the forward
+            # recomputes RoPE tables past max_position_embeddings on demand
+            # (rope_cos slice / compute_rope_freqs branch), and a buffer capped
+            # at max_position_embeddings had the cursor run off its end
+            # (device-side assert) at the first token past it.
+            max_len = prompt_len + max_new_tokens
             mdl = self.model
             static_cache = StaticKVCache(
                 num_layers=len(latents), batch=B,
@@ -2991,11 +3103,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             # some point, not only when all rows happen to emit a stop
             # token on the same step.
             #
-            # stop_token_ids/stop_tensor lets callers stop on chat-template markers
-            # like <|/answer|> (token 10) or <|user|> (token 11). Useful
-            # because MOPD-distilled models often generate additional
-            # answer blocks after the first one or try to start a new
-            # user turn — stopping on those keeps inference output clean.
+            # stop_token_ids/stop_tensor lets callers stop on chat-contract
+            # markers such as <|/answer|>, <|end_turn|> or <|user|> (ids in
+            # osrt.tokenizer_contract). Useful because distilled models often
+            # generate additional answer blocks after the first one or try to
+            # start a new user turn — stopping on those keeps output clean.
             nt = next_token.squeeze(-1)
             if eos_token_id is not None:
                 finished = finished | (nt == eos_token_id)
@@ -3168,6 +3280,14 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                     finished = finished | torch.isin(t, stop_tensor)
                 generated = torch.cat([generated, col], dim=1)
                 produced += 1
+                # Stop committing once every row has finished — the plain
+                # greedy loop stops at that step, so the outputs match to the
+                # token (the remaining columns would only be forced EOS).
+                if (
+                    (eos_token_id is not None or stop_tensor is not None)
+                    and bool(finished.all())
+                ):
+                    break
             stats["tokens"] = produced
 
             # Keep the cache through the accepted prefix (+ pending), and take
@@ -3387,7 +3507,9 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
             if len(new_cols) > limit:
                 new_cols = new_cols[:limit]
 
-            # Mask finished rows so they keep emitting EOS (rectangular tensor).
+            # Mask finished rows so they keep emitting EOS (rectangular tensor),
+            # and stop committing once every row has finished so the output
+            # matches plain greedy to the token.
             masked_cols = []
             for col in new_cols:
                 if eos_token_id is not None:
@@ -3400,6 +3522,11 @@ class OSRTForCausalLM(OSRTPreTrainedModel):
                     finished = finished | (t == eos_token_id)
                 if stop_tensor is not None:
                     finished = finished | torch.isin(t, stop_tensor)
+                if (
+                    (eos_token_id is not None or stop_tensor is not None)
+                    and bool(finished.all())
+                ):
+                    break
 
             if masked_cols:
                 generated = torch.cat([generated, *masked_cols], dim=1)

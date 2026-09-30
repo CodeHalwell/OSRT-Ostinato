@@ -58,3 +58,12 @@ research/*.pdf
 # NOTE: notebooks are NOT blanket-ignored here. The previous repo had a bare
 # `*.ipynb` rule, which meant every notebook needed `git add -f` and several
 # were silently never committed. Ignore outputs instead, via nbstripout.
+
+# Data, weights and papers in any directory (CLAUDE.md: never commit weights,
+# data or third-party PDFs; arXiv's default licence grants no redistribution).
+*.parquet
+*.arrow
+*.npy
+*.npz
+*.ckpt
+*.pdf
