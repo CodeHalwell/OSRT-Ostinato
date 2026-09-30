@@ -265,9 +265,12 @@ def _optimizer_lr_tags(opt_state: dict | None) -> dict:
 
 
 def _model_shape_metadata(cfg) -> dict:
-    """Shape identity. A checkpoint cannot load into a different vocab or
+    """Model identity. A checkpoint cannot load into a different vocab or
     expert layout, and v7 changed BOTH against v6 — so record them rather
-    than discovering the mismatch as a shape error mid-load."""
+    than discovering the mismatch as a shape error mid-load. The router gate
+    semantics are stamped alongside: not a shape, but weights trained with
+    the balance bias inside their gating weights compute a different function
+    when loaded with it outside, and a state-dict load cannot tell."""
     return {
         "vocab_size": cfg.vocab_size,
         "real_vocab_size": cfg.real_vocab_size,
@@ -277,7 +280,22 @@ def _model_shape_metadata(cfg) -> dict:
         "num_routed_experts": cfg.num_routed_experts,
         "top_k_experts": cfg.top_k_experts,
         "expert_hidden": cfg.expert_hidden,
+        "router_bias_in_gates": bool(getattr(cfg, "router_bias_in_gates", False)),
     }
+
+
+def _legacy_gate_semantics_apply(model_config) -> bool:
+    """True when a checkpoint written before `router_bias_in_gates` existed
+    (2026-09-30) would compute a different function under this config: those
+    checkpoints took their gates from the bias-adjusted, Gumbel-noised
+    selection distribution (today's `True`), so the difference is real
+    whenever the balance bias or Gumbel exploration is in play."""
+    if getattr(model_config, "router_bias_in_gates", False):
+        return False
+    return bool(
+        getattr(model_config, "router_balance_bias_enabled", True)
+        or getattr(model_config, "router_gumbel_tau_init", 0.0) > 0
+    )
 
 
 def assert_no_resume_drift(
@@ -306,6 +324,11 @@ def assert_no_resume_drift(
         if k == "phase_plan":
             return ("    phase_plan: data mix, seq_len, tokens/step or phase "
                     "boundaries differ from the checkpoint")
+        if k == "router_bias_in_gates" and a is True and legacy_gates:
+            return ("    router_bias_in_gates: checkpoint predates the flag and "
+                    "was trained with the balance bias INSIDE its gating "
+                    "weights (=True); current=False. Set "
+                    "router_bias_in_gates=True to continue that run as trained")
         return f"    {k}: checkpoint={a!r} current={b!r}"
 
     def _diff(saved: dict | None, current: dict, label: str) -> None:
@@ -327,9 +350,22 @@ def assert_no_resume_drift(
             return
         raise RuntimeError(msg)
 
+    legacy_gates = False
     if model_config is not None:
-        _diff(ckpt.get("model_shape"), _model_shape_metadata(model_config),
-              "MODEL SHAPE")
+        saved_shape = ckpt.get("model_shape")
+        _diff(saved_shape, _model_shape_metadata(model_config), "MODEL SHAPE")
+        # A checkpoint from before `router_bias_in_gates` existed carries no
+        # such key, so `_diff` cannot see that it was trained under today's
+        # `True` while the default is now `False`: the resumed model would
+        # weight its selected experts differently mid-run while keeping the
+        # optimizer state and the loss curve. Treat the absent key as True.
+        if (
+            (not saved_shape or "router_bias_in_gates" not in saved_shape)
+            and _legacy_gate_semantics_apply(model_config)
+        ):
+            legacy_gates = True
+            _diff({"router_bias_in_gates": True},
+                  {"router_bias_in_gates": False}, "ROUTER GATE SEMANTICS")
     if train_cfg is not None:
         _diff(ckpt.get("training_recipe"),
               _training_recipe_metadata(train_cfg, tokenizer_name),
@@ -1033,6 +1069,31 @@ def _router_health_failures(
     return failures
 
 
+def _failure_key(failure: str) -> str:
+    """The criterion a failure message belongs to: every message from
+    `_check_early_stop_criteria` opens with its metric name."""
+    return failure.split(" ", 1)[0]
+
+
+def _update_health_streaks(streaks: dict[str, int], failures: list[str]) -> list[str]:
+    """Advance the per-criterion consecutive-failure counts in `streaks` and
+    return the criteria that failed on THIS check, in reported order.
+
+    Patience means "the same criterion keeps failing", not "something failed
+    on each of the last N checks": a criterion that is absent from `failures`
+    drops back to zero, so three unrelated one-off blips never add up to a
+    stop, while one metric that stays bad for `health_check_patience` checks
+    does.
+    """
+    keys = [_failure_key(f) for f in failures]
+    for k in list(streaks):
+        if k not in keys:
+            del streaks[k]
+    for k in keys:
+        streaks[k] = streaks.get(k, 0) + 1
+    return keys
+
+
 def _health_scope(step: int, cfg: PretrainConfig) -> str | None:
     """Which criteria to evaluate at `step` (None = none).
 
@@ -1428,7 +1489,7 @@ def run_training(
     grad_accum = train_cfg.grad_accum_steps
     early_stop_triggered = False
     run_status: str | None = None
-    health_fail_streak = 0
+    health_fail_streaks: dict[str, int] = {}   # criterion -> consecutive fails
     nonfinite_streak = 0
     nonfinite_total = 0
     dead_sources_seen: list[str] = []
@@ -1907,16 +1968,18 @@ def run_training(
             patience = 1 if at_gate else max(
                 1, getattr(train_cfg, "health_check_patience", 3))
             if failures:
-                health_fail_streak += 1
+                keys = _update_health_streaks(health_fail_streaks, failures)
+                worst = max(health_fail_streaks[k] for k in keys)
                 print(
                     f"\n>>> HEALTH CHECK at step {step} ({scope}): "
                     f"{len(failures)} criteria failing "
-                    f"[{health_fail_streak}/{patience} consecutive]:",
+                    f"[longest streak {worst}/{patience} consecutive]:",
                     flush=True,
                 )
                 for f in failures:
-                    print(f"      - {f}")
-                if health_fail_streak >= patience:
+                    print(f"      - {f}  "
+                          f"[{health_fail_streaks[_failure_key(f)]}/{patience}]")
+                if worst >= patience:
                     print(f"\n>>> EARLY STOP at step {step}: health criteria "
                           "failed.", flush=True)
                     _stop_failed(
@@ -1927,11 +1990,11 @@ def run_training(
                     run_status = "early_stop"
                     break
             else:
-                if health_fail_streak:
+                if health_fail_streaks:
                     print(f"\n>>> health check at step {step}: recovered "
-                          f"after {health_fail_streak} failing check(s).",
-                          flush=True)
-                health_fail_streak = 0
+                          f"({', '.join(sorted(health_fail_streaks))} no longer "
+                          "failing).", flush=True)
+                health_fail_streaks.clear()
                 if at_gate:
                     print(
                         f"\n>>> Router health gate at step {step}: "

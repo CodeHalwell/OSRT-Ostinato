@@ -21,11 +21,13 @@ from osrt.train import (
     _average_moe_snapshots,
     _check_early_stop_criteria,
     _health_scope,
+    _model_shape_metadata,
     _optimizer_lr_tags,
     _reset_router_balance_accumulators,
     _set_param_group_lrs,
     _stamp_schedule_tags,
     _training_recipe_metadata,
+    _update_health_streaks,
     assert_no_resume_drift,
     get_lr,
 )
@@ -176,6 +178,39 @@ def test_drift_guard_reads_lr_tags_from_old_checkpoints(monkeypatch):
     assert_no_resume_drift(old, train_cfg=PretrainConfig(muon_lr=0.02))
 
 
+def test_drift_guard_treats_a_missing_gate_flag_as_the_old_true(monkeypatch):
+    """Checkpoints from before `router_bias_in_gates` existed were trained with
+    the balance bias inside the gating weights (today's True); resuming one
+    under the new default (False) must fail closed. (Codex review on PR #2.)"""
+    monkeypatch.delenv("OSRT_ALLOW_RECIPE_DRIFT", raising=False)
+    kw = dict(num_routed_experts=28, top_k_experts=4, router_balance_mode="quantile")
+    current = OSRTConfig(**kw)
+    assert current.router_bias_in_gates is False
+    old_shape = {k: v for k, v in _model_shape_metadata(current).items()
+                 if k != "router_bias_in_gates"}
+    for old in ({"model_shape": old_shape}, {}):          # pre-flag, pre-metadata
+        with pytest.raises(RuntimeError, match="router_bias_in_gates"):
+            assert_no_resume_drift(old, model_config=current)
+        # continuing the run as it was trained
+        assert_no_resume_drift(old, model_config=OSRTConfig(
+            **kw, router_bias_in_gates=True))
+        # with neither the bias nor Gumbel in play the two settings agree
+        assert_no_resume_drift(old, model_config=OSRTConfig(
+            **kw, router_balance_bias_enabled=False))
+    with pytest.raises(RuntimeError, match="router_bias_in_gates"):
+        assert_no_resume_drift({}, model_config=OSRTConfig(
+            **kw, router_balance_bias_enabled=False, router_gumbel_tau_init=1.0))
+    # a checkpoint stamped by this code carries the flag and is compared as-is
+    new = {"model_shape": _model_shape_metadata(current)}
+    assert_no_resume_drift(new, model_config=current)
+    with pytest.raises(RuntimeError, match="router_bias_in_gates"):
+        assert_no_resume_drift(new, model_config=OSRTConfig(
+            **kw, router_bias_in_gates=True))
+    # the deliberate-change escape hatch still applies
+    monkeypatch.setenv("OSRT_ALLOW_RECIPE_DRIFT", "1")
+    assert_no_resume_drift({"model_shape": old_shape}, model_config=current)
+
+
 def test_drift_guard_env_override_downgrades_to_warning(monkeypatch, capsys):
     monkeypatch.setenv("OSRT_ALLOW_RECIPE_DRIFT", "1")
     ckpt = _ckpt_for(PretrainConfig())
@@ -230,6 +265,27 @@ def test_loop_scope_ignores_router_criteria_but_full_scope_does_not():
     assert len(loop_f) == 2
     with pytest.raises(ValueError):
         _check_early_stop_criteria(1000, collapsed, cfg, mcfg, scope="router")
+
+
+def test_health_patience_counts_the_same_criterion_not_any_failure():
+    """Three unrelated one-off failures must not add up to a stop; one metric
+    failing `patience` checks in a row must. (Copilot review on PR #2.)"""
+    streaks: dict[str, int] = {}
+    _update_health_streaks(streaks, ["clean_raw_max_prob 0.10 < 0.20 (x)"])
+    _update_health_streaks(streaks, ["loop_update_norm_min 1.0e-05 < 1.0e-03 (y)"])
+    keys = _update_health_streaks(streaks, ["clean_top_margin 0.00 < 0.10 (z)"])
+    assert keys == ["clean_top_margin"]
+    assert streaks == {"clean_top_margin": 1}          # the blips did not stack
+    for _ in range(3):
+        _update_health_streaks(streaks, [
+            "loop_update_norm_min 1.0e-05 < 1.0e-03 (y)",
+            "clean_raw_max_prob 0.10 < 0.20 (x)" if _ == 1 else
+            "prebias_expert_min 0.0010 < 0.0071 (w)",
+        ])
+    assert streaks["loop_update_norm_min"] == 3        # the persisting one
+    assert max(v for k, v in streaks.items() if k != "loop_update_norm_min") == 1
+    _update_health_streaks(streaks, [])
+    assert streaks == {}
 
 
 def test_averaged_snapshots_emit_hidden_norm_ratio_metric():

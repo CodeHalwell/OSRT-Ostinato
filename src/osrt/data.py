@@ -654,9 +654,10 @@ class TokenStream(IterableDataset):
     EOS between them into `seq_len` chunks. `labels == input_ids` — the
     model applies the one-position shift internally.
 
-    Dead-source policy: when a stream's fetch gives up (`_robust_next`
-    exhausts its retries) `max_stream_failures` times in a row, or a
-    stream rejects `max_consecutive_rejections` rows in a row, it is marked
+    Dead-source policy: when a stream cannot be opened at startup (after
+    `load_dataset`'s bounded retries), when its fetch gives up (`_robust_next`
+    exhausts its retries) `max_stream_failures` times in a row, or when it
+    rejects `max_consecutive_rejections` rows in a row, it is marked
     dead — announced once, removed from the sampler (remaining weights are
     renormalised) and listed in `dead_sources`. When no live stream is left
     `DataSourceDead` is raised. A successfully fetched row resets the fetch
@@ -1077,13 +1078,28 @@ class TokenStream(IterableDataset):
             )
 
         # Connect every live stream (dead-on-resume sources are not reopened).
+        # A source that cannot be opened even after `_open_base`'s retries is
+        # declared dead like a mid-run failure would be, so one unavailable
+        # dataset does not take the healthy ones down with it; when none can
+        # be opened the same DataSourceDead the sampler would raise is raised
+        # here, before any compute is spent.
         for st in streams:
             if st["dead"]:
                 continue
             print(f"[DataWorker] Connecting to {st['name']}...", flush=True)
-            st["base"] = _open_base(st["idx"])
+            try:
+                st["base"] = _open_base(st["idx"])
+            except Exception as exc:  # noqa: BLE001 — reported via _mark_dead
+                _mark_dead(
+                    st["idx"],
+                    f"unreachable at startup: {type(exc).__name__}: "
+                    f"{str(exc)[:160]}",
+                )
+                continue
             st["gen"] = _cycling_iter(st)
             print(f"[DataWorker] Stream ready for {st['name']}", flush=True)
+        if all(st["dead"] for st in streams):
+            raise DataSourceDead(self.dead_sources)
 
         # Token-weighted sampling: pick the stream whose observed token
         # fraction is furthest behind its configured target. This makes

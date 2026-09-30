@@ -112,6 +112,26 @@ def test_apply_chat_template_matches_render_chat_byte_for_byte(tok, agp):
         [u("q")],
         [s("sys"), u("q")],
         [u("unicode ✓ 日本語"), a("<|think|>t<|/think|><|answer|>x<|/answer|>")],
+        # Aliased and malformed inputs: the twin must apply the same
+        # normalisation and validation, not just agree on well-formed rows.
+        [{"role": "human", "content": "q"}, {"role": "gpt", "content": "a"}],
+        [{"role": "User", "content": "q"}, {"role": "model", "content": " a "}],
+        [{"role": " Assistant", "content": "a"}],
+        [a("answer with no question")],
+        [u("q1"), u("q2"), a("a")],
+        [u("q"), a("x"), u("q2"), u("q3")],
+        [s("sys")],
+        # (an empty list is covered on render_chat alone: transformers'
+        # apply_chat_template indexes messages[0] before rendering)
+        [u("   "), a("x")],
+        [u("q"), a("\n")],
+        [u("q"), a("")],
+        [u(123), a("x")],
+        [u("q"), a(None)],
+        [u("q"), a([{"type": "text", "text": "parts"}])],
+        [s(""), u("q"), a("x")],
+        [u("q"), a("x"), s("late system")],
+        [s("one"), s("two"), u("q"), a("x")],
     ]
     for messages in cases:
         rendered = tok.apply_chat_template(
@@ -119,10 +139,18 @@ def test_apply_chat_template_matches_render_chat_byte_for_byte(tok, agp):
         assert rendered == render_chat(messages, add_generation_prompt=agp), messages
 
 
-def test_template_refuses_unsupported_roles(tok):
+@pytest.mark.parametrize("bad", [
+    {"role": "tool", "content": "42"},
+    {"role": "function", "content": "x"},
+    {"content": "no role"},
+    {"role": None, "content": "x"},
+])
+def test_template_refuses_unsupported_roles(tok, bad):
+    """The one deliberate divergence from `render_chat` (which returns "" so the
+    data stream skips the row): at inference an error beats an empty prompt."""
+    assert render_chat([u("q"), bad, a("x")]) == ""
     with pytest.raises(Exception, match="unsupported role"):
-        tok.apply_chat_template(
-            [u("q"), {"role": "tool", "content": "42"}, a("x")], tokenize=False)
+        tok.apply_chat_template([u("q"), bad, a("x")], tokenize=False)
 
 
 # ── encode_with_markers ──────────────────────────────────────────────────

@@ -102,12 +102,15 @@ The design is committed and the trunk is one command — `modal run --detach app
 and its falsifier; results are read against that. The health checks run
 during the run: the router-sharpening gate once at step 5,000, loop collapse /
 residual explosion on every logging step after warmup, and the whole set on
-every logging step after the gate (3 consecutive failures stop the run). The
+every logging step after the gate (a criterion failing 3 consecutive
+checks stops the run; unrelated one-off blips do not add up). The
 ladder (`scripts/launch_ladder.sh`) is for explaining results afterwards, not
 gating them.
 
 Resume is fail-closed: every checkpoint stamps the training recipe (schedule,
-Muon/AdamW LRs, phase plan with tokens/step, tokenizer sha) and the loader's
+Muon/AdamW LRs, phase plan with tokens/step, tokenizer sha), the model identity
+(shape and `router_bias_in_gates`; a checkpoint from before that flag existed
+counts as `True`) and the loader's
 data position; a resumed session that disagrees stops with a diff. A
 deliberate mid-run change needs `OSRT_ALLOW_RECIPE_DRIFT=1`. `run_training`
 returns a status (`complete` / `already_complete` / `early_stop` / `rescued` /

@@ -44,37 +44,60 @@ _ROLE_ALIASES: dict[str, str] = {
     "model": "assistant",
 }
 
-# Jinja twin of `render_chat` for transformers' apply_chat_template. Same
-# rules for well-formed conversations (optional leading system, then
-# user/assistant turns): content trimmed, no whitespace between markers, a
-# trailing user turn dropped unless add_generation_prompt, nothing rendered
-# when no assistant turn survives (and no generation prompt is requested).
-# Unsupported roles raise instead of rendering silently.
-CHAT_TEMPLATE: str = (
-    "{%- set ns = namespace(n=messages|length, has_assistant=false) -%}"
-    "{%- if not add_generation_prompt and ns.n > 0 "
-    "and messages[-1]['role'] == 'user' -%}"
-    "{%- set ns.n = ns.n - 1 -%}"
-    "{%- endif -%}"
-    "{%- for m in messages[:ns.n] -%}"
-    "{%- if m['role'] == 'assistant' -%}{%- set ns.has_assistant = true -%}"
-    "{%- endif -%}"
-    "{%- endfor -%}"
-    "{%- if add_generation_prompt or ns.has_assistant -%}"
-    "{%- for m in messages[:ns.n] -%}"
-    "{%- if m['role'] == 'system' and loop.first -%}"
-    "<|system|>{{ m['content'] | trim }}"
-    "{%- elif m['role'] == 'user' -%}"
-    "<|user|>{{ m['content'] | trim }}"
-    "{%- elif m['role'] == 'assistant' -%}"
-    "<|assistant|>{{ m['content'] | trim }}<|end_turn|>"
-    "{%- else -%}"
-    "{{ raise_exception('OSRT chat template: unsupported role ' ~ m['role']) }}"
-    "{%- endif -%}"
-    "{%- endfor -%}"
-    "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
-    "{%- endif -%}"
-)
+# Jinja twin of `render_chat` for transformers' apply_chat_template. It applies
+# the same normalisation and validation as the Python renderer — role aliases
+# (human -> user, gpt/model -> assistant, case-insensitive), content trimmed,
+# no whitespace between markers, a trailing user turn dropped unless
+# add_generation_prompt, and "" for a blank or non-string content, a system
+# message anywhere but first, or a row with no adjacent user->assistant pair
+# (with add_generation_prompt: no turns at all). The ONE deliberate
+# difference: a role outside system/user/assistant (or a missing role) raises
+# here, where a caller is building a prompt and an error beats an empty
+# string, while `render_chat` returns "" so the data stream skips the row.
+CHAT_TEMPLATE: str = "".join([
+    "{%- set ns = namespace(ok=true, turns=[], system=none, "
+    "pair=false, render=false) -%}",
+    "{%- for m in messages -%}",
+    "{%- set r = m['role'] if m['role'] is string else '' -%}",
+    "{%- set r = r | trim | lower -%}",
+    "{%- if r == 'human' -%}{%- set r = 'user' -%}",
+    "{%- elif r == 'gpt' or r == 'model' -%}{%- set r = 'assistant' -%}",
+    "{%- endif -%}",
+    "{%- if r not in ['system', 'user', 'assistant'] -%}",
+    "{{ raise_exception('OSRT chat template: unsupported role ' ~ m['role']) }}",
+    "{%- endif -%}",
+    "{%- set c = m['content'] if m['content'] is string else none -%}",
+    "{%- if c is none or (c | trim) == '' -%}{%- set ns.ok = false -%}{%- endif -%}",
+    "{%- if r == 'system' and not loop.first -%}{%- set ns.ok = false -%}{%- endif -%}",
+    "{%- set ns.turns = ns.turns + [[r, (c | trim) if c is string else '']] -%}",
+    "{%- endfor -%}",
+    "{%- if ns.turns and ns.turns[0][0] == 'system' -%}",
+    "{%- set ns.system = ns.turns[0][1] -%}",
+    "{%- set ns.turns = ns.turns[1:] -%}",
+    "{%- endif -%}",
+    "{%- if not add_generation_prompt and ns.turns and ns.turns[-1][0] == 'user' -%}",
+    "{%- set ns.turns = ns.turns[:-1] -%}",
+    "{%- endif -%}",
+    "{%- for i in range(ns.turns | length - 1) -%}",
+    "{%- if ns.turns[i][0] == 'user' and ns.turns[i + 1][0] == 'assistant' -%}",
+    "{%- set ns.pair = true -%}",
+    "{%- endif -%}",
+    "{%- endfor -%}",
+    "{%- if add_generation_prompt -%}",
+    "{%- set ns.render = ns.ok and (ns.turns | length) > 0 -%}",
+    "{%- else -%}",
+    "{%- set ns.render = ns.ok and ns.pair -%}",
+    "{%- endif -%}",
+    "{%- if ns.render -%}",
+    "{%- if ns.system is not none -%}<|system|>{{ ns.system }}{%- endif -%}",
+    "{%- for t in ns.turns -%}",
+    "{%- if t[0] == 'user' -%}<|user|>{{ t[1] }}",
+    "{%- else -%}<|assistant|>{{ t[1] }}<|end_turn|>",
+    "{%- endif -%}",
+    "{%- endfor -%}",
+    "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}",
+    "{%- endif -%}",
+])
 
 
 def _normalise(messages: object) -> list[tuple[str, str]] | None:

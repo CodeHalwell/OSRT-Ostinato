@@ -572,7 +572,8 @@ class OSRTConfig(PretrainedConfig):
         for name in ("bos_token_id", "eos_token_id", "pad_token_id",
                      "unk_token_id", "think_open_id", "think_close_id",
                      "answer_open_id", "answer_close_id", "user_token_id",
-                     "assistant_token_id", "system_token_id"):
+                     "assistant_token_id", "system_token_id",
+                     "fim_prefix_id", "fim_middle_id", "fim_suffix_id"):
             tid = getattr(self, name, None)
             if tid is not None and not 0 <= tid < self.real_vocab_size:
                 raise ValueError(

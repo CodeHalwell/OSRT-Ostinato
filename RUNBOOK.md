@@ -49,7 +49,8 @@ Budget: `PretrainConfig` — 18,000 steps ≈ **5.43B tokens** (16×2048 / 6×40
 The first log lines print the exact number and the Muon per-element step.
 
 **Resume is fail-closed.** Every checkpoint stamps the recipe (schedule, Muon
-and AdamW LRs, the phase plan with tokens/step, the tokenizer's sha256). A
+and AdamW LRs, the phase plan with tokens/step, the tokenizer's sha256) and
+the model identity (shape plus the router gate semantics). A
 session that disagrees stops with a diff instead of splicing two runs; a
 deliberate change needs `OSRT_ALLOW_RECIPE_DRIFT=1`. A finished run is
 recognised (`osrt_step_18000.pt` alias) and re-invoking it does nothing.

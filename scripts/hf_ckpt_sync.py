@@ -12,6 +12,7 @@ huggingface_hub reads it itself and nothing here ever prints it.
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import re
 import threading
@@ -25,7 +26,9 @@ import time
 _SYNC_RE = re.compile(r"^(?P<prefix>.+?)_(?:rescue_)?step_(?P<step>\d+)\.pt$")
 
 # Small files that ride along with the checkpoints so a run keeps its identity
-# across venues: pulled when absent locally, pushed when absent remotely, never
+# across venues: pulled when absent locally, pushed whenever their CONTENT
+# differs from what this process last uploaded (a name-only check missed an
+# explicit --wandb-run-id rewriting the file under a name already remote), never
 # pruned. `wandb_run_id.txt` is what lets Colab re-runs continue ONE W&B run.
 SIDE_FILES = ("wandb_run_id.txt",)
 
@@ -43,6 +46,15 @@ def _is_sync_name(name: str, prefix: str) -> bool:
     """True for exactly `{prefix}_step_N.pt` / `{prefix}_rescue_step_N.pt`."""
     m = _SYNC_RE.match(name)
     return bool(m) and m.group("prefix") == prefix
+
+
+def _digest(path: str) -> str:
+    """sha256 of a file's content (side files are tiny; never used on .pt)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _is_protected(name: str) -> bool:
@@ -63,8 +75,15 @@ def _list_remote(api, repo_id: str) -> list[str] | None:
 
     try:
         return list(api.list_repo_files(repo_id, repo_type="model"))
-    except RepositoryNotFoundError:
-        return None
+    except RepositoryNotFoundError as e:
+        # huggingface_hub raises this same class for a 401 on a private repo
+        # (missing or wrong token) and, via its GatedRepoError subclass, for a
+        # 403 — only a real 404 means "not created yet". Anything else is the
+        # bad-credentials case the docstring promises to propagate.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            return None
+        raise
 
 
 def _local_files(ckpt_dir: str, prefix: str, *, final: bool = False,
@@ -175,9 +194,11 @@ class PushDaemon:
         api.create_repo(repo_id, repo_type="model", private=True, exist_ok=True)
         self._write_probe()
         remote = _list_remote(api, repo_id) or []
-        self.pushed: set[str] = {
-            f for f in remote if _is_sync_name(f, prefix) or f in SIDE_FILES
-        }
+        self.pushed: set[str] = {f for f in remote if _is_sync_name(f, prefix)}
+        # Side files are tracked by CONTENT, not name: the remote listing says
+        # nothing about what is in them, so the first pass re-uploads each one
+        # once (bytes, not gigabytes) and every later change goes up too.
+        self.side_digests: dict[str, str] = {}
 
     def _write_probe(self) -> None:
         try:
@@ -202,7 +223,7 @@ class PushDaemon:
         copies that are the only ones left. Returns True when nothing failed."""
         pending = [(p, os.path.basename(p))
                    for p in _local_files(self.ckpt_dir, self.prefix)]
-        pending = [(p, n) for p, n in pending if n not in self.pushed]
+        pending = [(p, n) for p, n in pending if self._needs_upload(p, n)]
         cutoff = _obsolete_cutoff(
             self.pushed | {n for _, n in pending}, self.prefix, self.keep_remote)
         ok = True
@@ -211,13 +232,22 @@ class PushDaemon:
                 self.pushed.add(name)  # the prune would delete it at once
                 continue
             print(f"[hf-sync] uploading {name}...", flush=True)
+            digest = _digest(path) if name in SIDE_FILES else None
             if _upload(self.api, self.repo_id, path, name):
-                self.pushed.add(name)
+                if digest is not None:
+                    self.side_digests[name] = digest
+                else:
+                    self.pushed.add(name)
             else:
                 ok = False
         if ok:
             self._prune()
         return ok
+
+    def _needs_upload(self, path: str, name: str) -> bool:
+        if name in SIDE_FILES:
+            return _digest(path) != self.side_digests.get(name)
+        return name not in self.pushed
 
     def _prune(self) -> None:
         """Keep the newest `keep_remote` step/rescue files. `_final`, `_failed_`
@@ -264,7 +294,8 @@ def start_push_daemon(repo_id: str, ckpt_dir: str, prefix: str,
 def flush(repo_id: str, ckpt_dir: str, prefix: str,
           keep_remote: int = 3) -> bool:
     """Synchronously upload every local step/rescue/final/failed checkpoint
-    (and SIDE_FILES) not already on the remote, NEWEST FIRST — the newest file
+    not already on the remote (and every SIDE_FILE, whose content may have
+    changed under a name the remote already has), NEWEST FIRST — the newest file
     is the one a pre-emption must not take — with bounded retries per file.
     The push daemon is `daemon=True` and both the 23h-rescue and the end-of-run
     paths exit within one poll interval of their final save, so the single
@@ -296,8 +327,8 @@ def flush(repo_id: str, ckpt_dir: str, prefix: str,
     ok = True
     for path in local:
         name = os.path.basename(path)
-        if name in remote:
-            continue
+        if name in remote and name not in SIDE_FILES:
+            continue          # side files: content may differ, always re-sent
         if _is_sync_name(name, prefix) and _step_of(name) < cutoff:
             continue  # older than what the remote keeps
         print(f"[hf-sync] flush uploading {name}...", flush=True)

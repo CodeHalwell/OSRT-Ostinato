@@ -115,8 +115,10 @@ def measure(arm: str, step: int, max_new_tokens: int, dtype: str) -> str:
         identical = g_new == s_new
         rep = torch.equal(g, g2)
         g_eos, s_eos = to_eos(g_new), to_eos(s_new)
-        k = min(len(g_eos), len(s_eos))
-        identical_to_eos = k > 0 and g_eos[:k] == s_eos[:k]
+        # The WHOLE truncated continuations, not a common prefix: a prefix
+        # match would pass a decoder that stopped early or never emitted EOS,
+        # which is exactly the tail-length bug this diagnostic exists to catch.
+        identical_to_eos = len(g_eos) > 0 and g_eos == s_eos
         first_div = next(
             (i for i in range(min(n_g, n_s)) if g_new[i] != s_new[i]), -1)
         greedy_tps, spec_tps = n_g / tg, n_s / ts

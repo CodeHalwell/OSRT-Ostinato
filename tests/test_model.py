@@ -70,6 +70,16 @@ def test_config_rejects_odd_head_dim():
         tiny_config(dim=21, heads=3, head_dim=7)
 
 
+@pytest.mark.parametrize("name", ["fim_prefix_id", "fim_middle_id", "fim_suffix_id"])
+def test_config_rejects_out_of_range_fim_ids(name):
+    """The FIM ids are structural ids the preset derives from tokenizer slots;
+    an out-of-range one must fail at construction, not at first FIM use."""
+    with pytest.raises(ValueError, match="outside the real vocabulary"):
+        tiny_config(**{name: 512})
+    with pytest.raises(ValueError, match="outside the real vocabulary"):
+        tiny_config(**{name: -1})
+
+
 def test_config_rejects_negative_gumbel_tau():
     with pytest.raises(ValueError, match="router_gumbel_tau_init"):
         tiny_config(router_gumbel_tau_init=-0.1)

@@ -196,7 +196,7 @@ plainly: *"LM head is weight-tied to embeddings (via `F.linear` with
 If the input embedding and the output projection were **untied**, you would store
 **two** `49,280 × 1,536` matrices ≈ **151 M** parameters. Tying stores **one** and
 reuses it, **saving ≈ 76 M parameters** (`49,280 × 1,536 = 75,694,080`). For a
-~601 M-parameter model that is the difference between spending ~16.6 % vs ~33 % of
+~968 M-parameter model that is the difference between spending ~7.8 % vs ~15.6 % of
 the budget on the I/O interface alone — params that are far better spent on the
 recursive MoE blocks.
 
@@ -289,49 +289,27 @@ and [`06-heads-and-losses.md`](06-heads-and-losses.md).
 ## 7. Parameter cost
 
 Counts come from `scripts/compute_budget.py`, which instantiates the canonical
-`OSRT_V7` preset on a meta device and sums real parameters
-(`scripts/compute_budget.py:50-58`).
+`OSRT_V7` preset on a meta device and sums real parameters.
 
 ### The exact numbers
 
-- **Token-embedding matrix**: `49,280 × 1,536 = 75,694,080` parameters (`compute_budget.py` reports 75,721,728 for the category, which also catches 18 small per-layer vectors). This is
-  the one tensor that serves both the input lookup and (tied) the LM head.
-- **`compute_budget.py` "embedding" line**: **100,690,944**. This is *slightly
-  larger* than the matrix itself — by exactly **27,648 = 3 × 6 × 1,536**.
-
-#### Why the budget number is bigger than the matrix (resolved, not hand-waved)
-
-`100,690,944 − 100,663,296 = 27,648 = num_blocks(3) × recursive_loops(6) × dim(1536)`
-— the size of the per-block **loop embeddings**. The loop-embedding tensor
-(`nn.Embedding(recursive_loops, dim)`, `model.py:213`) lives inside `MoELayer`,
-which lives inside each `RecursiveBlock`, which is instantiated `num_blocks=3`
-times (`model.py:1250-1252`) — so there are `3 × 6 × 1536 = 27,648` loop-embedding
-params in total.
-
-They land in the **"embedding"** budget bucket only because of category
-*ordering*: `compute_budget.py:29-40` checks `"embedding" in name` **before**
-`"loop_emb" in name`, and the parameter is named `…loop_embeddings.weight`, whose
-name contains the substring `embedding`. So the first rule wins and the dedicated
-`loop_emb` bucket never fires. It is a *bucketing* artifact, not a second copy of
-the vocabulary — the actual token-embedding matrix is exactly **100,663,296**.
-
-> Take-away: cite **100,663,296** for the token-embedding/tied-LM-head matrix.
-> The **100,690,944** figure is `compute_budget.py`'s embedding line, which also
-> sweeps in the 3× loop embeddings (`+27,648`). The product in some notes that
-> (v6 history — the v7 matrix is 49,280 × 1,536 = 75,694,080.) The v6 note that
-> read "65,536 × 1,536 = 100,690,944" was arithmetically wrong; the true product
-> is 100,663,296.
+- **Token-embedding matrix**: `49,280 × 1,536 = 75,694,080` parameters — the
+  one tensor that serves both the input lookup and (tied) the LM head. This
+  is exactly the script's `embedding` line.
+- **Loop embeddings**: `3 blocks × 6 loops × 1,536 = 27,648`, on their own
+  `loop_emb` line. (Until 2026-09-30 the script tested the substring
+  `embedding` before `loop_emb`, so `…loop_embeddings.weight` landed in the
+  embedding bucket and that line read 27,648 too high. The category order is
+  fixed; regenerate rather than carry the old figure.)
 
 ### Share of the model — the embedding tax
 
-Against the preset's **~601M physical** parameters
-([`00-overview.md`](00-overview.md), from `compute_budget.py`), the token
-embedding is **≈ 7.8 %** of the model (`75,694,080 / 968,468,355`) — down from 16.6% in v6, because the vocab shrank while the experts grew. (The
-"embedding" *budget line*, 100,690,944, is ~16.7 %; ARCHITECTURE.md §4.1 quotes
-16.9 % against an older total. The spread is just numerator/denominator choice.)
+Against the preset's **968,468,355 physical** parameters the token embedding
+is **7.8 %** of the model (`75,694,080 / 968,468,355`), down from 16.7 % in
+v6 (100,663,296 of 601M): the vocabulary shrank from 65,536 to 49,280 rows
+while the routed experts grew from 424.7M to 817.5M.
 
-This ~16–17 % is the **deliberate "embedding tax" target**. The lesson from
-recent small models:
+The lesson from recent small models, for context:
 
 - **LFM2-700M** showed that small models should put their parameters into
   *blocks* (~85 %), not vocabulary — capacity in the reasoning machinery pays
@@ -340,31 +318,26 @@ recent small models:
   left **~63 %** of parameters tied up in the embedding — an "embedding
   catastrophe" where most of the model is a dictionary, not a thinker.
 
-OSRT's ~16.6 % sits firmly in the LFM2 regime, and **tying** is what keeps it
-there: an untied 64K×1536 head would roughly *double* the embedding tax. The
-choice of a 64K (not 128K+) vocabulary is the other half of the same bet.
-
-> **Caveat on totals**: do **not** read `model.py:23`'s docstring figure
-> (`362,720,259`) as the model total — that docstring describes the **default
-> `OSRTConfig`** (vocab 32,768, MHA, no MTP), *not* the 605M preset. For the
-> preset, regenerate with `PYTHONPATH=src python scripts/compute_budget.py`
-> (`compute_budget.py:14`).
+OSRT's 7.8 % sits well inside the LFM2 regime, and **tying** is what keeps it
+there: an untied 49K×1536 head would double the embedding tax to ~15 %. The
+choice of a ~49K (not 128K+) vocabulary is the other half of the same bet
+(roadmap §16, gate G2).
 
 ---
 
 ## Summary
 
-- The **tokenizer** is byte-level BPE (`train_tokenizer.py:233-237`); the
-  **embedding** is a single `49,280 × 1,536` matrix,
-  **weight-tied** as the LM head (`model.py:1658`), saving ~100M params.
-- **Embedding tax ≈ 16.6 %** of ~601M physical — the LFM2 "params into blocks"
+- The **tokenizer** is SmolLM2's byte-level BPE plus the 32 OSRT specials
+  (`scripts/build_tokenizer_v7.py`, shipped in `tokenizer/`); the
+  **embedding** is a single `49,280 × 1,536` matrix, **weight-tied** as the
+  LM head, saving ~76M params.
+- **Embedding tax ≈ 7.8 %** of 968M physical — the LFM2 "params into blocks"
   regime, far from Gemma-3-270M's ~63 % embedding catastrophe.
-- **Live discrepancies to fix** (code/file vs `ARCHITECTURE.md`):
-  1. Tokenizer on disk is **32K**, model is built for **64K** — IDs 32768–65535
-     are dead embedding rows until the tokenizer is retrained.
-  2. Special tokens **14–20** (tool-use + multimodal) are **not on disk**; those
-     strings byte-BPE into fragments → silent mis-tokenization for tool/vision.
-  3. There are **no reserved IDs 21–31**; real (non-special) tokens start at
-     **ID 14**, contra ARCHITECTURE.md §3.2.
-  4. Embedding init is **`normal_(std=0.02)`**, not truncated-normal 0.0255; and
-     there is **no √1536 μP logit scaling**, contra ARCHITECTURE.md §4.2.
+- The v6 discrepancy list that used to sit here (a 32K tokenizer on disk
+  under a 64K model, special tokens 14–20 missing, no reserved ids) is
+  resolved by the v7 tokenizer: 49,184 real tokens in a 49,280-row matrix,
+  the 32 specials at ids 49,152–49,183, checked at load time by
+  `tokenizer_contract.validate_tokenizer_contract`.
+- Still true and worth knowing: the embedding uses a plain normal init and
+  there is no √dim logit scaling — `src/osrt/` is ground truth where
+  `ARCHITECTURE.md` says otherwise.

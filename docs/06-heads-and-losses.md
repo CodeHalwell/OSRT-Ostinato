@@ -86,8 +86,8 @@ into vectors at the input turns vectors back into token scores at the output.
 
 Why tie? The embedding matrix is the single largest tensor in the model —
 `compute_budget.py` reports the `embedding` category (input embedding + the tied
-LM head, counted once) at **100,690,944 params** (~100.7M), ~17% of the 601M
-physical budget. An untied LM head would *double* that to ~200M for no quality
+LM head, counted once) at **75,694,080 params** (~75.7M), ~7.8% of the 968M
+physical budget. An untied LM head would *double* that to ~151M for no quality
 gain at this scale. Tying also couples "what a token means as input" to "what
 predicting that token requires," which is a mild but real inductive prior.
 
@@ -543,7 +543,7 @@ From `scripts/compute_budget.py` on the canonical `OSRT_V7` preset:
 
 | Head / component        | Params       | Inference-active? | Notes |
 |-------------------------|--------------|-------------------|-------|
-| Tied LM head            | (in embedding, 100,690,944) | yes | shares `embedding.weight`; counted once in the `embedding` category |
+| Tied LM head            | (in embedding, 75,694,080) | yes | shares `embedding.weight`; counted once in the `embedding` category |
 | Per-loop aux heads (×5) | **0**        | n/a (train-only)  | reuse `norm_out` + tied embedding |
 | MTP heads (×2)          | **4,721,664** | **no** (dropped at deploy) | each is `RMSNorm(1536) + Linear(1536,1536)` |
 
@@ -555,10 +555,10 @@ Takeaways:
 - **The MTP heads cost ~4.72M params, all training-only.** They are excluded
   from the active-per-token count (`compute_budget.py:71-72`) and droppable at
   deployment, so they buy denser training signal at **zero** inference cost.
-- For reference, `compute_budget.py` reports the full preset at **~601M physical
-  / ~278M active per token** (46.3% of physical). (The preset is *branded*
-  "605M / 288M" in `presets.py:21`; that label is slightly stale — the live
-  budget script is authoritative at ~601M / ~278M.)
+- For reference, `compute_budget.py` reports the full preset at
+  **968,468,355 physical / 263,035,779 active per token** (27.2% of physical).
+  No count appears in the preset's name by rule (`CLAUDE.md`); the live budget
+  script is the only source for these numbers.
 
 ---
 

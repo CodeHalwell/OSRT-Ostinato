@@ -213,6 +213,10 @@ def test_pull_latest_starts_clean_only_when_repo_is_missing(hub):
     _http_error(HfHubHTTPError, 401, "Unauthorized"),
     _http_error(HfHubHTTPError, 403, "Forbidden"),
     _http_error(HfHubHTTPError, 503, "Service Unavailable"),
+    # huggingface_hub raises RepositoryNotFoundError for a 401 on a private
+    # repo (missing/wrong token) too — only a real 404 may start clean.
+    _http_error(RepositoryNotFoundError, 401, "Invalid username or password."),
+    _http_error(RepositoryNotFoundError, 403, "Forbidden"),
     OSError("network is unreachable"),
 ])
 def test_pull_latest_raises_on_anything_but_a_missing_repo(hub, err):
@@ -256,7 +260,7 @@ def test_daemon_seeds_pushed_from_remote_and_uploads_only_new_files(hub):
     d = sync.start_push_daemon(REPO, hub.ckpt_dir, "osrt", interval=1)
 
     assert api.created == 1
-    assert d.pushed == {"osrt_step_100.pt", "wandb_run_id.txt"}
+    assert d.pushed == {"osrt_step_100.pt"}      # side files are not seeded by name
     assert len(_StubThread.started) == 1 and d.thread is _StubThread.started[0]
     # the write probe is the only write so far, and it cleaned up after itself
     assert api.uploads == [sync._PROBE_NAME]
@@ -264,9 +268,17 @@ def test_daemon_seeds_pushed_from_remote_and_uploads_only_new_files(hub):
     assert sync._PROBE_NAME not in api.files
 
     assert d.sync_once() is True
-    assert api.uploads[1:] == ["osrt_step_200.pt"]   # the pulled file stayed put
+    # the pulled checkpoint stayed put; the side file goes up once, by content
+    assert api.uploads[1:] == ["osrt_step_200.pt", "wandb_run_id.txt"]
     assert d.sync_once() is True
-    assert api.uploads[1:] == ["osrt_step_200.pt"]   # and nothing re-uploads
+    assert api.uploads[1:] == ["osrt_step_200.pt", "wandb_run_id.txt"]   # no re-uploads
+    # An explicit --wandb-run-id rewrites the side file under a name the
+    # remote already had: a name-only check never re-sent it (Codex, PR #2).
+    with open(os.path.join(hub.ckpt_dir, "wandb_run_id.txt"), "w") as fh:
+        fh.write("run-b\n")
+    assert d.sync_once() is True
+    assert api.uploads[1:] == ["osrt_step_200.pt", "wandb_run_id.txt",
+                               "wandb_run_id.txt"]
 
 
 def test_write_probe_failure_raises_before_any_thread_starts(hub):
@@ -356,6 +368,13 @@ def test_flush_covers_final_failed_and_side_files_and_skips_remote(hub):
     assert api.uploads[0] == "osrt_step_18000.pt"
     assert set(api.uploads) == {"osrt_step_18000.pt", "osrt_failed_step_7.pt",
                                 "osrt_final.pt", "wandb_run_id.txt"}
+
+
+def test_flush_resends_side_files_the_remote_already_names(hub):
+    api = hub.use(_FakeApi(files=["osrt_step_100.pt", "wandb_run_id.txt"]))
+    hub.local("osrt_step_100.pt", "wandb_run_id.txt")
+    assert sync.flush(REPO, hub.ckpt_dir, "osrt") is True
+    assert api.uploads == ["wandb_run_id.txt"]
 
 
 def test_flush_returns_false_when_the_repo_is_unreachable(hub):

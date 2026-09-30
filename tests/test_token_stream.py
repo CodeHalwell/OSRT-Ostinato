@@ -171,6 +171,49 @@ def test_dead_stream_is_dropped_and_the_other_continues(monkeypatch, tok, capsys
     assert sd["dead"] == ["B"] and sd["tokens_seen"][1] == 0
 
 
+def test_source_unreachable_at_startup_is_dead_and_the_rest_continue(
+    monkeypatch, tok, capsys,
+):
+    """`load_dataset` failing for one source (renamed/gated dataset, outage at
+    launch) used to abort the whole loader before a single batch; it is now
+    the same dead-source path as a mid-run failure. (Copilot review on PR #2.)"""
+    calls: list[str] = []
+
+    def _load(hf_id, **kw):
+        calls.append(hf_id)
+        if hf_id == "B":
+            raise ConnectionError("simulated: dataset unreachable")
+        return Dataset.from_list(_text_rows("alpha", 60)).to_iterable_dataset(
+            num_shards=4)
+
+    monkeypatch.setattr(datasets, "load_dataset", _load)
+    cfgs = [{"name": "A", "hf_id": "A", "weight": 0.5},
+            {"name": "B", "hf_id": "B", "weight": 0.5}]
+    stream = TokenStream(cfgs, 16, TOK, seed=0)
+    chunks = _take(stream, 10)
+    assert stream.dead_sources == ["B"]
+    texts = [tok.decode(d) for d in _docs(_flat(chunks))]
+    assert texts and all(t.startswith("alpha document") for t in texts)
+    out = capsys.readouterr().out
+    assert "SOURCE DEAD: B" in out and "unreachable at startup" in out
+    assert "live weights now: A=100.0%" in out
+    assert calls.count("B") == 5                 # _open_base's bounded attempts
+    assert stream.state_dict()["dead"] == ["B"]
+
+
+def test_every_source_unreachable_at_startup_raises_data_source_dead(monkeypatch):
+    def _load(hf_id, **kw):
+        raise ConnectionError("simulated: hub down")
+
+    monkeypatch.setattr(datasets, "load_dataset", _load)
+    cfgs = [{"name": "A", "hf_id": "A", "weight": 0.5},
+            {"name": "B", "hf_id": "B", "weight": 0.5}]
+    stream = TokenStream(cfgs, 16, TOK, seed=0)
+    with pytest.raises(DataSourceDead) as info:
+        next(iter(stream))
+    assert sorted(info.value.sources) == ["A", "B"]
+
+
 def test_all_sources_dead_raises_within_bounded_picks(monkeypatch):
     calls = _install(monkeypatch, {"A": _Poison(), "B": _Poison()})
     cfgs = [{"name": "A", "hf_id": "A", "weight": 0.5},
