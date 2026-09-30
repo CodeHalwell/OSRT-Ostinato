@@ -190,6 +190,8 @@ _STRICT_TRAIN_RECIPE_KEYS = (
     "optimizer_name", "muon_lr", "muon_min_lr", "muon_momentum",
     "per_head_muon", "muon_ns_steps", "muon_ns_stable_steps",
     "muon_update_rms",
+    "router_gumbel_tau_init", "router_gumbel_tau_final",
+    "router_gumbel_anneal_steps",
 )
 
 # Dataset-entry fields that define WHAT is trained on. Order-insensitive keys
@@ -284,18 +286,30 @@ def _model_shape_metadata(cfg) -> dict:
     }
 
 
-def _legacy_gate_semantics_apply(model_config) -> bool:
+def _legacy_gate_semantics_apply(model_config, train_cfg=None, step=None) -> bool:
     """True when a checkpoint written before `router_bias_in_gates` existed
     (2026-09-30) would compute a different function under this config: those
     checkpoints took their gates from the bias-adjusted, Gumbel-noised
     selection distribution (today's `True`), so the difference is real
-    whenever the balance bias or Gumbel exploration is in play."""
+    whenever the balance bias or Gumbel exploration is in play.
+
+    Gumbel is judged from the TRAINING config: the trainer drives every MoE's
+    `gumbel_tau` buffer from `get_router_gumbel_tau(step, train_cfg)`, while
+    the model config's own `router_gumbel_tau_init` normally stays 0.0. With
+    the checkpoint's step known, the schedule is evaluated there — a run
+    resumed after the anneal reached zero trains on with no noise under
+    either setting; without it, any positive tau in the schedule counts.
+    """
     if getattr(model_config, "router_bias_in_gates", False):
         return False
-    return bool(
-        getattr(model_config, "router_balance_bias_enabled", True)
-        or getattr(model_config, "router_gumbel_tau_init", 0.0) > 0
-    )
+    if getattr(model_config, "router_balance_bias_enabled", True):
+        return True
+    if train_cfg is not None and hasattr(train_cfg, "router_gumbel_tau_init"):
+        if step is not None:
+            return get_router_gumbel_tau(int(step), train_cfg) > 0
+        return max(train_cfg.router_gumbel_tau_init,
+                   train_cfg.router_gumbel_tau_final) > 0
+    return getattr(model_config, "router_gumbel_tau_init", 0.0) > 0
 
 
 def assert_no_resume_drift(
@@ -361,7 +375,7 @@ def assert_no_resume_drift(
         # optimizer state and the loss curve. Treat the absent key as True.
         if (
             (not saved_shape or "router_bias_in_gates" not in saved_shape)
-            and _legacy_gate_semantics_apply(model_config)
+            and _legacy_gate_semantics_apply(model_config, train_cfg, ckpt.get("step"))
         ):
             legacy_gates = True
             _diff({"router_bias_in_gates": True},

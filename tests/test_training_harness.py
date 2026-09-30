@@ -132,7 +132,8 @@ def test_recipe_metadata_carries_phase_plan_and_tokenizer_digest():
     meta = _training_recipe_metadata(PretrainConfig(), TOKENIZER_DIR)
     assert "phase_plan" in meta and "tokenizer_sha256" in meta
     assert len(meta["tokenizer_sha256"]) == 64
-    for key in ("muon_lr", "muon_min_lr", "optimizer_name", "lr_schedule"):
+    for key in ("muon_lr", "muon_min_lr", "optimizer_name", "lr_schedule",
+                "router_gumbel_tau_init", "router_gumbel_anneal_steps"):
         assert key in meta
     # operational knobs and the (rescalable) micro-batch shape are NOT recipe
     assert "dataloader_num_workers" not in meta
@@ -201,6 +202,23 @@ def test_drift_guard_treats_a_missing_gate_flag_as_the_old_true(monkeypatch):
     with pytest.raises(RuntimeError, match="router_bias_in_gates"):
         assert_no_resume_drift({}, model_config=OSRTConfig(
             **kw, router_balance_bias_enabled=False, router_gumbel_tau_init=1.0))
+    # Gumbel is driven by the TRAINING config's schedule, not the model
+    # config's field (which normally stays 0.0): with the bias off, the
+    # default PretrainConfig schedule (0.5 -> 0 over 4,000 steps) still means
+    # the legacy checkpoint's gates were noised. (Codex review on PR #2.)
+    nobias = OSRTConfig(**kw, router_balance_bias_enabled=False)
+    with pytest.raises(RuntimeError, match="router_bias_in_gates"):
+        assert_no_resume_drift({"model_shape": old_shape}, model_config=nobias,
+                               train_cfg=PretrainConfig())
+    with pytest.raises(RuntimeError, match="router_bias_in_gates"):
+        assert_no_resume_drift({"model_shape": old_shape, "step": 100},
+                               model_config=nobias, train_cfg=PretrainConfig())
+    # ... unless the schedule is silent, or had already annealed to zero at
+    # the checkpoint's step, in which case the remaining steps agree
+    assert_no_resume_drift({"model_shape": old_shape}, model_config=nobias,
+                           train_cfg=PretrainConfig(router_gumbel_tau_init=0.0))
+    assert_no_resume_drift({"model_shape": old_shape, "step": 10_000},
+                           model_config=nobias, train_cfg=PretrainConfig())
     # a checkpoint stamped by this code carries the flag and is compared as-is
     new = {"model_shape": _model_shape_metadata(current)}
     assert_no_resume_drift(new, model_config=current)
