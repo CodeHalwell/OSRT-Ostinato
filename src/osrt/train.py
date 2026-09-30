@@ -408,6 +408,7 @@ def save_checkpoint(
     *,
     data_state: dict | None = None,
     tokenizer_name: str | None = None,
+    run_state: dict | None = None,
 ) -> None:
     """Save a training checkpoint.
 
@@ -436,6 +437,10 @@ def save_checkpoint(
                 _training_recipe_metadata(train_cfg, tokenizer_name)
                 if train_cfg else None),
             "data_state": data_state,
+            # Run-level counters that must survive the 23h chain (a limit
+            # "over the run" is meaningless if every continuation restarts
+            # it at zero): {"nonfinite_total": int}.
+            "run_state": run_state,
         },
         tmp_path,
     )
@@ -472,9 +477,9 @@ def load_checkpoint(
     train_cfg=None,
     tokenizer_name: str | None = None,
     stage: str | None = None,
-) -> tuple[int, dict | None]:
-    """Load from checkpoint. Returns (step to resume from, saved data state);
-    (0, None) if the path is missing.
+) -> tuple[int, dict | None, dict | None]:
+    """Load from checkpoint. Returns (step to resume from, saved data state,
+    saved run state); (0, None, None) if the path is missing.
 
     One `torch.load`: the drift check reads the metadata from the same dict
     the weights come from (the old code loaded a multi-GB file twice, once to
@@ -483,7 +488,7 @@ def load_checkpoint(
     splice two runs — and re-stamps the schedule tags from the current config
     (see `_stamp_schedule_tags`)."""
     if not os.path.exists(path):
-        return 0, None
+        return 0, None, None
     print(f"Resuming from {path}...")
     ckpt = torch.load(path, map_location=device, weights_only=True)
     assert_no_resume_drift(
@@ -507,9 +512,10 @@ def load_checkpoint(
         _stamp_schedule_tags(optimizer, train_cfg)
     start_step = ckpt["step"] + 1
     data_state = ckpt.get("data_state")
+    run_state = ckpt.get("run_state")
     print(f"  Resumed at step {start_step}"
           f"{' (data position restored)' if data_state else ''}")
-    return start_step, data_state
+    return start_step, data_state, run_state
 
 
 # Eval batches are materialised once per process and replayed on every
@@ -584,11 +590,21 @@ def run_eval(
         data_iter = iter(loader)
         cached = []
         t_mat = time.time()
-        for _ in range(eval_steps):
-            try:
-                cached.append(next(data_iter))
-            except StopIteration:
-                break
+        try:
+            for _ in range(eval_steps):
+                try:
+                    cached.append(next(data_iter))
+                except StopIteration:
+                    break
+        except DataSourceDead:
+            # The held-out set is a single source; leave the model as we
+            # found it and let the caller decide (the trainer skips the
+            # eval — nothing is cached, so the next interval retries).
+            if was_training:
+                model.train(True)
+            del data_iter
+            del loader
+            raise
         print(
             f"  [eval] materialised {len(cached)} held-out batches in "
             f"{time.time() - t_mat:.0f}s (cached for the rest of the process)",
@@ -1494,12 +1510,13 @@ def run_training(
 
     start_step = 0
     resume_data_state: dict | None = None
+    resume_run_state: dict | None = None
     if best_step > 0 and best_ckpt is not None:
         print(f"Found checkpoint at step {best_step}: {best_ckpt}")
         # Fails closed BEFORE the weights are applied: a months-long drip run
         # resumes many times, and a silent config change makes the loss curve
         # a splice of two experiments rather than one result.
-        start_step, resume_data_state = load_checkpoint(
+        start_step, resume_data_state, resume_run_state = load_checkpoint(
             model, optimizer, best_ckpt, device,
             model_config=model_config, train_cfg=train_cfg,
             tokenizer_name=tokenizer_name,
@@ -1529,7 +1546,13 @@ def run_training(
     run_status: str | None = None
     health_fail_streaks: dict[str, int] = {}   # criterion -> consecutive fails
     nonfinite_streak = 0
-    nonfinite_total = 0
+    # Carried across the 23h chain through the checkpoint's run_state, so the
+    # run-total cap means what it says (a fresh zero per continuation let an
+    # unstable run keep going as long as each session stayed under it).
+    nonfinite_total = int((resume_run_state or {}).get("nonfinite_total", 0) or 0)
+    if nonfinite_total:
+        print(f"  Resumed with {nonfinite_total} non-finite batch(es) on record",
+              flush=True)
     dead_sources_seen: list[str] = []
     max_nonfinite = max(1, getattr(train_cfg, "max_consecutive_nonfinite_steps", 5))
 
@@ -1553,6 +1576,7 @@ def run_training(
             model, optimizer, at_step, path,
             model_config=model_config, train_cfg=train_cfg,
             data_state=_data_state(), tokenizer_name=tokenizer_name,
+            run_state={"nonfinite_total": nonfinite_total},
         )
         vol.commit()
 
@@ -2057,20 +2081,33 @@ def run_training(
         # slow eval can never again cost a checkpoint (2026-09-02 trunk).
         # Fixed context/batch so the cached set is the same in every phase.
         if step > 0 and step % train_cfg.eval_interval == 0:
-            eval_metrics = run_eval(
-                model, tokenizer_name,
-                getattr(train_cfg, "eval_seq_len", current_seq_len),
-                getattr(train_cfg, "eval_batch_size", current_batch_size),
-                train_cfg.eval_steps, device,
-            )
-            print(
-                f"  EVAL step {step} | "
-                f"loss {eval_metrics['eval/loss']:.4f} | "
-                f"ppl {eval_metrics['eval/perplexity']:.1f}",
-                flush=True,
-            )
-            if use_wandb:
-                wandb.log(eval_metrics, step=step)
+            try:
+                eval_metrics = run_eval(
+                    model, tokenizer_name,
+                    getattr(train_cfg, "eval_seq_len", current_seq_len),
+                    getattr(train_cfg, "eval_batch_size", current_batch_size),
+                    train_cfg.eval_steps, device,
+                )
+            except DataSourceDead as e:
+                # An outage of the (single-source) held-out stream is not a
+                # reason to end production training: the numbered checkpoint
+                # is already saved, the DataSourceDead handler above covers
+                # only training batches, and an escaping exception would
+                # leave the launcher without a status. Skip this eval; the
+                # next interval retries because nothing was cached.
+                print(f"  [warn] EVAL step {step} skipped: held-out data "
+                      f"unavailable ({e})", flush=True)
+                if use_wandb:
+                    wandb.log({"eval/skipped": 1}, step=step)
+            else:
+                print(
+                    f"  EVAL step {step} | "
+                    f"loss {eval_metrics['eval/loss']:.4f} | "
+                    f"ppl {eval_metrics['eval/perplexity']:.1f}",
+                    flush=True,
+                )
+                if use_wandb:
+                    wandb.log(eval_metrics, step=step)
         # --- 23h Modal safety (rescue checkpoint + clean exit) ---
         # Rescue filename includes the step so resume scanner can rank it
         # against numbered checkpoints.

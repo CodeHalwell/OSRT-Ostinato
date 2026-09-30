@@ -157,7 +157,7 @@ cross-session checkpoints via `--hf-repo`. Needs `HF_TOKEN` and
 - **The streaming loader fails closed.** A source that keeps failing is
   dropped from the mix and reported (`train/dead_sources`); if every source is
   dead the run saves a rescue checkpoint and exits `data_dead` instead of
-  spinning. Chat-shaped rows render through `osrt.chat_format.render_chat`
+  spinning. A re-run retries every source (fix the data, relaunch). Chat-shaped rows render through `osrt.chat_format.render_chat`
   (the tokenizer's `chat_template` is the same contract); raw text never
   parses control tokens.
 - **Run a smoke/sanity variant before any real GPU spend.**

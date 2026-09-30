@@ -214,6 +214,31 @@ def test_every_source_unreachable_at_startup_raises_data_source_dead(monkeypatch
     assert sorted(info.value.sources) == ["A", "B"]
 
 
+def test_previously_dead_sources_are_retried_in_a_new_process(monkeypatch, tok, capsys):
+    """A data-dead rescue checkpoint records every source as dead; the
+    advertised recovery is "fix the data, re-run", so a new process must
+    reconnect them instead of failing on the spot. (Codex review on PR #2.)"""
+    _install(monkeypatch, {"A": _text_rows("alpha", 60), "B": _Poison()})
+    cfgs = [{"name": "A", "hf_id": "A", "weight": 0.5},
+            {"name": "B", "hf_id": "B", "weight": 0.5}]
+    first = TokenStream(cfgs, 16, TOK, seed=0)
+    _take(first, 20)
+    sd = first.state_dict()
+    assert sd["dead"] == ["B"]
+    # the outage is fixed: B serves rows now
+    _install(monkeypatch, {"A": _text_rows("alpha", 60), "B": _text_rows("beta", 60)})
+    second = TokenStream(cfgs, 16, TOK, seed=1, resume_state=sd)
+    chunks = _take(second, 30)
+    assert second.dead_sources == []
+    texts = [tok.decode(x) for x in _docs(_flat(chunks))]
+    assert any(t.startswith("beta document") for t in texts)
+    assert "previously dead, retrying in this process: B" in capsys.readouterr().out
+    # the data-dead rescue itself: every source recorded dead, all retried
+    third = TokenStream(cfgs, 16, TOK, seed=2, resume_state=dict(sd, dead=["A", "B"]))
+    _take(third, 5)
+    assert third.dead_sources == []
+
+
 def test_all_sources_dead_raises_within_bounded_picks(monkeypatch):
     calls = _install(monkeypatch, {"A": _Poison(), "B": _Poison()})
     cfgs = [{"name": "A", "hf_id": "A", "weight": 0.5},

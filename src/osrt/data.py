@@ -666,10 +666,11 @@ class TokenStream(IterableDataset):
     Resume: `state_dict()` (None before iteration starts, or in a DataLoader
     worker) captures each stream's `datasets` position within its current
     shuffled epoch, epoch count and shuffle seed, plus the token buffer,
-    per-stream token counts, the sampler RNG, the dead set and the mix
-    counts. Pass it back as `resume_state` to continue; shuffle-buffer
-    contents are legitimately lost on resume (see `datasets` docs), shard
-    and row progress are not.
+    per-stream token counts, the sampler RNG, the dead set (recorded for the
+    report; a new process retries every source) and the mix counts. Pass it
+    back as `resume_state` to continue; shuffle-buffer contents are
+    legitimately lost on resume (see `datasets` docs), shard and row
+    progress are not.
 
     Args:
         dataset_configs: List of dataset config dicts with hf_id, weight, etc.
@@ -806,14 +807,19 @@ class TokenStream(IterableDataset):
                 restored.append(st["name"])
             else:
                 fresh.append(st["name"])
-            if st["name"] in dead:
-                st["dead"] = True
-                self.dead_sources.append(st["name"])
+        # A source the previous process declared dead is NOT restored as
+        # dead: a new process is a fresh chance (the outage or credentials may
+        # have been fixed — that is the advertised "fix the data, then
+        # re-run" recovery). It is reconnected like any other source below,
+        # and declared dead again there if it still fails. Persisting the
+        # all-dead set of a data-dead rescue would otherwise make every
+        # re-run fail on the spot without a single connection attempt.
         print(
             "[DataWorker] resumed data position — restored: "
             + (", ".join(restored) or "none")
             + (f"; no saved position: {', '.join(fresh)}" if fresh else "")
-            + (f"; still dead: {', '.join(sorted(dead))}" if dead else "")
+            + (f"; previously dead, retrying in this process: "
+               f"{', '.join(sorted(dead))}" if dead else "")
             + f"; buffer={len(live['buffer'])} tokens",
             flush=True,
         )
@@ -1077,7 +1083,8 @@ class TokenStream(IterableDataset):
                 flush=True,
             )
 
-        # Connect every live stream (dead-on-resume sources are not reopened).
+        # Connect every stream. Every source gets a fresh attempt in a new
+        # process, including ones a previous process declared dead.
         # A source that cannot be opened even after `_open_base`'s retries is
         # declared dead like a mid-run failure would be, so one unavailable
         # dataset does not take the healthy ones down with it; when none can

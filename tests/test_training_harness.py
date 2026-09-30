@@ -32,6 +32,8 @@ from osrt.train import (
     _update_health_streaks,
     assert_no_resume_drift,
     get_lr,
+    load_checkpoint,
+    save_checkpoint,
 )
 from osrt.train_config import PretrainConfig
 
@@ -285,6 +287,28 @@ def test_loop_scope_ignores_router_criteria_but_full_scope_does_not():
     assert len(loop_f) == 2
     with pytest.raises(ValueError):
         _check_early_stop_criteria(1000, collapsed, cfg, mcfg, scope="router")
+
+
+def test_checkpoint_carries_run_state_and_load_returns_it(tmp_path):
+    """The non-finite total rides in the checkpoint so the run-total cap
+    survives the 23h chain. (Codex review on PR #2.)"""
+    from osrt.model import OSRTForCausalLM
+    cfg = OSRTConfig(
+        dim=32, heads=2, head_dim=16, num_kv_heads=1, vocab_size=64,
+        real_vocab_size=64, num_blocks=1, recursive_loops=1,
+        num_routed_experts=2, top_k_experts=1, expert_hidden=64,
+        shared_expert_hidden=64, max_position_embeddings=16,
+    )
+    model = OSRTForCausalLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = str(tmp_path / "osrt_step_3.pt")
+    save_checkpoint(model, opt, 3, path, run_state={"nonfinite_total": 7})
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    assert ck["run_state"] == {"nonfinite_total": 7}
+    cpu = torch.device("cpu")
+    assert load_checkpoint(model, opt, path, cpu) == (4, None, {"nonfinite_total": 7})
+    missing = str(tmp_path / "missing.pt")
+    assert load_checkpoint(model, opt, missing, cpu) == (0, None, None)
 
 
 def test_nonfinite_batches_retry_until_a_streak_or_total_cap():
