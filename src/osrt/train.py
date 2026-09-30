@@ -1083,6 +1083,23 @@ def _router_health_failures(
     return failures
 
 
+def _nonfinite_stop_reason(streak: int, total: int, cfg: PretrainConfig) -> str | None:
+    """Why a non-finite gradient norm should end the run, or None to retry.
+
+    A skipped batch is retried at the SAME step (the schedule and the budget
+    only advance on a real update), so two caps bound the retrying: this many
+    in a row means the optimisation has diverged, and this many over the whole
+    run means something is wrong even when the batches in between succeed."""
+    max_streak = max(1, getattr(cfg, "max_consecutive_nonfinite_steps", 5))
+    max_total = getattr(cfg, "max_total_nonfinite_batches", 0) or 0
+    if streak >= max_streak:
+        return f"{streak} consecutive non-finite gradient norms"
+    if max_total and total >= max_total:
+        return (f"{total} non-finite gradient norms over the run "
+                f"(limit {max_total})")
+    return None
+
+
 def _failure_key(failure: str) -> str:
     """The criterion a failure message belongs to: every message from
     `_check_early_stop_criteria` opens with its metric name."""
@@ -1797,20 +1814,26 @@ def run_training(
             _reset_router_balance_accumulators(model)
             print(
                 f"  [warn] non-finite grad norm ({grad_norm}) at step {step}: "
-                f"optimizer step skipped ({nonfinite_streak}/{max_nonfinite} "
-                f"consecutive, {nonfinite_total} total)",
+                f"batch discarded, step retried on the next one "
+                f"({nonfinite_streak}/{max_nonfinite} consecutive, "
+                f"{nonfinite_total} total)",
                 flush=True,
             )
-            if nonfinite_streak >= max_nonfinite:
-                print(
-                    f"\n>>> EARLY STOP at step {step}: {nonfinite_streak} "
-                    "consecutive non-finite gradient norms.",
-                    flush=True,
-                )
+            stop_reason = _nonfinite_stop_reason(
+                nonfinite_streak, nonfinite_total, train_cfg)
+            if stop_reason:
+                print(f"\n>>> EARLY STOP at step {step}: {stop_reason}.",
+                      flush=True)
                 _stop_failed("The optimisation has diverged.")
                 early_stop_triggered = True
                 run_status = "early_stop"
                 break
+            # No weights changed, so nothing below applies to this attempt:
+            # not the log line, not the health checks, not a checkpoint that
+            # would record the step as done, and not `step += 1` — the
+            # schedule and the token budget advance only on a real update.
+            # (Until 2026-09-30 a skipped step fell through to all of them.)
+            continue
 
         # Average snapshots once per step. Used for both logging and the
         # early-stop gate so both see the same grad-accum-averaged values.

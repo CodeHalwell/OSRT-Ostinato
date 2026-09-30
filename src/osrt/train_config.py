@@ -179,9 +179,12 @@ class PretrainConfig:
     # cannot end a 45-hour run; the gate step itself keeps one-shot semantics.
     continuous_health_checks: bool = True
     health_check_patience: int = 3
-    # A non-finite gradient norm skips the optimizer step (gradients are
-    # zeroed, nothing is written). This many in a row fails the run instead.
+    # A non-finite gradient norm discards the batch and retries the SAME step
+    # on the next one (gradients zeroed, nothing written, schedule and budget
+    # untouched). This many in a row fails the run instead, as does this many
+    # over the whole run even with good batches in between (0 = no total cap).
     max_consecutive_nonfinite_steps: int = 5
+    max_total_nonfinite_batches: int = 50
     peak_lr: float = 6e-4
     min_lr: float = 6e-5
     weight_decay: float = 0.3

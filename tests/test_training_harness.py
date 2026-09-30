@@ -23,6 +23,7 @@ from osrt.train import (
     _check_early_stop_criteria,
     _health_scope,
     _model_shape_metadata,
+    _nonfinite_stop_reason,
     _optimizer_lr_tags,
     _reset_router_balance_accumulators,
     _set_param_group_lrs,
@@ -284,6 +285,22 @@ def test_loop_scope_ignores_router_criteria_but_full_scope_does_not():
     assert len(loop_f) == 2
     with pytest.raises(ValueError):
         _check_early_stop_criteria(1000, collapsed, cfg, mcfg, scope="router")
+
+
+def test_nonfinite_batches_retry_until_a_streak_or_total_cap():
+    """A skipped batch retries the same step; only a streak or a run total
+    ends the run. (Codex review on PR #2: a skipped step used to fall
+    through to checkpointing and `step += 1`.)"""
+    cfg = PretrainConfig()
+    assert cfg.max_consecutive_nonfinite_steps == 5
+    assert cfg.max_total_nonfinite_batches == 50
+    assert _nonfinite_stop_reason(1, 1, cfg) is None
+    assert _nonfinite_stop_reason(4, 30, cfg) is None
+    assert "consecutive" in _nonfinite_stop_reason(5, 5, cfg)
+    assert "over the run" in _nonfinite_stop_reason(1, 50, cfg)
+    no_total = PretrainConfig(max_total_nonfinite_batches=0)
+    assert _nonfinite_stop_reason(1, 10_000, no_total) is None
+    assert "consecutive" in _nonfinite_stop_reason(5, 10_000, no_total)
 
 
 def test_health_patience_counts_the_same_criterion_not_any_failure():

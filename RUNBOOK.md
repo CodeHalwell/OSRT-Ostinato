@@ -64,7 +64,7 @@ The run **ends itself** and names the criterion:
 | step 5,000 (one-shot gate) | router sharpening, balance, pre-bias health, bias saturation, loop collapse, residual explosion |
 | every 50 steps after warmup | loop collapse, residual explosion |
 | every 50 steps after the gate | the whole set above |
-| every step | non-finite gradient norm (step skipped; 5 in a row fails the run) |
+| every step | non-finite gradient norm (batch discarded, step retried; 5 in a row or 50 over the run fails it) |
 | on resume | recipe / data-plan / tokenizer drift |
 
 A criterion must fail 3 consecutive checks (150 steps) to stop the run, except
