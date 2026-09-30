@@ -1127,7 +1127,14 @@ def _alias_checkpoint(src: str, dst: str) -> None:
     try:
         os.link(src, dst)
     except OSError:
-        shutil.copyfile(src, dst)
+        # Copy under a name that neither the resume scan (`{prefix}_step_*.pt`)
+        # nor the sync daemon (`_SYNC_RE`, which needs the `.pt` suffix)
+        # matches, then publish with an atomic rename — the same discipline
+        # save_checkpoint uses — so a multi-GB copy on a link-less volume never
+        # exposes a truncated alias for the daemon to upload as complete.
+        tmp = f"{dst}.tmp"
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
 
 
 @torch.no_grad()

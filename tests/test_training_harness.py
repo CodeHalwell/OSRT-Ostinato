@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 
 import pytest
 import torch
@@ -313,6 +314,35 @@ def test_alias_checkpoint_exposes_final_under_step_name(tmp_path):
     assert dst.read_bytes() == b"weights"
     _alias_checkpoint(str(src), str(dst))       # idempotent
     assert dst.read_bytes() == b"weights"
+
+
+def test_alias_checkpoint_copy_fallback_publishes_atomically(tmp_path, monkeypatch):
+    """On a volume that rejects hard links the alias is COPIED; the step name
+    must not exist until the copy is complete, or the sync daemon can upload a
+    truncated alias and mark it pushed. (Codex review on PR #2.)"""
+    src = tmp_path / "osrt_final.pt"
+    src.write_bytes(b"weights")
+    dst = tmp_path / "osrt_step_18000.pt"
+    seen: dict = {}
+    real_copy = shutil.copyfile
+
+    def no_link(*a, **k):
+        raise OSError("hard links not supported here")
+
+    def spy_copy(s_, d_, *a, **k):
+        seen["target"] = os.path.basename(d_)
+        seen["final_visible_during_copy"] = dst.exists()
+        return real_copy(s_, d_, *a, **k)
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(shutil, "copyfile", spy_copy)
+    _alias_checkpoint(str(src), str(dst))
+    assert dst.read_bytes() == b"weights"
+    assert seen["final_visible_during_copy"] is False
+    # the interim name matches neither the resume glob nor the sync regex
+    assert seen["target"] == "osrt_step_18000.pt.tmp"
+    assert not seen["target"].endswith(".pt")
+    assert not (tmp_path / "osrt_step_18000.pt.tmp").exists()
 
 
 def test_reset_router_balance_accumulators_zeroes_per_step_stats():
