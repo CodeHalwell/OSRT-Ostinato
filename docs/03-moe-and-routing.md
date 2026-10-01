@@ -9,14 +9,14 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-*Part of the OSRT-605M `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
+*Part of the OSRT `docs/` architecture series. Companion to `ARCHITECTURE.md §7`.*
 
 This document explains the **mixture-of-experts (MoE)** sub-block of the
-OSRT-605M model — the part that replaces the dense feed-forward network of a
+OSRT v7 model — the part that replaces the dense feed-forward network of a
 vanilla transformer with a small set of *experts* and a *router* that sends
 each token to only a few of them. Everything here is grounded in
 `src/osrt/model.py` (the `MoELayer` class, roughly lines 163–860) and the
-canonical preset `OSRT_605M_A288M` in `src/osrt/presets.py`.
+canonical preset `OSRT_V7` in `src/osrt/presets.py`.
 
 > **A note on ground truth.** Three sources describe this block and they do
 > *not* fully agree. The **code** wins. `ARCHITECTURE.md §7` contains stale
@@ -60,7 +60,7 @@ fold them together itself:
 return shared_out, moe_out
 ```
 
-For the OSRT-605M preset (`presets.py:22-64`) the numbers are:
+For the canonical `OSRT_V7` preset (`presets.py`) the numbers are:
 
 | Component       | Count | Hidden (`h`) | Active per token        |
 |-----------------|-------|--------------|-------------------------|
@@ -155,7 +155,7 @@ A few things worth teaching here:
   preset as the fallback for the G3 ladder's SiTU-vs-clamp A/B.
 - **`hidden` is rounded up to a multiple of 64** (`model.py:101`) for
   tensor-core alignment. Both preset widths (3,840 and 2,816) are already
-  multiples of 64, so nothing changes for OSRT-605M.
+  multiples of 64, so nothing changes for OSRT.
 
 Shapes per routed expert (preset): `w_gate, w_up ∈ ℝ^(1536×2112)`,
 `w_down ∈ ℝ^(2112×1536)` — 9,732,096 params per expert; `h2112 = 33 × 64`
@@ -710,36 +710,38 @@ zero.
 ## 12. Parameter and compute cost
 
 Do not hand-derive these — `scripts/compute_budget.py` is the source of
-truth. Running it on the canonical preset (`OSRT_605M_A288M`) reports:
+truth. Running it on the canonical preset (`OSRT_V7`) reports:
 
 ```
-cfg: dim=1536 vocab=65536 blocks=3 loops=6 kv_heads=8
-     experts=28 top_k=4 h_routed=2112 h_shared=3840 rank=256 mtp=2
+cfg: dim=1536 vocab=49280 blocks=3 loops=6 kv_heads=8 experts=28 top_k=4 h_routed=2112 h_shared=3840 rank=256 mtp=2 hra=off
 ----------------------------------------------------------------
-  embedding           100,690,944
+  embedding            75,694,080
   attention            17,308,032
-  shared_expert        38,928,384
-  routed_experts      424,673,280
-  router                   36,867
-  ...
+  shared_expert        53,084,160
+  routed_experts      817,496,064
+  router                  129,027
+  mtp_heads             4,721,664
+  loop_emb                 27,648
+  norms_misc                7,680
+----------------------------------------------------------------
   TOTAL PHYSICAL      968,468,355  (~968M)
-  ACTIVE / TOKEN      263,035,779  (~263M, 27.2% of physical, excl. MTP)
+  ACTIVE / TOKEN      263,035,779  (~263M, 27.2% of physical, inference — excl. MTP)
 ```
 
 Takeaways:
 
-- **Routed experts (424.67M) are ~71% of the physical model** — the dominant
-  term — yet only **top-4 of 28 = 14.3% of them** are active per token. That is
-  the whole MoE bargain: store a lot, compute a little.
-- The **shared expert is 38.93M** and the **router is tiny (36,867 params)** —
-  routing is nearly free; the cost is in the experts.
-- **Active per token is ~278M (46.3% of physical)** at inference, excluding the
-  training-only MTP heads.
+- **Routed experts (817.50M) are 84.4% of the physical model** — the dominant
+  term — yet only **top-4 of 28 = 14.3% of them** (116.79M) are active per
+  token. That is the whole MoE bargain: store a lot, compute a little.
+- The **shared expert is 53.08M** (17.69M per block, always on) and the
+  **router is tiny** (129,027 params: 3 × 1,536 × 28 plus one scalar
+  `moe_gate` per block) — routing is nearly free; the cost is in the experts.
+- **Active per token is 263.04M (27.2% of physical)** at inference, excluding
+  the training-only MTP heads.
 
-> **Stale preset docstring.** `presets.py` claims "~607M physical / ~288.3M
-> active" and ships an `OSRT_605M_A279M` alias. The *actual* `compute_budget`
-> output is **601M / 278M (46.3%)**. The headline name and docstring drifted
-> from a stale solve; trust the live `compute_budget.py` numbers above.
+> No parameter count appears in any name (`CLAUDE.md`): the v6 lineage's
+> names and docstrings drifted from the real count four different ways.
+> Regenerate this block from the script rather than editing it.
 
 ---
 

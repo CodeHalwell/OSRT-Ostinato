@@ -38,6 +38,16 @@ def test_mtp_off_by_default_is_bit_identical():
     # No MTP contribution / telemetry when disabled.
     assert model.last_mtp_loss is None
     assert model.last_mtp_losses == []
+    # "Bit-identical" made concrete: the training loss is exactly the task CE
+    # plus the router terms — nothing else is added when MTP is off.
+    cfg = model.config
+    expected = (
+        model.last_task_loss
+        + cfg.router_aux_loss_coeff * model.last_balance_loss_normalised
+        + cfg.router_z_loss_coeff * model.last_z_loss_normalised
+        + cfg.router_seq_balance_loss_coeff * model.last_seq_balance_loss_normalised
+    )
+    assert torch.allclose(out.loss.detach(), expected, atol=1e-6, rtol=1e-6)
 
 
 def test_mtp_modules_exist_when_enabled():

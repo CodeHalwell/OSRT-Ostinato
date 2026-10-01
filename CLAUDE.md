@@ -44,9 +44,15 @@ See `docs/specs/2026-08-11-v7-roadmap.md` §14. Summary:
 - Tokenizer: **SmolLM2-based, 49,280 padded / 49,184 real** — G2 resolved (§16)
 - **mHC: OFF** — decision stands (§12.3; its 2026-08-18 amendment keeps one
   G3 ladder slot as cheap insurance, so "off" is settled, not unrevisitable)
-- Quantile Balancing router bias — **required**, not optional (§14.6)
-- SiTU-GLU experts, per-head Muon, seq-balance 1e-4 — set in code per §14.1;
-  the **V4 Muon recipe (item 1.3) is the one §14.1 line not yet implemented**
+- Quantile Balancing router bias — **required**, not optional (§14.6). The
+  bias steers top-k **selection only**; gating weights come from the pre-bias
+  affinity (DeepSeek-V3 semantics, `router_bias_in_gates=False`). The router
+  itself runs in fp32 under autocast.
+- SiTU-GLU experts, per-head Muon, seq-balance 1e-4 — set in code per §14.1.
+  The V4 Muon recipe (item 1.3: 8+2 Newton–Schulz, update RMS 0.18, Nesterov)
+  is implemented; only its WD ∝ LR² variant is not. Under the update-RMS rule
+  `muon_lr` lives on the **AdamW scale** (3e-3, giving 5.4e-4 per element),
+  not the 0.02 the old shape heuristic needed — see `train_config.muon_lr`.
 
 Open: MTP head count (§15 — do **not** slim to 1), loops × blocks (G4).
 
@@ -56,9 +62,9 @@ Open: MTP head count (§15 — do **not** slim to 1), loops × blocks (G4).
 |---|---|---|
 | G8 | drafter accepted length on frozen v6 | **blocked**: `HallD/osrt-v6-ckpt` was absent from an authenticated HF listing on 2026-08-31 — locate the frozen v6 ckpt (Mac?) or G8 is dead |
 | G7 | do routed experts get FP8/NVFP4 kernels via grouped-GEMM? | before G3/G4; `probe_gpu.py` ready, needs the GPU box |
-| G3a | does the token requirement track active or total params? | blocks the trunk run; no harness yet |
+| G3a | does the token requirement track active or total params? | open; harness = the ladder (`scripts/launch_ladder.sh`, arms a/b/c/dense, `compute_budget.py --arm`). Per RUNBOOK it explains the trunk rather than gating it |
 | G2 | tokenizer bake-off | **resolved** — SmolLM2 + 32 OSRT specials (§16), shipped in `tokenizer/` |
-| G3/G4 | expert re-grain; loops × blocks | open; no ladder harness yet |
+| G3/G4 | expert re-grain; loops × blocks | open; ladder arms `g4` (4×5) and `hra` (E1 counter-arm) exist |
 
 The roadmap's §12 is an independent citation audit of §§4–6 — **read it before
 citing any external claim from this repo.** Three material errors were found.
@@ -93,9 +99,22 @@ roadmap cites them, labelled so nobody mistakes them for current.
 
 The design is committed and the trunk is one command — `modal run --detach app.py
 --trunk-run`, or the Colab notebook. Roadmap **§19** records every design bet
-and its falsifier; results are read against that. The collapse detectors run
-during the run. The ladder (`scripts/launch_ladder.sh`) is for explaining
-results afterwards, not gating them.
+and its falsifier; results are read against that. The health checks run
+during the run: the router-sharpening gate once at step 5,000, loop collapse /
+residual explosion on every logging step after warmup, and the whole set on
+every logging step after the gate (a criterion failing 3 consecutive
+checks stops the run; unrelated one-off blips do not add up). The
+ladder (`scripts/launch_ladder.sh`) is for explaining results afterwards, not
+gating them.
+
+Resume is fail-closed: every checkpoint stamps the training recipe (schedule,
+Muon/AdamW LRs, phase plan with tokens/step, tokenizer sha), the model identity
+(shape and `router_bias_in_gates`; a checkpoint from before that flag existed
+counts as `True`) and the loader's
+data position; a resumed session that disagrees stops with a diff. A
+deliberate mid-run change needs `OSRT_ALLOW_RECIPE_DRIFT=1`. `run_training`
+returns a status (`complete` / `already_complete` / `early_stop` / `rescued` /
+`data_dead`) that the launchers act on.
 
 ## Environment & commands
 
@@ -130,9 +149,17 @@ cross-session checkpoints via `--hf-repo`. Needs `HF_TOKEN` and
   rejected outright.
 - **Third-party paper PDFs are gitignored** — arXiv's default licence grants no
   redistribution right. Cite the arXiv ID.
-- **Stability features are load-bearing:** QK-norm, sandwich RMSNorm, per-loop
-  routing accounting, aux-loss-free balancing, SwiGLU clamp. Don't remove them
-  to "simplify" without understanding the failure they prevent.
+- **Stability features are load-bearing:** QK-norm, pre-norm on both
+  sub-blocks plus the RMSNorm reset between loops (the docs' "sandwich norm";
+  there is no post-sub-block norm), per-loop routing accounting,
+  aux-loss-free balancing, SiTU-GLU / SwiGLU clamp. Don't remove them to
+  "simplify" without understanding the failure they prevent.
+- **The streaming loader fails closed.** A source that keeps failing is
+  dropped from the mix and reported (`train/dead_sources`); if every source is
+  dead the run saves a rescue checkpoint and exits `data_dead` instead of
+  spinning. A re-run retries every source (fix the data, relaunch). Chat-shaped rows render through `osrt.chat_format.render_chat`
+  (the tokenizer's `chat_template` is the same contract); raw text never
+  parses control tokens.
 - **Run a smoke/sanity variant before any real GPU spend.**
 
 ## Where to read more

@@ -41,6 +41,24 @@ OSTINATO_ROLE_TOKEN_IDS = {
     "pad_token_id": 49154,
 }
 
+# The 32 OSRT special strings, in id order (49152..49183): the four base
+# tokens, then the 28 `extra_special_tokens` of tokenizer/tokenizer_config.json.
+# `osrt.chat_format.encode_with_markers` splits text on exactly these, so a
+# marker embedded by a formatter always becomes its single id while SmolLM2's
+# 17 legacy control strings (`<|endoftext|>`, `<|im_end|>`, `<file_sep>`, ...)
+# in raw web text tokenize as ordinary text.
+OSTINATO_SPECIAL_TOKENS: tuple[str, ...] = (
+    "<|begin_of_text|>", "<|end_of_text|>", "<|padding|>", "<|unknown|>",
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+    "<|think|>", "<|/think|>", "<|answer|>", "<|/answer|>",
+    "<|user|>", "<|assistant|>", "<|system|>", "<|end_turn|>",
+    "<|tool_call|>", "<|/tool_call|>", "<|tool_result|>", "<|/tool_result|>",
+    "<|image|>", "<|audio|>",
+    *(f"<|reserved_{i}|>" for i in range(21, 32)),
+)
+OSTINATO_FIRST_SPECIAL_ID = 49152
+assert len(OSTINATO_SPECIAL_TOKENS) == 32
+
 
 def validate_tokenizer_contract(
     tokenizer: _Tokenizer,

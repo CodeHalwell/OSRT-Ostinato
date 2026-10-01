@@ -9,7 +9,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-> Part of the OSRT-605M `docs/` architecture series. This chapter explains how
+> Part of the OSRT `docs/` architecture series. This chapter explains how
 > the trained model actually turns a prompt into text: the two phases of
 > generation (prefill and decode), the unusual *latent-only* KV cache (KDV,
 > Key-Derived Value), the CPU-GPU-sync-aware standard decode loop, sampling,

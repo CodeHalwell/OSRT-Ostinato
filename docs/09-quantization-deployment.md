@@ -9,8 +9,8 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-> Part of the OSRT-605M `docs/` architecture series. This chapter explains how a
-> **601M-parameter mixture-of-experts model** is squeezed down to run on small /
+> Part of the OSRT `docs/` architecture series. This chapter explains how a
+> **968M-parameter (physical) mixture-of-experts model** is squeezed down to run on small /
 > edge hardware (phones, a Raspberry Pi 5): the deployment memory budget and why
 > the routed experts dominate it, the **implemented** int4 KV-cache quantizer in
 > `src/osrt/quant.py`, the **planned** AlphaQ expert quantization, the full
@@ -26,17 +26,18 @@ int4 KV quantizer is code. The int8 base and FP4/AlphaQ expert quantization are
 is labelled IMPLEMENTED or PLANNED, and section 7 has the full table. Where the
 code and the spec disagree, the code wins and the discrepancy is flagged.
 
-A naming note. The `docs/` series brands the model **OSRT-605M**;
-`compute_budget.py` reports **968,468,355 physical parameters** ("~968M"); and
-`ARCHITECTURE.md §2.5` brands it "OSRT-600M". These are the same model — the
-suffix is a round marketing label, not a precise count. This document uses the
-exact figure **601M physical** for all memory math.
+A naming note. The v6 lineage put parameter counts in names (OSRT-605M,
+"OSRT-600M") and the counts drifted; v7 does not, and `scripts/compute_budget.py`
+is the only source for any count. This document uses its v7 output —
+**968,468,355 physical / 263,035,779 active** — for all memory math. Where an
+older chapter or `ARCHITECTURE.md` quotes a different figure it is a v6 number;
+regenerate, do not average.
 
 ---
 
-## 1. Purpose — getting a 601M MoE onto edge hardware
+## 1. Purpose — getting a 968M MoE onto edge hardware
 
-OSRT is a mixture-of-experts model. Its *physical* parameter count (601M) is
+OSRT is a mixture-of-experts model. Its *physical* parameter count (968M) is
 large because it stores many routed experts, but only a fraction
 (~263M, 27%) is *active* per token — the router picks the top-4 of 28 experts per
 MoE block (`compute_budget.py` reports `ACTIVE / TOKEN 263,035,779`). That gap
@@ -45,15 +46,15 @@ is the whole point of MoE: lots of stored knowledge, cheap per-token compute.
 But "cheap compute" does not mean "cheap memory". On a phone or a Pi, **every
 stored weight has to live in RAM** (you cannot fault a top-4 expert in from disk
 at decode latency without an inference system that explicitly pages — see §6).
-At bf16, 601M params is ~1.2 GB of weights alone, before the KV cache and
+At bf16, 968M params is ~1.9 GB of weights alone, before the KV cache and
 activations. That is too big for a comfortable mobile resident set.
 
 Quantization is the answer: store each weight in fewer bits. The goal of this
-chapter's stack is to get the **resident weights to ~377 MB** as specified
+chapter's stack is to get the **resident weights to ~510 MB** as specified
 (§2), and down toward **~150–250 MB** with the aggressive levers (§6) — small
 enough to sit alongside an OS and an app. Two facts drive every decision:
 
-1. **The routed experts are ~71% of the physical weights** (424.7M of 601M).
+1. **The routed experts are ~84% of the physical weights** (817.5M of 968M).
    Whatever you do to them dominates the budget. Expert quantization is *the*
    deployment lever.
 2. **The KV cache grows with context** (`ARCHITECTURE.md §13.2`: 18 KB/token,
@@ -67,13 +68,13 @@ The real per-component parameter breakdown, straight from
 `scripts/compute_budget.py` (run `PYTHONPATH=src python3 scripts/compute_budget.py`):
 
 ```
-  embedding           100,690,944    (16.7%)
-  attention            17,308,032    ( 2.9%)
-  shared_expert        38,928,384    ( 6.5%)
-  routed_experts      424,673,280    (70.6%)   ← the dominant term
-  router                   36,867
-  adapters (HRA)       14,155,776    ( 2.4%)
-  mtp_heads             4,721,664    ( 0.8%)   ← DROPPED at deploy
+  embedding            75,694,080    ( 7.8%)
+  attention            17,308,032    ( 1.8%)
+  shared_expert        53,084,160    ( 5.5%)
+  routed_experts      817,496,064    (84.4%)   ← the dominant term
+  router                  129,027
+  mtp_heads             4,721,664    ( 0.5%)   ← DROPPED at deploy
+  loop_emb                 27,648
   norms_misc                7,680
   ----------------------------------------------
   TOTAL PHYSICAL      968,468,355    (~968M)
@@ -82,8 +83,9 @@ The real per-component parameter breakdown, straight from
 
 Two things to read off this table.
 
-**Routed experts are ~71% of the model.** (`compute_budget.py` reports 70.6%;
-`ARCHITECTURE.md §14.2` rounds to "71%". Either way the conclusion is the same.)
+**Routed experts are ~84% of the model.** (`compute_budget.py` reports 84.4%
+for the v7 shape; `ARCHITECTURE.md §14.2` rounds to 84%. v6's figure was 71%
+— the re-grain to 28 experts made the conclusion sharper, not different.)
 If you only quantize one thing aggressively, quantize these. Every other
 component combined is smaller than the routed experts alone.
 
@@ -93,43 +95,44 @@ tokens ahead). At inference you only need the main next-token head, so the MTP
 heads contribute **0 bytes** to the deployed model. The active-per-token figure
 above already excludes them.
 
-### The on-disk estimate (~377 MB, the as-specified stack)
+### The on-disk estimate (~510 MB, the as-specified stack)
 
 Applying the `ARCHITECTURE.md §14.1` per-component plan — int8 base, mixed-FP4
 routed experts, bf16 for the small sensitive bits — gives (`ARCHITECTURE.md
 §14.2`; decimal MB, 1 MB = 1,000,000 bytes, no allocator/metadata overhead):
 
 ```
-Embedding (int8, 100.7M × 1 byte)                    101 MB
+Embedding (int8, 75.7M × 1 byte)                      76 MB
 Attention (int8, 17.3M)                               17 MB
-Shared experts (int8, 38.9M)                          39 MB
-Routed experts (mixed FP4 @ ~3.5 bit avg, 424.7M):
-    424.7M × 3.5 bits / 8  ≈ 186 MB (+~2% AlphaQ meta) ~190 MB
-HRA adapters (bf16, 14.2M × 2 bytes)                  28 MB
-router + norms + loop_emb (bf16)                      ~2 MB
+Shared experts (int8, 53.1M)                          53 MB
+Routed experts (mixed FP4 @ ~3.5 bit avg, 817.5M):
+    817.5M × 3.5 bits / 8  ≈ 358 MB (+~2% AlphaQ meta) ~365 MB
+HRA adapter (post-training only; off in pretraining)   0 MB
+router + norms + loop_emb (bf16, 0.16M × 2 bytes)     <1 MB
 MTP heads (dropped at deploy)                          0 MB
   ----------------------------------------------------------
-TOTAL ON DISK / RESIDENT                             ~377 MB
+TOTAL ON DISK / RESIDENT                             ~510 MB
 ```
 
-The routed-expert row (~190 MB) is half the total even at 3.5 bits — exactly
-because they are 71% of the params. The embedding (101 MB) is the second-biggest
-target precisely because it is the next-largest component.
+The routed-expert row (~365 MB) is over 70% of the total even at 3.5 bits —
+exactly because they are 84% of the params. The embedding (76 MB) is the
+second-biggest target precisely because it is the next-largest component.
 
-### 377 MB vs the "~250 MB" headline — not a contradiction
+### 510 MB vs the "~250 MB" headline — different scenarios, and a v6 number
 
-`ARCHITECTURE.md §15.3` quotes a "~250 MB" total inference footprint (weights
-~150–200 MB + ~5 MB KV + ~50 MB activations). That is a **different scenario**,
-not a conflicting number:
+`ARCHITECTURE.md §15.3` used to quote a "~250 MB" total inference footprint
+(weights ~150–200 MB + ~5 MB KV + ~50 MB activations), derived for the v6
+shape. It describes a **different scenario**, not a conflicting number:
 
-- **~377 MB** = the full stack *exactly as specified* in §14.1 (int8 base,
-  FP4 routed at 3.5 bit, bf16 HRA). This is the honest baseline.
+- **~510 MB** = the full v7 stack *exactly as specified* in §14.1 (int8 base,
+  FP4 routed at 3.5 bit). This is the honest baseline.
 - **~150–250 MB** = the footprint *after* the tighter-envelope levers of §6
-  (routed → 2-bit, embedding → int4, HRA folded) and/or an active-only resident
-  loading scheme.
+  **and** an active-only resident loading scheme. With v7's 3× larger routed
+  pool the weight levers alone land near ~320 MB (§6 has the arithmetic); the
+  headline is only reachable with the residency assumption.
 
-Quote 377 MB when you mean "the spec'd weights"; quote ~150–250 MB when you mean
-"after we pull the aggressive levers". Always say which.
+Quote 510 MB when you mean "the spec'd weights"; quote ~150–250 MB only with
+the residency assumption stated. Always say which.
 
 ---
 
@@ -315,12 +318,12 @@ The core idea (`ARCHITECTURE.md §14.3`):
 
 The expected result is **near-lossless quality at a 3.5-bit average**
 (`ARCHITECTURE.md §14.3` cites AlphaQ results on Qwen1.5-MoE, a similar
-8-experts-per-block regime). Note this is *mixed* precision — the §14.1 table's
+fine-grained many-expert regime). Note this is *mixed* precision — the §14.1 table's
 "FP4 (MXFP4)" label is the base format, but AlphaQ then varies the per-expert
 bit-width 2/3/4 around it. Describe it as **mixed FP4**, not uniform FP4.
 
-This is where the ~190 MB routed-expert figure of §2 comes from
-(424.7M × 3.5 bits / 8). Until AlphaQ is coded, that figure is a *projection*.
+This is where the ~365 MB routed-expert figure of §2 comes from
+(817.5M × 3.5 bits / 8). Until AlphaQ is coded, that figure is a *projection*.
 
 ---
 
@@ -332,50 +335,52 @@ different thing. Only the last layer (int4 KV) is implemented today.
 | layer | format | what it buys | status |
 |---|---|---|---|
 | **Base weights** (embedding, attention, shared experts) | int8, symmetric per-channel | 2× over bf16 on the ~157M "dense" params; int8 is near-lossless for these | PLANNED |
-| **Routed experts** | mixed FP4 (MXFP4 + AlphaQ 2/3/4-bit) | the big win — ~5× over bf16 on the 71% term, ~190 MB | PLANNED |
+| **Routed experts** | mixed FP4 (MXFP4 + AlphaQ 2/3/4-bit) | the big win — ~5× over bf16 on the 84% term, ~365 MB | PLANNED |
 | **KV cache** | int4 TurboQuant (rotation + symmetric grid + nibble pack) | 4× over bf16 on the *runtime* cache; bounds context growth | IMPLEMENTED (`quant.py`, standalone) |
 | HRA adapters, router, loop-emb, norms | bf16 | kept full precision — small and sensitive | (no quant needed) |
 
 **Why each layer, and the order to apply them:**
 
-1. **int8 base first.** The embedding (101 MB after int8) and the dense
+1. **int8 base first.** The embedding (76 MB after int8) and the dense
    attention / shared-expert weights are large but tolerate int8 essentially
    losslessly with per-channel scales. This is the cheap, safe 2× — do it first.
 2. **FP4/AlphaQ on the routed experts** — the dominant lever. 4× to 5×
-   compression on 71% of the model, allocated so the experts that matter keep
-   their bits. This is what gets you from ~700 MB (int8-everything) down to
-   ~377 MB.
+   compression on 84% of the model, allocated so the experts that matter keep
+   their bits. This is what gets you from ~970 MB (int8-everything) down to
+   ~510 MB.
 3. **int4 KV at runtime, separately.** The KV cache is not a weight — it is
    produced during decode and quantized per-token by the caller. It does not
    change the on-disk weight size at all; it bounds the *runtime* memory so a
    long context does not dwarf the weights.
 
-**Leave alone:** HRA adapters (14.2M), router, loop embeddings, norms, and
-biases stay **bf16** (`ARCHITECTURE.md §14.1`). They are small (a few MB total)
-and quantization-sensitive — the HRA adapters carry the RL-tuned behaviour, the
-router decides expert selection, and norms/biases are numerically delicate.
+**Leave alone:** the post-training HRA adapter (v7 pretrains with HRA off),
+router, loop embeddings, norms, and biases stay **bf16** (`ARCHITECTURE.md
+§14.1`). They are small (router, norms and loop embeddings total under 1 MB;
+the adapter is a low-rank delta) and quantization-sensitive — the HRA adapter
+carries the post-training behaviour, the router decides expert selection, and
+norms/biases are numerically delicate.
 Spending bits to shrink them buys almost nothing and risks quality.
 
 ---
 
 ## 6. Levers to hit a tighter envelope (~150–250 MB)
 
-The ~377 MB stack of §2 is the spec'd baseline. To reach the ~150–250 MB
+The ~510 MB stack of §2 is the spec'd baseline. To reach the ~150–250 MB
 footprint of `ARCHITECTURE.md §15.3`, pull these levers in priority order
 (`ARCHITECTURE.md §14.2`):
 
-1. **Routed experts → 2-bit average (~190 MB → ~110 MB).** They are 71% of the
-   model, so this is the dominant lever by a wide margin. Halving their average
-   bit-width from 3.5 to ~2 saves ~80 MB — more than every other lever combined.
+1. **Routed experts → 2-bit average (~365 MB → ~210 MB).** They are 84% of the
+   model, so this is the dominant lever by a wide margin. Cutting their average
+   bit-width from 3.5 to ~2 saves ~155 MB — more than every other lever combined.
    The cost is quality: AlphaQ's whole point is to spend the bit budget where it
    matters, so a 2-bit average leans hard on light-tailed experts being cheap.
-2. **Embedding → int4 (101 MB → ~50 MB).** The embedding is the second-largest
+2. **Embedding → int4 (76 MB → ~38 MB).** The embedding is the second-largest
    component. int4 halves it again over int8; the tied embedding/LM-head is
    somewhat robust to this, but watch rare-token quality.
-3. **HRA adapters folded or int8'd (−28 MB).** Post-RL, the HRA adapters can be
-   **folded into the base weights** (they are low-rank deltas), eliminating the
-   28 MB entirely — or int8'd to ~14 MB if they must stay separate for further
-   tuning.
+3. **HRA adapter folded (0 MB).** v7 pretrains with HRA off, so the baseline
+   already carries no adapter bytes. If post-training ships a rank-256 adapter,
+   **fold it into the base weights** (it is a low-rank delta) rather than
+   shipping it in bf16 — or int8 it if it must stay separate for further tuning.
 
 A fourth, *system-level* lever: **active-only resident loading.** Load just the
 top-4 routed experts per layer into RAM and page the rest from disk/CPU. This is
@@ -383,10 +388,13 @@ an *inference-system* choice, not a *weight* choice — it changes the resident
 set, not the file size — so state the assumption explicitly when you quote a
 number that depends on it (`ARCHITECTURE.md §14.2`).
 
-Stacking levers 1–3: routed ~110 MB + embedding ~50 MB + int8 base (attention
-~17 + shared ~39) + folded HRA (0) + misc ~2 ≈ **~220 MB** of weights, which is
-how `§15.3` reaches its ~150–200 MB weight band (the low end assumes active-only
-residency or more aggressive routed bits).
+Stacking levers 1–3: routed ~210 MB + embedding ~38 MB + int8 base (attention
+~17 + shared ~53) + folded HRA (0) + misc <1 ≈ **~320 MB** of weights. That
+does **not** reach the ~150–200 MB weight band v6's `§15.3` quoted: the band was
+derived for v6's 424.7M routed pool, and v7's is 817.5M. Getting there needs the
+fourth lever. With only the top-4 of 28 experts resident per block (1/7 of the
+routed bytes) the stack is ~140 MB with levers 1–3 applied and ~200 MB with the
+baseline §2 formats. State the residency assumption whenever you quote either.
 
 ---
 
@@ -405,7 +413,7 @@ residency or more aggressive routed bits).
 **The one-line summary:** the int4 **KV-cache** quantizer is real, tested code
 (`src/osrt/quant.py`) — but it is a standalone utility a caller must invoke, not
 something the default model does. The int8 base and the FP4/AlphaQ **expert**
-quantization that actually shrink the *weights* to ~377 MB are **design intent
+quantization that actually shrink the *weights* to ~510 MB are **design intent
 in `ARCHITECTURE.md §14`, not yet implemented**.
 
 ---

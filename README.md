@@ -40,8 +40,9 @@ counts at once; this one states none.
 
 ## Quick start
 
-To actually launch runs, follow [`RUNBOOK.md`](RUNBOOK.md) — it sequences the
-probe, the launch gate and the ladder, and says what each result means.
+To actually launch runs, follow [`RUNBOOK.md`](RUNBOOK.md) — it says how to
+launch the trunk on Colab or Modal, what the run checks about itself while it
+trains, what to watch, and how to read the result.
 
 ### Local checks
 

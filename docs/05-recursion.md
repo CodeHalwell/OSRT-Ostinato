@@ -9,7 +9,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-> Part of the OSRT-605M `docs/` architecture series. This chapter explains how
+> Part of the OSRT `docs/` architecture series. This chapter explains how
 > the model gets deep without getting big: it runs **3 physical decoder blocks
 > 6 times** (recursive depth recurrence), how it keeps the six iterations from
 > collapsing into one, and the training machinery (loop embeddings, per-loop aux

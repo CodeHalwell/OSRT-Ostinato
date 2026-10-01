@@ -20,8 +20,34 @@ Assumption on record (roadmap §14.8), still open at gate G3a:
 from __future__ import annotations
 
 from osrt.config import OSRTConfig
+from osrt.tokenizer_contract import OSTINATO_SPECIAL_TOKEN_IDS as _TOK
+
+# Structural token ids of the v7 tokenizer (tokenizer/, SmolLM2 base + 32 OSRT
+# specials at 49,152+). OSRTConfig's own defaults are the v6 ids (0..13), which
+# in THIS tokenizer are SmolLM2's <|endoftext|>, <|im_start|>, <gh_stars>,
+# <jupyter_start>...; a model built from the preset alone used to inherit them
+# (generate() then stopped on <|im_end|>). The FIM ids are the three slots
+# between <|unknown|> and <|think|> in scripts/build_tokenizer_v7.py.
+assert _TOK["<|think|>"] == _TOK["<|unknown|>"] + 4, "tokenizer contract moved"
+OSRT_V7_TOKEN_IDS: dict = dict(
+    bos_token_id=_TOK["<|begin_of_text|>"],
+    eos_token_id=_TOK["<|end_of_text|>"],
+    pad_token_id=_TOK["<|padding|>"],
+    unk_token_id=_TOK["<|unknown|>"],
+    fim_prefix_id=_TOK["<|unknown|>"] + 1,
+    fim_middle_id=_TOK["<|unknown|>"] + 2,
+    fim_suffix_id=_TOK["<|unknown|>"] + 3,
+    think_open_id=_TOK["<|think|>"],
+    think_close_id=_TOK["<|/think|>"],
+    answer_open_id=_TOK["<|answer|>"],
+    answer_close_id=_TOK["<|/answer|>"],
+    user_token_id=_TOK["<|user|>"],
+    assistant_token_id=_TOK["<|assistant|>"],
+    system_token_id=_TOK["<|system|>"],
+)
 
 OSRT_V7: dict = dict(
+    **OSRT_V7_TOKEN_IDS,
     dim=1536,
     heads=24,
     head_dim=64,
@@ -116,32 +142,37 @@ def build_config(preset: dict = OSRT_V7, **overrides) -> OSRTConfig:
 # top_k x expert_hidden. Every arm therefore does identical per-token compute
 # and differs only in how much sparse capacity sits behind the router. If
 # loss-per-token is flat across the sweep, §14.8's assumption holds and the
-# committed 968M shape is safe; if it degrades with total, re-price before the
+# committed shape is safe; if it degrades with total, re-price before the
 # trunk run.
 #
-# The arms bracket v7's own ratio (3.68x): 1.83x / 2.98x / 5.26x.
+# The base is the TRUNK RECIPE at a smaller dim: everything not listed here
+# (SiTU-GLU, seq-balance, Quantile Balancing, sqrt-softplus affinity, MTP,
+# HRA off with the shared-expert reinvestment, the token ids) is inherited
+# from OSRT_V7, so an arm explains the trunk rather than a different model.
+# Until 2026-09-30 the base was a separate dict that had drifted (HRA on,
+# SiTU off, no seq-balance) and asked for expert_hidden=1056, which
+# model.py rounds up to 1088 — 1088 is now stated. Counts per arm come from
+# `scripts/compute_budget.py --arm <name>`, not from comments here.
 #
-# CAVEAT: the tied embedding is 41% of active here against 28.8% in v7 — the
-# vocab is fixed while dim shrinks, so it cannot be matched exactly at ladder
-# scale. Read the arms against each OTHER, not against v7's absolute numbers.
-_LADDER_BASE: dict = dict(
-    dim=1024, heads=16, head_dim=64, num_kv_heads=4,
-    vocab_size=49280, real_vocab_size=49184,
-    num_blocks=3, recursive_loops=6,
-    top_k_experts=4, expert_hidden=1056, shared_expert_hidden=1920,
-    adapter_rank=192, adapter_alpha=192.0,
-    swiglu_clamp=10.0, attention_sink=False, moe_grouped_gemm=True,
-    aux_loop_loss_weight=0.05, mtp_heads=2, mtp_loss_weight=0.3,
-    router_aux_loss_coeff=0.10, router_z_loss_coeff=1e-3,
-    router_balance_bias_enabled=True, router_balance_mode="quantile",
-    router_affinity="sqrt_softplus", max_position_embeddings=2048,
-)
+# CAVEAT: the tied embedding is a larger share of active here than in v7 —
+# the vocab is fixed while dim shrinks, so it cannot be matched exactly at
+# ladder scale. Read the arms against each OTHER, not against v7's numbers.
+_LADDER_BASE: dict = {
+    **OSRT_V7,
+    "dim": 1024, "heads": 16, "head_dim": 64, "num_kv_heads": 4,
+    "top_k_experts": 4, "expert_hidden": 1088,
+    # HRA-off reinvestment at this dim: 1920 + the adapters' all-active
+    # params (18 x 2 x 1024 x 192 = 3 x 3 x 1024 x 768) -> 2688.
+    "shared_expert_hidden": 2688,
+    "adapter_rank": 192, "adapter_alpha": 192.0,
+    "max_position_embeddings": 2048,
+}
 
 LADDER_ARMS: dict[str, dict] = {
     # name: experts. Active is constant; only total moves.
-    "a": {**_LADDER_BASE, "num_routed_experts": 14},   # 225M total, 1.83x
-    "b": {**_LADDER_BASE, "num_routed_experts": 28},   # 365M total, 2.98x
-    "c": {**_LADDER_BASE, "num_routed_experts": 56},   # 646M total, 5.26x
+    "a": {**_LADDER_BASE, "num_routed_experts": 14},
+    "b": {**_LADDER_BASE, "num_routed_experts": 28},
+    "c": {**_LADDER_BASE, "num_routed_experts": 56},
     # DENSE CONTROL at matched active compute: top-4 of 4 means every expert
     # is always on, so total == active and there is no sparsity. Required
     # because Krajewski et al. (roadmap §17.4) find MoE needs LONGER training
@@ -150,21 +181,19 @@ LADDER_ARMS: dict[str, dict] = {
     # and a "we are before the crossover" result look identical.
     "dense": {**_LADDER_BASE, "num_routed_experts": 4, "dense_control": True},
     # ── E1 (roadmap §18.1): do per-loop adapters add anything over grouping?
-    # Identical to arm a except the HRA adapters are absent — a pure shared
-    # layer, MoEUT-style. If this matches `a` within noise, the adapters are
-    # inert given that 3 blocks already ARE grouping (G=3), and v7 drops them.
-    # The adapters are ALL-ACTIVE params, so removing them removes compute; a
-    # bare ablation would confound "adapters help" with "8.8% more FLOPs help".
-    # Reinvest them one-for-one into the shared expert (also all-active):
-    # 1920 -> 2688 is exactly 7,077,888 params, matching a to the parameter
-    # on both total and FLOP-equivalent.
-    "nohra": {**_LADDER_BASE, "num_routed_experts": 14, "use_hra": False,
-              "shared_expert_hidden": 2688},
+    # Arm a WITH the HRA adapters and the shared expert shrunk back by the
+    # same all-active parameter count (2688 -> 1920), so a and hra match on
+    # total and FLOP-equivalent. E1 concluded (2026-09-02) that the no-HRA
+    # arm led by 1.5 nats; this arm is kept so the result stays reproducible.
+    "hra": {**_LADDER_BASE, "num_routed_experts": 14, "use_hra": True,
+            "shared_expert_hidden": 1920},
     # ── G4 with MoEUT's G=4 prior (roadmap §17.2): 4 blocks x 5 loops.
     # A fourth block carries its own attention + shared expert, so total and
     # compute cannot BOTH be held when block count changes. This shape holds
-    # both to within 2% (total -0.7%, FLOP-eq +1.8% vs a) at 20 effective
-    # layers vs a's 18: more distinct blocks, slightly smaller experts.
+    # both to within 2% of arm a (total +1.1%, FLOP-eq +0.2%, re-solved
+    # 2026-09-30 for the reinvested shared expert) at 20 effective layers vs
+    # a's 18: more distinct blocks, slightly smaller experts
+    # (tests/test_novelty_experiments pins the 2% and the 64-multiple).
     "g4": {**_LADDER_BASE, "num_blocks": 4, "recursive_loops": 5,
-           "num_routed_experts": 11, "expert_hidden": 960},
+           "num_routed_experts": 12, "expert_hidden": 896},
 }

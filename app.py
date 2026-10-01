@@ -7,12 +7,18 @@ runs the trunk, its 30-step gate, and the ladder arms.
 
     modal run --detach app.py --trunk-run        # THE run, detached, resumable
     modal run --detach app.py --trunk-run --hf-repo u/r   # ...also mirrored to HF
+    modal run --detach app.py --trunk-run --trunk-steps 2000 --micro-batch-scale 0.5
     modal run app.py --sanity                    # 30-step gate
-    modal run --detach app.py --arm a --spawn    # one ladder arm
+    modal run --detach app.py --arm a --spawn    # one ladder arm: a b c dense hra g4
 
     --detach is REQUIRED with --trunk-run / --spawn: without it the CLI stops the
     ephemeral app the moment the entrypoint returns and cancels the spawned call
     ("Stopping app - local entrypoint completed."). Bit the first ladder launch.
+
+The trunk is ~45 h against Modal's 24 h function ceiling: when the trainer
+returns "rescued" at the 23 h boundary, `trunk` spawns itself again with the
+same arguments, and every link logs to ONE W&B run whose id is persisted at
+/vol/trunk/wandb_run_id.txt (or given with --wandb-run-id).
 
 Each arm is a separate invocation on purpose: with N x $30 workspaces the arms
 run in parallel, one per workspace, and a arm that dies takes only itself down.
@@ -157,6 +163,7 @@ def v7_sanity(steps: int = 30) -> dict:
     launched explicitly, on a box, after G3a reports.
     """
     import os
+    import shutil
     import sys
 
     sys.path.insert(0, "/root/src")
@@ -168,7 +175,7 @@ def v7_sanity(steps: int = 30) -> dict:
     from osrt.model import OSRTForCausalLM
     from osrt.presets import OSRT_V7, build_config
     from osrt.train import run_training
-    from osrt.train_config import PretrainConfig
+    from osrt.train_config import V7SanityConfig
 
     steps = min(steps, 100)          # hard ceiling, not a default
 
@@ -196,24 +203,35 @@ def v7_sanity(steps: int = 30) -> dict:
           f"E={cfg.num_routed_experts} top-{cfg.top_k_experts} "
           f"situ_glu={cfg.situ_glu} balance={cfg.router_balance_mode}", flush=True)
 
-    train_cfg = PretrainConfig()
+    # V7SanityConfig IS the gate recipe (no W&B, no final save, 10-step ckpts);
+    # only the length is a parameter here.
+    train_cfg = V7SanityConfig()
     train_cfg.total_steps = steps
-    train_cfg.warmup_steps = max(steps // 5, 2)
+    if train_cfg.warmup_steps >= steps:
+        train_cfg.warmup_steps = max(steps // 5, 1)
+    # The phases are B200-sized (32K tokens per micro-batch, roadmap §13b) and
+    # OOM on this 80 GB H100. Quarter micro-batches, 4x accumulation: the same
+    # tokens per step, so the gate still exercises the committed recipe.
+    train_cfg.scale_micro_batches(0.25)
     train_cfg.dataloader_num_workers = 0  # workers SIGABRT at phase switch; see git log
-    train_cfg.wandb_log = False       # a 30-step gate is not a run worth logging
     ckpt_dir = "/vol/v7_sanity"
+    # A gate is a throwaway. V7SanityConfig checkpoints every 10 steps, and a
+    # leftover osrt_step_30.pt would make the next gate resume straight into
+    # "already_complete" without stepping once.
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     class _Vol:
         def commit(self) -> None:
             vol.commit()
 
-    run_training(
+    status = run_training(
         model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
         tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir,
     )
     vol.commit()
-    return {"stage": "v7_sanity", "steps": steps, "params": n}
+    print(f"[v7_sanity] run_training -> {status}", flush=True)
+    return {"stage": "v7_sanity", "steps": steps, "params": n, "status": status}
 
 
 @app.function(
@@ -223,13 +241,21 @@ def v7_sanity(steps: int = 30) -> dict:
     secrets=[modal.Secret.from_name("hf-secret"),
              modal.Secret.from_name("wandb-secret")],
 )
-def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
+def trunk(hf_repo: str = "", total_steps: int | None = None,
+          micro_batch_scale: float = 1.0, wandb_run_id: str = "") -> dict:
     """The v7 pretraining run. Committed without gates — see roadmap §19 for
     the bets this embodies and what would falsify each.
 
     Resumable by design: checkpoints land on the volume, so re-invoking picks
     up from the highest step. Set hf_repo to ALSO mirror them to a private HF
     repo, which is what lets the same run continue from Colab.
+
+    Chains itself across Modal's 24 h ceiling: when `run_training` returns
+    "rescued" (23 h boundary, `osrt_rescue_step_N.pt` written) this function
+    spawns itself again with the same arguments. No other status re-spawns.
+    One W&B run id is persisted at /vol/trunk/wandb_run_id.txt (minted on the
+    first invocation unless `wandb_run_id` is given) so every link of the
+    chain — and a Colab continuation via the HF mirror — logs to one run.
     """
     import os
     import sys
@@ -244,6 +270,12 @@ def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
     from osrt.tokenizer_contract import validate_tokenizer_contract
     from osrt.train import run_training
     from osrt.train_config import PretrainConfig
+    from osrt.train_main import persisted_wandb_run_id
+
+    # The previous link of the chain may still have been committing its rescue
+    # checkpoint when this container started: see the volume as it is NOW,
+    # before the resume scan (and before anything here opens a file on it).
+    vol.reload()
 
     tok = AutoTokenizer.from_pretrained("/root/tokenizer")
     validate_tokenizer_contract(tok)
@@ -259,48 +291,77 @@ def trunk(hf_repo: str = "", total_steps: int | None = None) -> dict:
     train_cfg = PretrainConfig()
     if total_steps is not None:
         train_cfg.total_steps = total_steps
+    # Tokens/step is what the resume drift check digests, and scaling holds
+    # it — so a run can move between the B200 (1.0) and a smaller card.
+    train_cfg.scale_micro_batches(micro_batch_scale)
     train_cfg.dataloader_num_workers = 0  # workers SIGABRT at phase switch; see git log
     train_cfg.wandb_run_name = "osrt-v7-trunk"
-    print(f"[trunk] {train_cfg.total_steps} steps ≈ "
-          f"{train_cfg.total_tokens()/1e9:.2f}B tokens | "
-          f"E={cfg.num_routed_experts} top-{cfg.top_k_experts} h{cfg.expert_hidden} | "
-          f"vocab {real}->{padded}", flush=True)
 
     ckpt_dir = "/vol/trunk"
     os.makedirs(ckpt_dir, exist_ok=True)
     sync = None
     if hf_repo:
         from scripts import hf_ckpt_sync as sync
+        # Also brings over wandb_run_id.txt when a Colab session minted it.
         sync.pull_latest(hf_repo, ckpt_dir, "osrt")
+    run_id = persisted_wandb_run_id(ckpt_dir, wandb_run_id or None)
+    vol.commit()  # the id file must outlive this container
+    train_cfg.wandb_run_id = run_id
+    if sync is not None:
+        # Fails fast (before any GPU time) if the token cannot write.
         sync.start_push_daemon(hf_repo, ckpt_dir, "osrt")
+    print(f"[trunk] {train_cfg.total_steps} steps ≈ "
+          f"{train_cfg.total_tokens()/1e9:.2f}B tokens | "
+          f"E={cfg.num_routed_experts} top-{cfg.top_k_experts} h{cfg.expert_hidden} | "
+          f"vocab {real}->{padded} | micro-batch x{micro_batch_scale} | "
+          f"wandb run {run_id}", flush=True)
 
     class _Vol:
         def commit(self) -> None:
             vol.commit()
 
     try:
-        run_training(model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
-                     tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir)
+        status = run_training(model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
+                              tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir)
     finally:
         vol.commit()
         if sync is not None:
             sync.flush(hf_repo, ckpt_dir, "osrt")
-    return {"stage": "trunk", "steps": train_cfg.total_steps}
+    print(f"[trunk] run_training -> {status}", flush=True)
+    result = {"stage": "trunk", "steps": train_cfg.total_steps, "status": status,
+              "wandb_run_id": run_id}
+    if status == "rescued":
+        # 23h boundary. The rescue checkpoint is committed (and mirrored) by the
+        # `finally` above; the next link resumes from it with the same
+        # arguments and the same W&B run. Nothing else re-spawns: "complete",
+        # "already_complete", "early_stop" and "data_dead" all end the chain.
+        call = trunk.spawn(hf_repo, total_steps, micro_batch_scale, run_id)
+        print(f"[trunk] rescued at the 23h boundary — re-spawned as "
+              f"{call.object_id}", flush=True)
+        result["next_call_id"] = call.object_id
+    return result
 
 
 @app.local_entrypoint()
 def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
          spawn: bool = False, sanity: bool = False, sanity_steps: int = 30,
-         trunk_run: bool = False, hf_repo: str = "") -> None:
-    """Stages: --trunk (the run), --sanity (30-step gate), or one ladder --arm.
+         trunk_run: bool = False, trunk_steps: int = 0, hf_repo: str = "",
+         micro_batch_scale: float = 1.0, wandb_run_id: str = "") -> None:
+    """Stages: --trunk-run (the run), --sanity (30-step gate), or one ladder
+    --arm (a, b, c, dense, hra, g4).
 
-    total_steps=8000 at seq 2048 is ~1.07B tokens per ladder arm. The trunk
-    uses PretrainConfig's own budget (18,000 steps ≈ 5.43B tokens) unless
-    --total-steps is given.
+    --total-steps is the LADDER budget: 8000 at seq 2048 is ~1.07B tokens per
+    arm. The trunk uses PretrainConfig's own budget (18,000 steps ≈ 5.43B
+    tokens) unless --trunk-steps is given (0 = that default). Trunk-only:
+    --micro-batch-scale (1.0 = the B200 shape; 0.5 on a 96 GB card, 0.25 on
+    80 GB) and --wandb-run-id (leave empty and the trunk persists one on the
+    volume, so every re-invocation continues the same W&B run).
     """
     if trunk_run:
-        call = trunk.spawn(hf_repo, None if total_steps == 8000 else total_steps)
-        print(f"spawned trunk: {call.object_id} — resumes from /vol/trunk on re-invoke")
+        call = trunk.spawn(hf_repo, trunk_steps or None, micro_batch_scale,
+                           wandb_run_id)
+        print(f"spawned trunk: {call.object_id} — resumes from /vol/trunk on "
+              "re-invoke and re-spawns itself at the 23h boundary")
         return
     if sanity:
         print(v7_sanity.remote(sanity_steps))

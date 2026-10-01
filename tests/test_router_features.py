@@ -59,6 +59,17 @@ def test_sqrt_softplus_affinity_is_non_negative():
         torch.nn.functional.softplus(moe.router(x.reshape(-1, cfg.dim)))
     )
     assert (affinity >= 0).all()
+    # The transform must actually be wired into the layer, not just be a true
+    # statement about sqrt(softplus): the same weights under the softmax
+    # affinity route (and gate) differently, so the routed output changes.
+    soft = MoELayer(_tiny_config(router_affinity="softmax"), moe_seed=0)
+    soft.load_state_dict(moe.state_dict())
+    moe.eval()
+    soft.eval()
+    with torch.no_grad():
+        _, routed_sqrt = moe(x, loop_idx=0)
+        _, routed_soft = soft(x, loop_idx=0)
+    assert not torch.allclose(routed_sqrt, routed_soft, atol=1e-5)
     # And the layer forwards finitely on this pathological input.
     moe.eval()
     shared, routed = moe(x, loop_idx=0)

@@ -9,7 +9,7 @@
 > open gates: `specs/2026-08-11-v7-roadmap.md` §14, §16, §19.
 
 
-> Part of the OSRT-605M `docs/` architecture series. This chapter explains the
+> Part of the OSRT `docs/` architecture series. This chapter explains the
 > optimizer that trains the model: a **hybrid** that runs *Muon* (momentum
 > orthogonalised by Newton-Schulz) on 2D hidden weight matrices and *AdamW* on
 > everything else. Ground truth is `src/osrt/muon.py` (the whole file) and the
@@ -151,18 +151,31 @@ against the V4 report; §14.1 item 1.3):
 | `per_head_muon` | off | **on** | orthogonalise each attention head's block separately (Kimi K3 §2.5; GLM-5's "Muon Split" credits this for Muon+MLA matching GQA) |
 
 Two independent validations at OSRT-adjacent scale: the Fully Looped
-Transformer (roadmap §17.3) trains a *looped* model with Muon at exactly this
-lr 0.02 / momentum 0.95 split, and QK-Normed MLA (§12.2) shows QK-norm — OSRT's
-choice — beating QK-clipping at 400M / 100B tokens. Muon is `newton_schulz_v4`
-in `muon.py`; the 5-step path is retained as `newton_schulz5` for reproducing
-v6.
+Transformer (roadmap §17.3) trains a *looped* model with Muon at momentum
+0.95, and QK-Normed MLA (§12.2) shows QK-norm — OSRT's choice — beating
+QK-clipping at 400M / 100B tokens. `Muon.step` runs the 8 fast + 2 stabilising
+Newton–Schulz passes (`_newton_schulz`; `newton_schulz_v4` is the same
+recipe as a free function, `newton_schulz5` the 5-step v6 path).
+
+**The learning rate changes meaning with the step rule.** Under the shape
+heuristic (`update_rms=None`) the per-element step is ≈ lr/√cols, which is why
+v5/v6 ran `muon_lr=0.02` (≈5.1e-4 per element at cols=1536). Under the
+update-RMS rule the per-element step is lr × 0.18 for every shape, so the same
+0.02 would be 3.6e-3 per element — seven times the tuned regime. v7 therefore
+sets `muon_lr=3e-3` (5.4e-4 per element; `muon_min_lr=3e-4`), and the trainer
+prints the implied per-element step next to the AdamW LR at start-up. Both
+values are stamped into checkpoints and drift-checked on resume.
 
 **Telemetry (roadmap §18.2).** Every step the optimizer records
 `muon/update_rms_pre` (the momentum-blended update Muon receives) and
-`muon/update_rms_post` (after Newton–Schulz, before scaling); on logged steps
-it also computes `muon/ortho_err = ‖O Oᵀ − I‖_F / √k` — whether 8+2 iterations
-actually converge. A rising `ortho_err` is the first sign the recipe is
-mis-sized for a matrix shape.
+`muon/update_rms_post` (after Newton–Schulz, before scaling), accumulated
+on-device with one host sync per step; on logged steps it also computes
+`muon/ortho_err = ‖O Oᵀ − I‖_F / √k` — whether 8+2 iterations actually
+converge. Under per-head Muon the residual is taken **per head block** and
+averaged (the blocks are orthogonalised independently and are not mutually
+orthogonal, so the full-matrix Gram would read ~0.9 for a perfectly converged
+update). A rising `ortho_err` is the first sign the recipe is mis-sized for a
+matrix shape.
 
 ### Two preconditions before iterating
 
@@ -407,9 +420,10 @@ nothing bounds it. Two architectural features are what make Muon viable here:
   on top — OSRT relies on QK-Norm plus Muon's own stability). QK-Norm gains are
   1D, so they themselves are trained by **AdamW**, not Muon.
 
-- **Sandwich RMSNorm, per-loop aux losses and loop dropout** bound how much a
-  fast Muon update to one block can perturb the shared residual that all six
-  loops read and write.
+- **Pre-norm plus the per-loop RMSNorm reset, the per-loop aux losses and
+  (optionally) loop dropout** bound how much a fast Muon update to one block
+  can perturb the shared residual that all six loops read and write. (Loop
+  dropout is off in the v7 trunk; the aux loop loss is on at 0.05.)
 
 > **Corrected in v7.** Earlier revisions of this chapter claimed Muon's
 > viability was *contingent* on mHC bounding the residual mixing. That was an
@@ -486,10 +500,12 @@ in lockstep.
   two touch disjoint params — but Muon's NS iteration is the longer step, so it's
   kicked off first for a tidier wall-clock profile.
 - `.state_dict()` / `.load_state_dict()` use one dict with `"muon"` and
-  `"adamw"` sub-keys (`src/osrt/muon.py:230-238`), so checkpoints stay one file.
-  `train.py`'s resume path wraps the load in try/except and starts the optimizer
-  fresh on a type mismatch, so swapping optimizer mid-run (e.g. Lion → Muon)
-  doesn't break resume.
+  `"adamw"` sub-keys, so checkpoints stay one file. `train.py`'s resume path
+  **fails closed** on a mismatch (a swapped optimizer type is a recipe change,
+  checked by `assert_no_resume_drift`), and re-stamps the per-group schedule
+  tags from the current config after the load — torch restores every
+  param-group key from the checkpoint, so without that a resumed session
+  silently kept the previous session's Muon/AdamW peak LR.
 
 ---
 
