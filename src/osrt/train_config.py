@@ -423,11 +423,10 @@ class PretrainConfig:
             # STEM 11 / long docs 5. No long reasoning traces (data plan §0.1).
             "frac": 0.15,
             "seq_len": 8192,
-            # 32K tokens/micro-batch (~145 GB steady on B200, roadmap §13b). The
-            # trunk ran 2x32 through the in-process switch at 15,300; a fresh
-            # process starting at 8192 has no cached blocks, so no switch transient.
-            "batch_size": 4,
-            "grad_accum_steps": 16,  # 524,288 tokens/step
+            # 16K tokens/micro-batch (~75 GB): same headroom reasoning as knowledge,
+            # and this switch also triggers a fresh compile at the largest logits.
+            "batch_size": 2,
+            "grad_accum_steps": 32,  # 524,288 tokens/step
             "datasets": [
                 dict(
                     name="smoltalk2-magpie",
