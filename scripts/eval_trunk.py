@@ -41,7 +41,7 @@ SHAPES = [(8192, 2), (4096, 6)]
 
 @app.function(gpu="H100", timeout=3600, volumes={"/vol": vol}, memory=65536, cpu=8,
               secrets=[modal.Secret.from_name("hf-secret")])
-def score(eval_steps: int, save_soup: bool) -> str:
+def score(eval_steps: int, save_soup: bool, candidates: list[str]) -> str:
     import time
 
     import torch
@@ -65,20 +65,24 @@ def score(eval_steps: int, save_soup: bool) -> str:
     )
     model = OSRTForCausalLM(cfg)
 
+    cands = candidates or CANDIDATES
+    soup_name = "soup_" + "_".join(
+        c.removeprefix("osrt_step_").removesuffix(".pt").replace("osrt_final", "18000")
+        for c in cands)
     sds, steps = {}, {}
-    for n in CANDIDATES:
+    for n in cands:
         ck = torch.load(f"/vol/trunk/{n}", map_location="cpu", weights_only=False)
         sds[n] = ck["model_state_dict"]
         steps[n] = ck.get("step")
         del ck
     soup = {}
-    for k, v in sds["osrt_final.pt"].items():
+    for k, v in sds[cands[-1]].items():
         if v.is_floating_point():
-            soup[k] = sum(sds[n][k].float() for n in CANDIDATES) / len(CANDIDATES)
+            soup[k] = sum(sds[n][k].float() for n in cands) / len(cands)
             soup[k] = soup[k].to(v.dtype)
         else:
             soup[k] = v.clone()
-    sds["soup_17000_17500_18000"] = soup
+    sds[soup_name] = soup
 
     lines = [f"steps: {steps} | eval_steps={eval_steps} | shapes={SHAPES}"]
     results = {}
@@ -103,9 +107,9 @@ def score(eval_steps: int, save_soup: bool) -> str:
         torch.cuda.empty_cache()
 
     if save_soup:
-        out = "/vol/trunk/osrt_soup_17000_17500_18000.pt"
+        out = f"/vol/trunk/osrt_{soup_name}.pt"
         torch.save({"step": 18000, "model_state_dict": soup,
-                    "soup_of": CANDIDATES, "heldout": {
+                    "soup_of": cands, "heldout": {
                         n: {f"{s}x{b}": r[0] for (s, b), r in row.items()}
                         for n, row in results.items()}}, out)
         vol.commit()
@@ -114,5 +118,6 @@ def score(eval_steps: int, save_soup: bool) -> str:
 
 
 @app.local_entrypoint()
-def main(eval_steps: int = 20, save_soup: bool = True):
-    print(score.remote(eval_steps, save_soup))
+def main(eval_steps: int = 20, save_soup: bool = True, candidates: str = ""):
+    cands = [c.strip() for c in candidates.split(",") if c.strip()]
+    print(score.remote(eval_steps, save_soup, cands))
