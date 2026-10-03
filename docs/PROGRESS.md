@@ -227,8 +227,9 @@ Preflight: 18/18 sources clean. Throughput on the B200 climbed from 17K to
 - **Attempt 2, peak 1e-4 / Muon 3e-3:** loss 1.46 → 1.83 over warmup, grad
   norm under the clip. **Held-out fineweb at step 500: 3.510 (soup 3.245),
   +0.26 nats — the gate (≤ 3.25 at every eval) failed at the first read.**
-  Run to the step-1,000 eval for the direction of the curve, then stopped
-  for credit.
+  **Step 1,000: 3.518** — flat. Stopped after the step-1,000 checkpoint
+  reached the mirror (`HallD/OSRT-Ostinato-midtrain`, `osrt_step_500/1000.pt`).
+  ~1,000 steps ≈ 0.27B tokens, about $11 across the two attempts.
 
 Reading: re-warming a converged base to even half the trunk's late LR, on a
 mix that is 80% non-general, costs general-text loss immediately; the
