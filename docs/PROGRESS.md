@@ -212,6 +212,31 @@ compile, then each batch of 8 took 5–6 s, 0.7 s per request against 4.5 s on
 eager (6.5×); scores matched (10.4% on 48 vs 10.5% on 200). The inductor
 cache lives on the volume, so the next run skips most of the compile.
 
+## 9e. Midtrain, first launch (2026-10-03, late)
+
+`MidtrainConfig` (`app.py --midtrain-run`): from the soup, fresh optimizer,
+seq 4096 at the trunk's knowledge shape, eighteen sources weighted maths
+0.35 / reasoning 0.20 / code 0.25 / general 0.20, Gumbel off, held-out at
+4096×6 every 500 steps, checkpoints mirrored to a private HF repo of its own.
+Preflight: 18/18 sources clean. Throughput on the B200 climbed from 17K to
+44K tok/s over the first 500 steps as compile and stream start-up amortised.
+
+- **Attempt 1, peak 2e-4 / Muon 6e-3:** training loss 1.79 → 2.08 and grad
+  norm 0.5 → 2.1 by step 250 with the LR still rising. Stopped at step 260
+  (~$4).
+- **Attempt 2, peak 1e-4 / Muon 3e-3:** loss 1.46 → 1.83 over warmup, grad
+  norm under the clip. **Held-out fineweb at step 500: 3.510 (soup 3.245),
+  +0.26 nats — the gate (≤ 3.25 at every eval) failed at the first read.**
+  Run to the step-1,000 eval for the direction of the curve, then stopped
+  for credit.
+
+Reading: re-warming a converged base to even half the trunk's late LR, on a
+mix that is 80% non-general, costs general-text loss immediately; the
+continued-pretraining literature expects recovery over 1–2K+ steps, which is
+beyond this month's credit. Next attempt: no re-warm (stable at the soup's
+final 6e-5 / Muon 2e-3 then decay), warmup ≥ 1,000, general web ≥ 0.30, and
+a step-0 eval so the first point is the soup itself.
+
 ## 10. Tooling that exists now
 
 - `scripts/eval_trunk.py` — held-out scoring of checkpoints and soups on
