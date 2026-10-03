@@ -40,7 +40,8 @@ app = modal.App("osrt-lm-eval", image=image)
 @app.function(gpu="H100", timeout=4 * 3600, volumes={"/vol": vol}, memory=32768,
               secrets=[modal.Secret.from_name("hf-secret")])
 def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | None,
-             batch_size: int, max_gen_toks: int, hf_repo: str) -> str:
+             batch_size: int, max_gen_toks: int, hf_repo: str,
+             log_samples: bool = False) -> str:
     import json
     import os
     import time
@@ -67,15 +68,28 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
     t0 = time.time()
     res = simple_evaluate(model=wrapper, tasks=task_list,
                           limit=(None if limit == 0 else limit),
-                          num_fewshot=num_fewshot, log_samples=False,
+                          num_fewshot=num_fewshot, log_samples=log_samples,
                           confirm_run_unsafe_code=True)
     results = res.get("results", {})
+    samples = {}
+    if log_samples:
+        def _row(r: dict) -> dict:
+            args = r.get("arguments") or [[""]]
+            resps = r.get("resps") or []
+            filt = r.get("filtered_resps") or []
+            return {"prompt_tail": str(args[0][0])[-400:],
+                    "resps": [str(x)[:600] for x in resps][:1],
+                    "filtered": [str(x)[:300] for x in filt][:1],
+                    "target": str(r.get("target"))[:200]}
+        for task, rows in (res.get("samples") or {}).items():
+            samples[task] = [_row(r) for r in rows[:6]]
     os.makedirs("/vol/evals", exist_ok=True)
     out = f"/vol/evals/{ckpt.removesuffix('.pt')}_{tag}.json"
     with open(out, "w") as f:
         json.dump({"ckpt": ckpt, "tasks": task_list, "limit": limit,
                    "num_fewshot": num_fewshot, "results": results,
-                   "secs": time.time() - t0}, f, indent=1, default=str)
+                   "samples": samples, "secs": time.time() - t0}, f, indent=1,
+                  default=str)
     vol.commit()
     lines = [f"{ckpt} | limit={limit or 'full'} | fewshot={num_fewshot} | "
              f"{time.time() - t0:.0f}s | -> {out}"]
@@ -85,6 +99,11 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
                 and "stderr" not in k}
         cells = [f"{k}={v:.4f}" for k, v in keep.items() if isinstance(v, (int, float))]
         lines.append(f"  {task:22s} " + "  ".join(cells))
+    for task, rows in samples.items():
+        for r in rows[:3]:
+            lines.append(f"--- {task} sample | target={r['target'][:80]!r}")
+            lines.append("PROMPT TAIL: " + repr(r["prompt_tail"][-200:]))
+            lines.append("RESP: " + repr(r["resps"][0] if r["resps"] else ""))
     return "\n".join(lines)
 
 
@@ -93,7 +112,7 @@ def main(ckpt: str = "osrt_final.pt",
          tasks: str = "hellaswag,arc_easy,arc_challenge,piqa,winogrande",
          limit: int = 0, tag: str = "base", num_fewshot: int = -1,
          batch_size: int = 8, max_gen_toks: int = 256,
-         hf_repo: str = "HallD/OSRT-Ostinato-trunk"):
+         hf_repo: str = "HallD/OSRT-Ostinato-trunk", log_samples: bool = False):
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
-                          batch_size, max_gen_toks, hf_repo))
+                          batch_size, max_gen_toks, hf_repo, log_samples))
