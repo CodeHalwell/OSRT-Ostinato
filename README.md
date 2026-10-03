@@ -11,6 +11,8 @@ effective layers from one third of the parameters.
 > v6 core and applies the v7 plan — see
 > [`docs/specs/2026-08-11-v7-roadmap.md`](docs/specs/2026-08-11-v7-roadmap.md).
 
+> **Progress to date:** see [`docs/PROGRESS.md`](docs/PROGRESS.md) — every stage, decision and measured result on v7, in order.
+
 ## North star
 
 Highest quality at the fastest achievable inference, on Blackwell — primarily
