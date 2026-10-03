@@ -135,7 +135,12 @@ def main(ckpt: str = "osrt_final.pt",
          gen_prefix: str = "", legacy_gates: bool = True, keep_text: bool = False,
          hf_subdir: str = "trunk", chat: bool = False):
     """--chat: v7 chat mode (render_chat wrap, <|end_turn|> stop, boxed/code
-    extraction) for SFT'd checkpoints; --hf-subdir sft pulls `sft/<ckpt>`."""
+    extraction) for SFT'd checkpoints; --hf-subdir sft pulls `sft/<ckpt>`.
+
+    Run generation tasks with `modal run --detach`: the function is `.remote()`,
+    and a client that dies (shell timeout, laptop sleep) cancels the input a
+    few seconds later — a 45-minute GSM8K run was lost that way on 2026-10-03.
+    The JSON lands on /vol/evals either way; only the client needs to live."""
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
                           batch_size, max_gen_toks, hf_repo, log_samples,
