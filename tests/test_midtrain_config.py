@@ -13,7 +13,7 @@ def test_midtrain_config_is_one_phase_with_valid_entries():
         fmt = d.get("format")
         assert fmt is None or fmt in FORMAT_FN_PRETRAIN, d["name"]
     assert cfg.total_tokens() == cfg.total_steps * 6 * 11 * 4096
-    assert cfg.lr_schedule == "cosine" and cfg.peak_lr == 2e-4
+    assert cfg.lr_schedule == "cosine" and cfg.peak_lr == 1e-4
     assert cfg.router_gumbel_tau_init == 0.0
     assert cfg.eval_seq_len == 4096 and cfg.eval_batch_size == 6
     assert cfg.init_weights_path == "" and PretrainConfig().init_weights_path == ""

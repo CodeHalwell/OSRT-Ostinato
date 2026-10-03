@@ -829,10 +829,14 @@ class MidtrainConfig(PretrainConfig):
     _total_steps: int = 20_000           # 20,000 x 270,336 ≈ 5.4B tokens
     warmup_steps: int = 300
     lr_schedule: str = "cosine"
-    peak_lr: float = 2e-4
-    min_lr: float = 2e-5
-    muon_lr: float = 6e-3                # trunk peak was 0.02 (pinned recipe)
-    muon_min_lr: float = 6e-4
+    # First launch (2026-10-03, peak 2e-4 / Muon 6e-3) re-warmed the converged
+    # base: task loss 1.79 -> 2.08 and grad norm 0.5 -> 2.1 by step 250 with
+    # the LR still climbing. Half the peak: ~1.7x the trunk's FINAL LR
+    # (6e-5 / 2e-3), not 3x.
+    peak_lr: float = 1e-4
+    min_lr: float = 1e-5
+    muon_lr: float = 3e-3
+    muon_min_lr: float = 3e-4
     router_gumbel_tau_init: float = 0.0
     router_gumbel_tau_final: float = 0.0
     router_gumbel_anneal_steps: int = 1
