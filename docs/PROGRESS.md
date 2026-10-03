@@ -252,10 +252,18 @@ midtrain and the SFT + GRPO path. Spec with preregistered reads:
   every packed window is supervised assistant text (v6's padded loader
   managed ~24%).
 
+- **Result (same evening):** held-out SFT loss 1.134 → 0.970, fineweb
+  3.245 → 3.214, both monotone. **GSM8K 0-shot chat 7.0 strict / 10.5
+  flexible** on 200 (base 6.0 / 8.0): coherent, well-formatted, arithmetic
+  wrong → below the 12% threshold → maths is the base. **HumanEval chat
+  pass@1 9.76%** (16/164) from 0/164 → code was format. Decision: midtrain
+  the base next, weighted toward arithmetic/reasoning; SFT then redone on top.
+  Full table and reads: `docs/specs/2026-10-03-sft-probe.md`.
+
 ## 12. Next
 
-1. Read the probe (GSM8K 0-shot chat on 200, HumanEval chat, held-out
-   curves) against the preregistered thresholds; decide midtrain vs SFT path.
+1. Midtrain the base (data plan §1.2/§1.3 pools re-weighted toward maths and
+   reasoning; full model, HRA off, ~5–10B tokens), then the SFT recipe again.
 2. If SFT: the full data-plan §2 run (short-think slice, tool calling, 2
    epochs ≈ 1.5B tokens), still adapters on the frozen soup unless the probe
    says the base needs to move.
