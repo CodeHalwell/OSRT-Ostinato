@@ -185,6 +185,27 @@ fixed retrospectively):
   at a step-seeded shuffle. 5.43B is tokens processed. `main` now carries the
   data position across launches.
 
+## 9d. Decode speed (2026-10-03)
+
+`scripts/bench_decode.py` on the merged probe model, one H100, bf16, batch 1,
+128 new tokens, four chat prompts, each mode warmed up; agreement is the
+continuation up to the first stop token compared with eager.
+
+| mode | tok/s | vs eager | agree |
+|---|---|---|---|
+| eager, latent cache (what lm-eval used) | 10.9 | 1× | — |
+| eager, batch 8 (aggregate) | 80.9 | 7.4× | — |
+| `optimize_for_inference()` (compile, telemetry off) | 88.9 | 8.2× | 4/4 |
+| + `reduce_overhead` and `cache_impl="static"` (CUDA graphs) | **241.7** | **22×** | 4/4 |
+| compiled + MTP speculative (2 heads) | 35.8 | 3.3× | 4/4; accept 0.38, 1.74 tok/fwd |
+
+Greedy output is token-identical to eager in all three fast modes on these
+prompts. Cold compile cost: 181 s (compiled) + 93 s (graphs) + 229 s
+(speculative); the inductor cache persists on the volume. MTP speculation
+loses on this model: 38% acceptance does not pay for the verify forward on
+top of the compiled baseline. The evaluators still run the eager path; moving
+them to the CUDA-graph path is the next engineering step.
+
 ## 10. Tooling that exists now
 
 - `scripts/eval_trunk.py` — held-out scoring of checkpoints and soups on
