@@ -419,11 +419,113 @@ def sft_probe(steps: int = 0, run_name: str = "", push_hf: bool = True) -> dict:
     return result
 
 
+MIDTRAIN_HF_REPO = "HallD/OSRT-Ostinato-midtrain"   # private; created on first run
+MIDTRAIN_INIT = ("HallD/OSRT-Ostinato-trunk", "trunk/osrt_soup_17000_17500_18000.pt")
+
+
+@app.function(
+    gpu=TRUNK_GPU,
+    timeout=TRUNK_TIMEOUT_H * 3600,
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("hf-secret"),
+             modal.Secret.from_name("wandb-secret")],
+)
+def midtrain(hf_repo: str = MIDTRAIN_HF_REPO, total_steps: int | None = None,
+             micro_batch_scale: float = 1.0, wandb_run_id: str = "") -> dict:
+    """Midtrain of the soup (MidtrainConfig): same chain-of-invocations shape
+    as `trunk` — resumes from /vol/midtrain, mirrors to a PRIVATE HF repo of
+    its own (never the trunk's: same `osrt_step_N.pt` names), re-spawns at the
+    23 h boundary. The first invocation pulls the soup and starts at step 0
+    with a fresh optimizer (`init_weights_path`).
+    """
+    import glob
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    sys.path.insert(0, "/root")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.presets import OSRT_V7, build_config
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+    from osrt.train import run_training
+    from osrt.train_config import MidtrainConfig
+    from osrt.train_main import persisted_wandb_run_id
+
+    vol.reload()
+    tok = AutoTokenizer.from_pretrained("/root/tokenizer")
+    validate_tokenizer_contract(tok)
+    real = len(tok)
+    padded = ((real + 127) // 128) * 128
+    if real != OSRT_V7["real_vocab_size"]:
+        raise SystemExit(f"tokenizer {real} != preset {OSRT_V7['real_vocab_size']}")
+    cfg = build_config(
+        vocab_size=padded, real_vocab_size=real,
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        router_bias_in_gates=True,   # the trunk's routing function (loader gate)
+    )
+    train_cfg = MidtrainConfig()
+    if total_steps is not None:
+        train_cfg.total_steps = total_steps
+    train_cfg.scale_micro_batches(micro_batch_scale)
+    train_cfg.dataloader_num_workers = 0
+
+    ckpt_dir = "/vol/midtrain"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    sync = None
+    if hf_repo:
+        HfApi().create_repo(hf_repo, private=True, exist_ok=True)
+        from scripts import hf_ckpt_sync as sync
+        sync.pull_latest(hf_repo, ckpt_dir, "osrt")
+    if not glob.glob(f"{ckpt_dir}/osrt_*step_*.pt"):
+        base_repo, base_file = MIDTRAIN_INIT
+        local = f"/vol/trunk/{os.path.basename(base_file)}"
+        if not os.path.exists(local):
+            print(f"[midtrain] pulling {base_file} from {base_repo}", flush=True)
+            local = hf_hub_download(base_repo, base_file, local_dir="/root/base")
+        train_cfg.init_weights_path = local
+    run_id = persisted_wandb_run_id(ckpt_dir, wandb_run_id or None)
+    vol.commit()
+    train_cfg.wandb_run_id = run_id
+    if sync is not None:
+        sync.start_push_daemon(hf_repo, ckpt_dir, "osrt")
+    print(f"[midtrain] {train_cfg.total_steps} steps ≈ "
+          f"{train_cfg.total_tokens()/1e9:.2f}B tokens | init "
+          f"{train_cfg.init_weights_path or 'resume'} | wandb run {run_id}",
+          flush=True)
+
+    class _Vol:
+        def commit(self) -> None:
+            vol.commit()
+
+    try:
+        status = run_training(model_config=cfg, train_cfg=train_cfg, vol=_Vol(),
+                              tokenizer_name="/root/tokenizer", ckpt_dir=ckpt_dir)
+    finally:
+        vol.commit()
+        if sync is not None:
+            sync.flush(hf_repo, ckpt_dir, "osrt")
+    print(f"[midtrain] run_training -> {status}", flush=True)
+    result = {"stage": "midtrain", "steps": train_cfg.total_steps, "status": status,
+              "wandb_run_id": run_id}
+    if status == "rescued":
+        call = midtrain.spawn(hf_repo, total_steps, micro_batch_scale, run_id)
+        print(f"[midtrain] rescued at the 23h boundary — re-spawned as "
+              f"{call.object_id}", flush=True)
+        result["next_call_id"] = call.object_id
+    return result
+
+
 @app.local_entrypoint()
 def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
          spawn: bool = False, sanity: bool = False, sanity_steps: int = 30,
          trunk_run: bool = False, trunk_steps: int = 0, hf_repo: str = "",
          sft_probe_run: bool = False, sft_steps: int = 0,
+         midtrain_run: bool = False, midtrain_steps: int = 0,
          micro_batch_scale: float = 1.0, wandb_run_id: str = "") -> None:
     """Stages: --trunk-run (the run), --sanity (30-step gate), or one ladder
     --arm (a, b, c, dense, hra, g4).
@@ -435,6 +537,12 @@ def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
     80 GB) and --wandb-run-id (leave empty and the trunk persists one on the
     volume, so every re-invocation continues the same W&B run).
     """
+    if midtrain_run:
+        call = midtrain.spawn(hf_repo or MIDTRAIN_HF_REPO, midtrain_steps or None,
+                              micro_batch_scale, wandb_run_id)
+        print(f"spawned midtrain: {call.object_id} — resumes from /vol/midtrain, "
+              f"mirrors to {hf_repo or MIDTRAIN_HF_REPO}")
+        return
     if sft_probe_run:
         call = sft_probe.spawn(sft_steps)
         print(f"spawned sft_probe: {call.object_id} — writes /vol/sft/<run> and "

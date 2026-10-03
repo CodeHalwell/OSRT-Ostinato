@@ -157,6 +157,9 @@ class PretrainConfig:
     # forked workers leaks semaphores, and on a session-capped runtime a dead
     # worker costs the session. Raise on a dedicated box.
     dataloader_num_workers: int = 0
+    # Weights to start from when the checkpoint dir is empty (midtrain /
+    # continued pretraining from a finished run). Fresh optimizer, step 0.
+    init_weights_path: str = ""
 
     # ── Loop-collapse floor (roadmap §17.3) ────────────────────────────
     # Per-effective-layer residual update ||Δx||/||x||. Two independent groups
@@ -807,3 +810,92 @@ class SFTProbeConfig:
         total = sum(float(d["weight"]) for d in self.datasets)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"SFT probe dataset weights sum to {total}, not 1.0")
+
+
+class MidtrainConfig(PretrainConfig):
+    """Midtrain of the v7 base (the soup) — docs/specs/2026-10-03-sft-probe.md
+    result: maths is the base's problem, code was format. One phase at seq
+    4096 on the knowledge pools re-weighted toward maths and reasoning, full
+    model, HRA off, Muon + AdamW, cosine from a moderate peak. Fixed schedule
+    of `total_steps`; drip-funded across workspaces like the trunk (resume
+    from the highest checkpoint, HF mirror `HallD/OSRT-Ostinato-midtrain`).
+
+    Starts from `init_weights_path` (the soup, pulled from the trunk mirror by
+    app.py) with a fresh optimizer. Router Gumbel is off: the router is
+    trained. Held-out eval at 4096 x 6 so the gate compares with the soup's
+    3.245 (roadmap §20.5).
+    """
+
+    _total_steps: int = 20_000           # 20,000 x 270,336 ≈ 5.4B tokens
+    warmup_steps: int = 300
+    lr_schedule: str = "cosine"
+    peak_lr: float = 2e-4
+    min_lr: float = 2e-5
+    muon_lr: float = 6e-3                # trunk peak was 0.02 (pinned recipe)
+    muon_min_lr: float = 6e-4
+    router_gumbel_tau_init: float = 0.0
+    router_gumbel_tau_final: float = 0.0
+    router_gumbel_anneal_steps: int = 1
+    eval_interval: int = 500
+    ckpt_interval: int = 500
+    eval_seq_len: int = 4096
+    eval_batch_size: int = 6
+    wandb_run_name: str = "osrt-v7-midtrain"
+
+    _phase_spec: dict = {  # noqa: RUF012
+        "midtrain": {
+            "frac": 1.0,
+            "seq_len": 4096,
+            "batch_size": 6,          # 6 x 4096 = 24K tokens/micro-batch
+            "grad_accum_steps": 11,   # 270,336 tokens/step (trunk knowledge shape)
+            "datasets": [
+                # maths 0.35
+                dict(name="nemotron-cc-math-4plus", hf_id="nvidia/Nemotron-CC-Math-v1",
+                     hf_config="4plus", weight=0.08),
+                dict(name="nemotron-cc-math-mind", hf_id="nvidia/Nemotron-CC-Math-v1",
+                     hf_config="4plus_MIND", weight=0.05),
+                dict(name="finemath-4plus", hf_id="HuggingFaceTB/finemath",
+                     hf_config="finemath-4plus", weight=0.05),
+                dict(name="infiwebmath-4plus", hf_id="HuggingFaceTB/finemath",
+                     hf_config="infiwebmath-4plus", weight=0.02),
+                dict(name="nemotron-math-textbooks",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                     hf_config="Nemotron-Pretraining-Math-Textbooks", weight=0.05),
+                dict(name="openmathinstruct-2", hf_id="nvidia/OpenMathInstruct-2",
+                     format="openmath_instruct2", weight=0.10),
+                # reasoning / STEM 0.20
+                dict(name="nemotron-stem-sft",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                     hf_config="Nemotron-Pretraining-STEM-SFT", weight=0.06),
+                dict(name="nemotron-rqa",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                     hf_config="Nemotron-Pretraining-RQA", weight=0.05),
+                dict(name="nemotron-infinibyte",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
+                     hf_config="Nemotron-Pretraining-InfiniByte-Reasoning",
+                     weight=0.04),
+                dict(name="stackexchange", hf_id="common-pile/stackexchange_filtered",
+                     weight=0.03),
+                dict(name="nemotron-science-mcq", hf_id="nvidia/Nemotron-Science-v1",
+                     split="MCQ", max_tokens=2048, weight=0.02),
+                # code 0.25
+                dict(name="stack-v3", hf_id="HuggingFaceCode/stack-v3-train",
+                     format="stack_v3", weight=0.10),
+                dict(name="opencodeinstruct", hf_id="nvidia/OpenCodeInstruct",
+                     format="io_pair", weight=0.06,
+                     filter={"average_test_score": ["1.0", "1", "1.00", 1.0, 1]}),
+                dict(name="nemotron-code-syn-qa",
+                     hf_id="nvidia/Nemotron-Pretraining-Code-v2",
+                     hf_config="Synthetic-Question-Answering", weight=0.05),
+                dict(name="opc-algorithmic", hf_id="OpenCoder-LLM/opc-annealing-corpus",
+                     hf_config="algorithmic_corpus", weight=0.04),
+                # general 0.20
+                dict(name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu",
+                     weight=0.12),
+                dict(name="cosmopedia-v2", hf_id="HuggingFaceTB/smollm-corpus",
+                     hf_config="cosmopedia-v2", weight=0.04),
+                dict(name="finepdfs-edu", hf_id="HuggingFaceFW/finepdfs-edu",
+                     hf_config="eng_Latn", weight=0.04),
+            ],
+        },
+    }

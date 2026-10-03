@@ -1521,6 +1521,17 @@ def run_training(
             model_config=model_config, train_cfg=train_cfg,
             tokenizer_name=tokenizer_name,
         )
+    init_path = getattr(train_cfg, "init_weights_path", "") or ""
+    if start_step == 0 and init_path:
+        # A midtrain / continued-pretrain start: the WEIGHTS of a finished run
+        # (soup or final), a fresh optimizer and a fresh schedule from step 0.
+        # Strict load — a shape or key mismatch means the wrong preset.
+        init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+        init_sd = init_ckpt.get("model_state_dict", init_ckpt)
+        load_model_state_or_raise(model, init_sd, context=f"init_weights {init_path}")
+        del init_ckpt, init_sd
+        print(f"Initialised weights from {init_path} (fresh optimizer, step 0)",
+              flush=True)
     if start_step >= train_cfg.total_steps:
         print(
             f"Run already complete: checkpoint step {start_step - 1} >= "

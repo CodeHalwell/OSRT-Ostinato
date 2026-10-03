@@ -38,7 +38,7 @@ SAMPLE_CHARS = 200
 
 
 @app.function(secrets=[modal.Secret.from_name("hf-secret")], timeout=3600, cpu=4)
-def preflight(phase_filter: str, sft: bool = False) -> str:
+def preflight(phase_filter: str, sft: bool = False, midtrain: bool = False) -> str:
     import os
     import random
     import sys
@@ -51,13 +51,15 @@ def preflight(phase_filter: str, sft: bool = False) -> str:
 
     import osrt.sft_data  # noqa: F401 — registers format="sft"
     from osrt.data import process_row
-    from osrt.train_config import PretrainConfig, SFTProbeConfig
+    from osrt.train_config import MidtrainConfig, PretrainConfig, SFTProbeConfig
 
     tok = AutoTokenizer.from_pretrained("/root/tokenizer")
     token = os.environ.get("HF_TOKEN")
     if sft:
         sc = SFTProbeConfig()
         phases = {"sft-probe": {"seq_len": sc.seq_len, "datasets": sc.train_datasets()}}
+    elif midtrain:
+        phases = MidtrainConfig().phases
     else:
         phases = PretrainConfig().phases
     rng = random.Random(0)
@@ -134,5 +136,5 @@ def preflight(phase_filter: str, sft: bool = False) -> str:
 
 
 @app.local_entrypoint()
-def main(phase: str = "", sft: bool = False):
-    print(preflight.remote(phase, sft))
+def main(phase: str = "", sft: bool = False, midtrain: bool = False):
+    print(preflight.remote(phase, sft, midtrain))
