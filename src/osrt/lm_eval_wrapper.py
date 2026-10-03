@@ -616,7 +616,8 @@ class OSRTLMEval(LM):
                 for r, i in enumerate(batch):
                     gen_ids = self._cut_generated(
                         out_ids[r, width:].tolist(), stop_ids)
-                    results[i] = self._postprocess(self.tok_decode(gen_ids), st["until"])
+                    results[i] = self._postprocess(
+                        self.tok_decode(gen_ids), st["until"])
                 done += len(batch)
                 el = time.time() - t0
                 print(f"[lm_eval] generate_until {done}/{n} | {el:.0f}s | "
