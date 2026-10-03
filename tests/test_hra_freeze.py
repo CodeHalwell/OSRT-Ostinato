@@ -49,3 +49,22 @@ def test_unfrozen_injection_keeps_the_base_trainable():
     assert _trainable(model) == total + sum(p.numel() for p in hra)
     groups = get_param_groups(model, hra, base_lr=1e-5, hra_lr=1e-4)
     assert [g["group_name"] for g in groups] == ["pretrained", "hra"]
+
+
+def test_merge_hra_reproduces_the_adapter_forward_and_restores_plain_linears():
+    import torch.nn as nn
+
+    from osrt.hra import HRALinear, merge_hra
+
+    torch.manual_seed(0)
+    lin = nn.Linear(16, 8, bias=True)
+    wrapped = HRALinear(lin, rank=4, scale=0.5)
+    with torch.no_grad():
+        wrapped.adapter_b.normal_()  # B is zero-init; give the adapter a value
+    x = torch.randn(3, 16)
+    y_adapter = wrapped(x)
+    holder = nn.Sequential(wrapped)
+    assert merge_hra(holder) == 1
+    assert isinstance(holder[0], nn.Linear) and not isinstance(holder[0], HRALinear)
+    torch.testing.assert_close(holder[0](x), y_adapter, atol=1e-5, rtol=1e-5)
+    assert {n for n, _ in holder.named_parameters()} == {"0.weight", "0.bias"}

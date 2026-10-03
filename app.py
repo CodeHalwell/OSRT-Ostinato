@@ -342,10 +342,88 @@ def trunk(hf_repo: str = "", total_steps: int | None = None,
     return result
 
 
+@app.function(
+    gpu=TRUNK_GPU,
+    timeout=6 * 3600,
+    volumes={"/vol": vol},
+    secrets=[modal.Secret.from_name("hf-secret"),
+             modal.Secret.from_name("wandb-secret")],
+)
+def sft_probe(steps: int = 0, run_name: str = "", push_hf: bool = True) -> dict:
+    """The bounded SFT probe (docs/specs/2026-10-03-sft-probe.md): HRA adapters
+    on the FROZEN soup, assistant-only loss, ~0.26B tokens. Pulls the base from
+    the private HF mirror, trains, merges the adapters into the base and pushes
+    the merged checkpoint (+ bf16 safetensors) back to the mirror, so
+    scripts/lm_eval_trunk.py can score it in chat mode with nothing new.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    from osrt.presets import OSRT_V7, build_config
+    from osrt.sft_train import run_sft
+    from osrt.tokenizer_contract import validate_tokenizer_contract
+    from osrt.train_config import SFTProbeConfig
+
+    vol.reload()
+    cfg = SFTProbeConfig()
+    if steps:
+        cfg.total_steps = steps
+    if run_name:
+        cfg.wandb_run_name = run_name
+    tok = AutoTokenizer.from_pretrained("/root/tokenizer")
+    validate_tokenizer_contract(tok)
+    real = len(tok)
+    padded = ((real + 127) // 128) * 128
+    if real != OSRT_V7["real_vocab_size"]:
+        raise SystemExit(f"tokenizer {real} != preset {OSRT_V7['real_vocab_size']}")
+    model_cfg = build_config(
+        vocab_size=padded, real_vocab_size=real,
+        bos_token_id=tok.bos_token_id, eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id, fused_cross_entropy_chunks=8,
+        router_bias_in_gates=cfg.legacy_gates, mtp_loss_weight=0.0,
+    )
+    base_path = f"/vol/trunk/{os.path.basename(cfg.base_file)}"
+    if not os.path.exists(base_path):
+        print(f"[sft] pulling {cfg.base_file} from {cfg.base_hf_repo}", flush=True)
+        base_path = hf_hub_download(cfg.base_hf_repo, cfg.base_file,
+                                    local_dir="/root/base")
+    out_dir = f"/vol/sft/{cfg.wandb_run_name}"
+    print(f"[sft] {cfg.total_steps} steps x {cfg.tokens_per_step():,} tokens "
+          f"= {cfg.total_steps * cfg.tokens_per_step() / 1e9:.2f}B | base {base_path}",
+          flush=True)
+    result = run_sft(model_cfg, cfg, "/root/tokenizer", base_path, out_dir, vol=vol)
+    vol.commit()
+    if push_hf:
+        import torch
+        from safetensors.torch import save_file
+        api = HfApi()
+        merged = result["merged"]
+        name = f"sft/{cfg.wandb_run_name}_merged_step_{cfg.total_steps}"
+        api.upload_file(path_or_fileobj=merged, path_in_repo=f"{name}.pt",
+                        repo_id=cfg.base_hf_repo, commit_message=f"{name}")
+        ck = torch.load(merged, map_location="cpu", weights_only=False)
+        sd = ck["model_state_dict"]
+        bf = {k: (v.to(torch.bfloat16) if v.is_floating_point() else v).contiguous()
+              for k, v in sd.items()}
+        st = f"/tmp/{os.path.basename(name)}_bf16.safetensors"
+        save_file(bf, st, metadata={"format": "pt", "sft": cfg.wandb_run_name})
+        api.upload_file(path_or_fileobj=st, path_in_repo=f"{name}_bf16.safetensors",
+                        repo_id=cfg.base_hf_repo, commit_message=f"{name} bf16")
+        result["hf"] = f"{cfg.base_hf_repo}/{name}.pt"
+    return result
+
+
 @app.local_entrypoint()
 def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
          spawn: bool = False, sanity: bool = False, sanity_steps: int = 30,
          trunk_run: bool = False, trunk_steps: int = 0, hf_repo: str = "",
+         sft_probe_run: bool = False, sft_steps: int = 0,
          micro_batch_scale: float = 1.0, wandb_run_id: str = "") -> None:
     """Stages: --trunk-run (the run), --sanity (30-step gate), or one ladder
     --arm (a, b, c, dense, hra, g4).
@@ -357,6 +435,11 @@ def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
     80 GB) and --wandb-run-id (leave empty and the trunk persists one on the
     volume, so every re-invocation continues the same W&B run).
     """
+    if sft_probe_run:
+        call = sft_probe.spawn(sft_steps)
+        print(f"spawned sft_probe: {call.object_id} — writes /vol/sft/<run> and "
+              "pushes the merged checkpoint to the HF mirror")
+        return
     if trunk_run:
         call = trunk.spawn(hf_repo, trunk_steps or None, micro_batch_scale,
                            wandb_run_id)

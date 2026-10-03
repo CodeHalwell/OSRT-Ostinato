@@ -38,7 +38,7 @@ SAMPLE_CHARS = 200
 
 
 @app.function(secrets=[modal.Secret.from_name("hf-secret")], timeout=3600, cpu=4)
-def preflight(phase_filter: str) -> str:
+def preflight(phase_filter: str, sft: bool = False) -> str:
     import os
     import random
     import sys
@@ -49,15 +49,20 @@ def preflight(phase_filter: str) -> str:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
+    import osrt.sft_data  # noqa: F401 — registers format="sft"
     from osrt.data import process_row
-    from osrt.train_config import PretrainConfig
+    from osrt.train_config import PretrainConfig, SFTProbeConfig
 
     tok = AutoTokenizer.from_pretrained("/root/tokenizer")
     token = os.environ.get("HF_TOKEN")
-    cfg = PretrainConfig()
+    if sft:
+        sc = SFTProbeConfig()
+        phases = {"sft-probe": {"seq_len": sc.seq_len, "datasets": sc.train_datasets()}}
+    else:
+        phases = PretrainConfig().phases
     rng = random.Random(0)
     out, bad = [], 0
-    for pname, ph in cfg.phases.items():
+    for pname, ph in phases.items():
         if phase_filter and pname != phase_filter:
             continue
         out.append(f"== {pname} (seq {ph['seq_len']}, {len(ph['datasets'])} sources)")
@@ -129,5 +134,5 @@ def preflight(phase_filter: str) -> str:
 
 
 @app.local_entrypoint()
-def main(phase: str = ""):
-    print(preflight.remote(phase))
+def main(phase: str = "", sft: bool = False):
+    print(preflight.remote(phase, sft))

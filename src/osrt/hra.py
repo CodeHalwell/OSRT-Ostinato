@@ -71,6 +71,17 @@ class HRALinear(nn.Module):
         hra_out = (x @ self.adapter_a) @ self.adapter_b
         return base_out + self.scale * hra_out
 
+    @torch.no_grad()
+    def merged_weight(self) -> Tensor:
+        """W + scale * (A @ B)^T — the single linear equal to this layer.
+
+        `forward` computes x @ W^T + scale * (x @ A) @ B, so the adapter is
+        the rank-`rank` update  dW = scale * (A @ B)^T  to the original weight.
+        """
+        delta = (self.adapter_a.float() @ self.adapter_b.float()).T
+        return (self.original.weight.float() + self.scale * delta).to(
+            self.original.weight.dtype)
+
     @property
     def in_features(self) -> int:
         return self.original.in_features
@@ -86,6 +97,27 @@ class HRALinear(nn.Module):
     @property
     def bias(self) -> Tensor | None:
         return self.original.bias
+
+
+def merge_hra(model: nn.Module) -> int:
+    """Fold every HRALinear back into a plain nn.Linear (in place).
+
+    After this the model has the ORIGINAL parameter names and shapes again,
+    so a `state_dict()` loads into a freshly built OSRTForCausalLM — which is
+    how an SFT'd model reaches the evaluators and the inference path without
+    either knowing about adapters. Returns the number of layers merged.
+    """
+    merged = 0
+    for module in list(model.modules()):
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, HRALinear):
+                lin = child.original
+                lin.weight.data.copy_(child.merged_weight())
+                for p in lin.parameters():
+                    p.requires_grad = True
+                setattr(module, child_name, lin)
+                merged += 1
+    return merged
 
 
 def inject_hra(

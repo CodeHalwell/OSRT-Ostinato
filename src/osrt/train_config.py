@@ -113,6 +113,8 @@ Sweep template (drop into app.py near the existing `sweep` stage)::
     ]
 """
 
+from dataclasses import dataclass, field
+
 
 class PretrainConfig:
     """Pre-training hyperparameters for v7.
@@ -726,3 +728,82 @@ class V7SanityConfig(PretrainConfig):
     eval_interval: int = 10_000  # never, inside 30 steps
     save_final_checkpoint: bool = False
     wandb_log: bool = False
+
+
+@dataclass
+class SFTProbeConfig:
+    """The bounded SFT probe (docs/specs/2026-10-03-sft-probe.md).
+
+    HRA adapters on the FROZEN soup; adapters are the only trainable
+    parameters (`inject_hra(freeze_pretrained=True)`, tests/test_hra_freeze.py).
+    The question it answers: how much of the base's zero on HumanEval and
+    6-8% on GSM8K is chat-format mismatch, and how much is the base. It is a
+    probe, not the SFT run: no short-think slice, no tool calling, ~0.26B
+    tokens.
+    """
+
+    # ── Base ─────────────────────────────────────────────────────────
+    base_hf_repo: str = "HallD/OSRT-Ostinato-trunk"
+    base_file: str = "trunk/osrt_soup_17000_17500_18000.pt"
+    legacy_gates: bool = True        # the trunk's routing function (loader gate)
+    hra_rank: int = 256
+    hra_scale: float = 1.0
+
+    # ── Budget ───────────────────────────────────────────────────────
+    seq_len: int = 4096
+    batch_size: int = 8
+    grad_accum_steps: int = 8        # 262,144 tokens/step
+    total_steps: int = 1_000         # ≈ 0.26B tokens
+    warmup_steps: int = 50
+    lr: float = 2e-4                 # adapters only (AdamW); cosine to lr_min
+    lr_min: float = 2e-5
+    weight_decay: float = 0.0
+    betas: tuple[float, float] = (0.9, 0.95)
+    grad_clip: float = 1.0
+
+    # ── Cadence ──────────────────────────────────────────────────────
+    log_interval: int = 10
+    eval_interval: int = 250
+    eval_steps: int = 16
+    ckpt_interval: int = 250
+    wandb_project: str = "osrt"
+    wandb_run_name: str = "osrt-v7-sft-probe"
+
+    # ── Data (data plan §2.1, no-think backbone; shares renormalised) ───
+    # Training streams skip the first `holdout_rows` rows of every source;
+    # the held-out loss is measured on those rows.
+    holdout_rows: int = 500
+    datasets: list[dict] = field(default_factory=lambda: [
+        dict(name="dolci-instruct", hf_id="allenai/Dolci-Instruct-SFT",
+             format="sft", weight=0.30, max_tokens=4096),
+        dict(name="smoltalk2-magpie", hf_id="HuggingFaceTB/smoltalk2",
+             hf_config="SFT", split="smoltalk_smollm3_smol_magpie_ultra_no_think",
+             format="sft", weight=0.12, max_tokens=4096),
+        dict(name="smoltalk2-personas-if", hf_id="HuggingFaceTB/smoltalk2",
+             hf_config="SFT",
+             split="tulu_3_sft_personas_instruction_following_no_think",
+             format="sft", weight=0.08, max_tokens=4096),
+        dict(name="opencodeinstruct", hf_id="nvidia/OpenCodeInstruct",
+             format="sft", weight=0.20, max_tokens=4096,
+             filter={"average_test_score": ["1.0", "1", "1.00", 1.0, 1]}),
+        dict(name="openmathinstruct-2", hf_id="nvidia/OpenMathInstruct-2",
+             format="sft", weight=0.20, max_tokens=4096),
+        dict(name="nemotron-if-chat-off",
+             hf_id="nvidia/Nemotron-SFT-Instruction-Following-Chat-v2",
+             split="reasoning_off", format="sft", weight=0.10, max_tokens=4096),
+    ])
+
+    def train_datasets(self) -> list[dict]:
+        return [{**d, "skip": d.get("skip", 0) + self.holdout_rows}
+                for d in self.datasets]
+
+    def holdout_datasets(self) -> list[dict]:
+        return [dict(d) for d in self.datasets]
+
+    def tokens_per_step(self) -> int:
+        return self.seq_len * self.batch_size * self.grad_accum_steps
+
+    def __post_init__(self) -> None:
+        total = sum(float(d["weight"]) for d in self.datasets)
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"SFT probe dataset weights sum to {total}, not 1.0")
