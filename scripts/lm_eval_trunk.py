@@ -40,7 +40,7 @@ app = modal.App("osrt-lm-eval", image=image)
 @app.function(gpu="H100", timeout=4 * 3600, volumes={"/vol": vol}, memory=32768,
               secrets=[modal.Secret.from_name("hf-secret")])
 def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | None,
-             batch_size: int, max_gen_toks: int) -> str:
+             batch_size: int, max_gen_toks: int, hf_repo: str) -> str:
     import json
     import os
     import time
@@ -52,6 +52,13 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
 
     vol.reload()
     path = f"/vol/trunk/{ckpt}"
+    if not os.path.exists(path) and hf_repo:
+        # Not on this workspace's volume: pull the full checkpoint from the
+        # private HF mirror (Modal -> HF is fast; the laptop path is not).
+        from huggingface_hub import hf_hub_download
+        print(f"[lm_eval] {path} absent; downloading trunk/{ckpt} from {hf_repo}",
+              flush=True)
+        path = hf_hub_download(hf_repo, f"trunk/{ckpt}", local_dir="/root/ckpt")
     assert os.path.exists(path), path
     wrapper = OSRTLMEval(ckpt_path=path, tokenizer_path="/root/tokenizer",
                          batch_size=batch_size, base_model=True,
@@ -84,7 +91,8 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
 def main(ckpt: str = "osrt_final.pt",
          tasks: str = "hellaswag,arc_easy,arc_challenge,piqa,winogrande",
          limit: int = 0, tag: str = "base", num_fewshot: int = -1,
-         batch_size: int = 8, max_gen_toks: int = 256):
+         batch_size: int = 8, max_gen_toks: int = 256,
+         hf_repo: str = "HallD/OSRT-Ostinato-trunk"):
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
-                          batch_size, max_gen_toks))
+                          batch_size, max_gen_toks, hf_repo))
