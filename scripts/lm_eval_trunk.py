@@ -67,7 +67,8 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
     t0 = time.time()
     res = simple_evaluate(model=wrapper, tasks=task_list,
                           limit=(None if limit == 0 else limit),
-                          num_fewshot=num_fewshot, log_samples=False)
+                          num_fewshot=num_fewshot, log_samples=False,
+                          confirm_run_unsafe_code=True)
     results = res.get("results", {})
     os.makedirs("/vol/evals", exist_ok=True)
     out = f"/vol/evals/{ckpt.removesuffix('.pt')}_{tag}.json"
