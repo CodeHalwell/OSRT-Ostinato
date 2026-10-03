@@ -139,10 +139,22 @@ def inject_hra(
     print(f"  HRA injected: {n_layers} layers, rank {rank}, "
           f"+{n_hra:,} params ({n_hra / 1e6:.1f}M)")
     if freeze_pretrained:
+        # Freeze the WHOLE base, not just the wrapped linears. Before this
+        # (2026-10-03) only HRALinear.original was frozen, which on the v7
+        # preset left 80,585,091 parameters trainable — the tied embedding
+        # (75.7M), both MTP heads, the three routers and every norm — so a
+        # "frozen-base" SFT would have trained a quarter of the model.
+        hra_ids = {id(p) for p in hra_params}
+        for p in model.parameters():
+            if id(p) not in hra_ids:
+                p.requires_grad = False
         n_frozen = sum(
             p.numel() for p in model.parameters() if not p.requires_grad
         )
-        print(f"  Pretrained weights frozen: {n_frozen:,} params")
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        assert n_train == n_hra, (n_train, n_hra)
+        print(f"  Pretrained weights frozen: {n_frozen:,} params "
+              f"(trainable = adapters only: {n_train:,})")
 
     return hra_params
 

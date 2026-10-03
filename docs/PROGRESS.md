@@ -155,6 +155,35 @@ buys), with the maths mix already visible at GSM8K. LAMBADA is a domain gap
 chat-annealed in plain text** (`assistant:` lines, fenced code) and mixes tab
 and space indentation — so coding is to be measured after SFT.
 
+## 9b. Review follow-ups (2026-10-03)
+
+An independent review of the trunk and its evaluation raised four points; the
+first three are fixed on `main` (the fourth, data-stream position, cannot be
+fixed retrospectively):
+
+- **Frozen-base SFT was not frozen.** `inject_hra(freeze_pretrained=True)`
+  froze only the wrapped linears, leaving 80,585,091 base parameters trainable
+  (tied embedding, MTP heads, routers, norms) alongside 254.8M adapter
+  parameters. It now freezes every non-adapter parameter; `get_param_groups`
+  yields the adapter group alone (`tests/test_hra_freeze.py`).
+- **Loader gate.** `main` reproduces the pinned trunk forward exactly when
+  built with `router_bias_in_gates=True`: `scripts/check_trunk_loader.py`
+  builds the same tiny model in both trees from their presets, perturbs the
+  router bias (a fresh model's zero bias hides the difference), copies the
+  weights and compares — 0.0 logit difference with the flag, 5.8e-2 without
+  (`tests/test_trunk_loader_equivalence.py`). The lm-eval wrapper and the
+  held-out scorer on `main` default to the flag. Still to run: the GPU
+  reproduction of the soup's held-out 3.183 through `main`'s scorer.
+- **Evaluation bookkeeping.** The wrapper now tokenises (context,
+  continuation) jointly and splits, as the harness does (the trailing-space
+  case diverged); the runner saves complete per-item outcomes, the resolved
+  wrapper and task configs and versions, so checkpoints can be compared with
+  paired statistics.
+- **Unique-token exposure of the trunk is unknown**: the pinned checkpoint
+  saved no data cursor, so each of the eleven launches re-opened the streams
+  at a step-seeded shuffle. 5.43B is tokens processed. `main` now carries the
+  data position across launches.
+
 ## 10. Tooling that exists now
 
 - `scripts/eval_trunk.py` — held-out scoring of checkpoints and soups on
