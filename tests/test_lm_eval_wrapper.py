@@ -52,3 +52,16 @@ def test_chat_extraction_returns_code_fence_body_for_code_replies():
     assert w._extract_answer(reply) == "def f(x):\n    return x + 1\n"
     prose = "Use a loop:\n```python\nfor i in x: pass\n```"
     assert w._extract_answer(prose) == prose  # fence not at the start: left alone
+
+
+def test_chat_wrap_uses_render_chat_with_generation_prompt():
+    w = _ChatStub()
+    w._chat_format_generate = True
+    w._chat_format_loglikelihood = False
+    w._system_prompt = ""
+    out = w._wrap_context("  Q: 2+2?\nA:  ", for_generate=True)
+    assert out == "<|user|>Q: 2+2?\nA:<|assistant|>"
+    w._system_prompt = "Be brief."
+    assert w._wrap_context("hi", for_generate=True) == (
+        "<|system|>Be brief.<|user|>hi<|assistant|>")
+    assert w._wrap_context("hi", for_generate=False) == "hi"

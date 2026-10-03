@@ -44,7 +44,8 @@ app = modal.App("osrt-lm-eval", image=image)
 def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | None,
              batch_size: int, max_gen_toks: int, hf_repo: str,
              log_samples: bool = True, gen_prefix: str = "",
-             legacy_gates: bool = True, keep_text: bool = False) -> str:
+             legacy_gates: bool = True, keep_text: bool = False,
+             hf_subdir: str = "trunk", chat: bool = False) -> str:
     import json
     import os
     import time
@@ -55,17 +56,17 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
     from osrt.lm_eval_wrapper import OSRTLMEval
 
     vol.reload()
-    path = f"/vol/trunk/{ckpt}"
+    path = f"/vol/{hf_subdir}/{ckpt}"
     if not os.path.exists(path) and hf_repo:
         # Not on this workspace's volume: pull the full checkpoint from the
         # private HF mirror (Modal -> HF is fast; the laptop path is not).
         from huggingface_hub import hf_hub_download
-        print(f"[lm_eval] {path} absent; downloading trunk/{ckpt} from {hf_repo}",
-              flush=True)
-        path = hf_hub_download(hf_repo, f"trunk/{ckpt}", local_dir="/root/ckpt")
+        print(f"[lm_eval] {path} absent; downloading {hf_subdir}/{ckpt} from "
+              f"{hf_repo}", flush=True)
+        path = hf_hub_download(hf_repo, f"{hf_subdir}/{ckpt}", local_dir="/root/ckpt")
     assert os.path.exists(path), path
     wrapper = OSRTLMEval(ckpt_path=path, tokenizer_path="/root/tokenizer",
-                         batch_size=batch_size, base_model=True,
+                         batch_size=batch_size, base_model=not chat,
                          max_gen_toks=max_gen_toks,
                          gen_prefix=gen_prefix.encode().decode("unicode_escape"),
                          legacy_gates=legacy_gates)
@@ -131,8 +132,11 @@ def main(ckpt: str = "osrt_final.pt",
          limit: int = 0, tag: str = "base", num_fewshot: int = -1,
          batch_size: int = 8, max_gen_toks: int = 256,
          hf_repo: str = "HallD/OSRT-Ostinato-trunk", log_samples: bool = True,
-         gen_prefix: str = "", legacy_gates: bool = True, keep_text: bool = False):
+         gen_prefix: str = "", legacy_gates: bool = True, keep_text: bool = False,
+         hf_subdir: str = "trunk", chat: bool = False):
+    """--chat: v7 chat mode (render_chat wrap, <|end_turn|> stop, boxed/code
+    extraction) for SFT'd checkpoints; --hf-subdir sft pulls `sft/<ckpt>`."""
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
                           batch_size, max_gen_toks, hf_repo, log_samples,
-                          gen_prefix, legacy_gates, keep_text))
+                          gen_prefix, legacy_gates, keep_text, hf_subdir, chat))

@@ -164,7 +164,10 @@ class OSRTLMEval(LM):
         self._gen_prefix = gen_prefix
         # base_model=True: raw prompts, greedy, no answer extraction (a
         # pretrained trunk has no chat schema to put it "in distribution").
-        # base_model=False: the v6 SFT defaults (chat wrap, temp 0.7, rp 1.2).
+        # base_model=False: v7 chat mode — render_chat wrap, still greedy and
+        # rp 1.0 (the SFT probe spec reads greedy outputs; v6's 0.7/1.2 were
+        # a looping workaround the v7 base does not need), <|end_turn|> stop,
+        # boxed/code extraction.
         self._chat_format_generate = (
             (not base_model) if chat_format_generate is None else chat_format_generate
         )
@@ -173,15 +176,13 @@ class OSRTLMEval(LM):
             system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         )
         self._default_temperature = float(
-            (0.0 if base_model else 0.7)
-            if default_temperature is None else default_temperature
+            0.0 if default_temperature is None else default_temperature
         )
         self._max_temperature = float(max_temperature)
         self._default_top_p = float(default_top_p)
         self._default_top_k = int(default_top_k)
         self._default_repetition_penalty = float(
-            (1.0 if base_model else 1.2)
-            if default_repetition_penalty is None else default_repetition_penalty
+            1.0 if default_repetition_penalty is None else default_repetition_penalty
         )
         self._extract_answer_block = (
             (not base_model) if extract_answer_block is None else extract_answer_block
@@ -281,8 +282,8 @@ class OSRTLMEval(LM):
     def _wrap_context(self, context: str, *, for_generate: bool) -> str:
         """Wrap raw lm-eval context in the SFT-trained chat schema.
 
-        Schema (matches sft_data.py SFTStream output):
-            <|system|>{system_prompt}<|user|>{context}<|assistant|>
+        Schema (render_chat, as osrt.sft_data trains it):
+            [<|system|>{system_prompt}]<|user|>{context}<|assistant|>
 
         Two independent gates:
           - generate_until paths use chat_format_generate (default True
@@ -298,10 +299,17 @@ class OSRTLMEval(LM):
         )
         if not gate:
             return context
-        prefix = ""
+        # render_chat is the SFT stream's renderer: same stripping, no
+        # whitespace between markers, so the prompt is byte-identical to
+        # what the adapters trained on.
+        from osrt.chat_format import render_chat
+
+        msgs = []
         if self._system_prompt:
-            prefix = f"<|system|>{self._system_prompt}"
-        return f"{prefix}<|user|>{context}<|assistant|>"
+            msgs.append({"role": "system", "content": self._system_prompt})
+        msgs.append({"role": "user", "content": context})
+        wrapped = render_chat(msgs, add_generation_prompt=True)
+        return wrapped or f"<|user|>{context}<|assistant|>"
 
     def _extract_answer(self, text: str) -> str:
         """Chat-mode post-processing for the v7 contract (no think/answer tags).
