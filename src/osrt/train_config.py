@@ -774,23 +774,23 @@ class SFTProbeConfig:
     # the held-out loss is measured on those rows.
     holdout_rows: int = 500
     datasets: list[dict] = field(default_factory=lambda: [
+        # nemotron-if-chat-off (data plan 0.05) is NOT here: 399/400 of its
+        # `reasoning_off` rows render empty through render_chat (preflight
+        # 2026-10-03) — a layout the contract rejects. Shares renormalised.
         dict(name="dolci-instruct", hf_id="allenai/Dolci-Instruct-SFT",
-             format="sft", weight=0.30, max_tokens=4096),
+             format="sft", weight=0.33, max_tokens=4096),
         dict(name="smoltalk2-magpie", hf_id="HuggingFaceTB/smoltalk2",
              hf_config="SFT", split="smoltalk_smollm3_smol_magpie_ultra_no_think",
-             format="sft", weight=0.12, max_tokens=4096),
+             format="sft", weight=0.14, max_tokens=4096),
         dict(name="smoltalk2-personas-if", hf_id="HuggingFaceTB/smoltalk2",
              hf_config="SFT",
              split="tulu_3_sft_personas_instruction_following_no_think",
-             format="sft", weight=0.08, max_tokens=4096),
+             format="sft", weight=0.10, max_tokens=4096),
         dict(name="opencodeinstruct", hf_id="nvidia/OpenCodeInstruct",
-             format="sft", weight=0.20, max_tokens=4096,
+             format="sft", weight=0.22, max_tokens=4096,
              filter={"average_test_score": ["1.0", "1", "1.00", 1.0, 1]}),
         dict(name="openmathinstruct-2", hf_id="nvidia/OpenMathInstruct-2",
-             format="sft", weight=0.20, max_tokens=4096),
-        dict(name="nemotron-if-chat-off",
-             hf_id="nvidia/Nemotron-SFT-Instruction-Following-Chat-v2",
-             split="reasoning_off", format="sft", weight=0.10, max_tokens=4096),
+             format="sft", weight=0.21, max_tokens=4096),
     ])
 
     def train_datasets(self) -> list[dict]:

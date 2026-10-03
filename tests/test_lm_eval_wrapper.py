@@ -30,3 +30,25 @@ def test_pair_encoding_keeps_empty_context_handling_to_caller():
     w = _Stub()
     c, k = w._encode_pair("", " park")
     assert c == [] and k == w.tok_encode(" park")
+
+
+class _ChatStub(_Stub):
+    def __init__(self):
+        super().__init__()
+        self._extract_answer_block = True
+
+
+def test_chat_extraction_cuts_end_turn_and_surfaces_boxed_answers():
+    w = _ChatStub()
+    out = w._extract_answer(
+        "First 3 apples, then 4: \\boxed{7}<|end_turn|><|user|>junk")
+    assert out.endswith("\n#### 7") and "<|end_turn|>" not in out and "junk" not in out
+    assert w._extract_answer("The answer is 12.<|end_turn|>") == "The answer is 12."
+
+
+def test_chat_extraction_returns_code_fence_body_for_code_replies():
+    w = _ChatStub()
+    reply = "```python\ndef f(x):\n    return x + 1\n```\nThis adds one.<|end_turn|>"
+    assert w._extract_answer(reply) == "def f(x):\n    return x + 1\n"
+    prose = "Use a loop:\n```python\nfor i in x: pass\n```"
+    assert w._extract_answer(prose) == prose  # fence not at the start: left alone

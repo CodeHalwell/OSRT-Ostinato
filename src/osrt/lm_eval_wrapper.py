@@ -29,6 +29,7 @@ Usage (scripts/lm_eval_trunk.py):
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -83,10 +84,9 @@ class OSRTLMEval(LM):
     # (IDs 7-10) in the prompt got suppressed by repetition_penalty
     # during generation, breaking the trained think/answer structure
     # entirely. Use only natural language references.
-    DEFAULT_SYSTEM_PROMPT = (
-        "Respond directly to the user with a complete answer. "
-        "Do not call any tools or external functions."
-    )
+    # v7 chat mode: no system turn by default — the SFT backbone rows mostly
+    # carry none, and render_chat omits the marker when the prompt is empty.
+    DEFAULT_SYSTEM_PROMPT = ""
 
     def __init__(
         self,
@@ -304,65 +304,32 @@ class OSRTLMEval(LM):
         return f"{prefix}<|user|>{context}<|assistant|>"
 
     def _extract_answer(self, text: str) -> str:
-        """Strip <|think|>...<|/think|> and return the <|answer|>...
-        <|/answer|> contents formatted for lm-eval's filter chain.
+        """Chat-mode post-processing for the v7 contract (no think/answer tags).
 
-        Lm-eval's gsm8k task uses a two-stage filter:
-          - strict-match:    "#### (\\-?[0-9\\.\\,]+)"
-          - flexible-extract: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
-        Smoke-L5 (commit f931406) confirmed bare extracted answers
-        like "9" come back as "[invalid]" from BOTH filters — the
-        strict pattern requires a literal "#### " prefix and the
-        flexible pattern needs surrounding context that a single
-        digit doesn't supply.
-
-        Fix: emit "{answer}\n#### {answer}". Two payoffs:
-          1. strict-match finds "#### 9" → valid extraction.
-          2. flexible-extract finds "9" at end of string.
-        The duplication is harmless on tasks that don't filter
-        (loglikelihood) and only mildly extra-text-y on IFEval
-        (where graders test the response content, not its
-        position-of-number formatting).
-
-        Behaviour:
-          - If <|answer|>...<|/answer|> found: extract contents,
-            strip, and emit dual format.
-          - If only <|answer|> found (no close tag): everything
-            after <|answer|>, stripped, dual-formatted.
-          - If no <|answer|> tag at all: return input unchanged
-            (preserves the model's full output for the failure
-            case where it never emits the answer block).
-
-        Always called when extract_answer_block=True.
+        * cut at `<|end_turn|>` (the trained end of an assistant turn);
+        * a `\\boxed{X}` answer (OpenMathInstruct-2 style) gets "\n#### X"
+          appended so lm-eval's gsm8k strict-match filter finds it, while the
+          flexible filter still sees the last number;
+        * a reply that is a fenced code block (HumanEval under chat) returns
+          the body of the first ```python / ``` fence, so the harness appends
+          runnable code to the prompt instead of markdown.
+        Off when extract_answer_block=False (base-model mode).
         """
         if not self._extract_answer_block:
             return text
-        open_tag = "<|answer|>"
-        close_tag = "<|/answer|>"
-        open_idx = text.find(open_tag)
-        if open_idx == -1:
-            return text
-        rest = text[open_idx + len(open_tag) :]
-        close_idx = rest.find(close_tag)
-        if close_idx != -1:
-            rest = rest[:close_idx]
-        ans = rest.strip()
-        if not ans:
-            return text
-        # Only emit the "#### {ans}" duplicate when the answer looks
-        # like a number (gsm8k-style). Doing it for IFEval/longform
-        # responses doubles the response text — which would inflate
-        # word-count constraints, fool "include word X N times" checks,
-        # and generally break any IF grader that processes the literal
-        # output. The numeric check is permissive: matches "9", "9.0",
-        # "1,234", "-2.5", "$18", "18 dollars" with leading/trailing
-        # whitespace.
-        import re
-
-        if re.fullmatch(r"\$?-?[0-9][0-9.,]*\s*(?:dollars?|usd)?", ans, re.IGNORECASE):
-            return f"{ans}\n#### {ans}"
-        return ans
-
+        cut = text.find("<|end_turn|>")
+        if cut != -1:
+            text = text[:cut]
+        text = text.strip()
+        fence = re.search(
+            r"```(?:python|py|python3)?[ \t]*\n(.*?)(?:```|$)", text, re.S)
+        if fence is not None and text.lstrip().startswith("```"):
+            return fence.group(1).rstrip() + "\n"
+        boxed = re.findall(r"\\boxed\{([^{}]*)\}", text)
+        if boxed:
+            ans = boxed[-1].strip().replace(",", "").replace("$", "")
+            return f"{text}\n#### {ans}"
+        return text
 
     def _encode_pair(
         self, context: str, continuation: str,
@@ -541,8 +508,8 @@ class OSRTLMEval(LM):
             # Always stop at the model's trained end-of-answer tag —
             # the answer block is the target output for every benchmark
             # we run, and continuing past it just generates noise.
-            if self._chat_format_generate and "<|/answer|>" not in until:
-                until.append("<|/answer|>")
+            if self._chat_format_generate and "<|end_turn|>" not in until:
+                until.append("<|end_turn|>")
             max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
             requested_temp = float(
                 gen_kwargs.get("temperature", self._default_temperature),
