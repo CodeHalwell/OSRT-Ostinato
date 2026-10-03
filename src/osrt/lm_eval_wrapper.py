@@ -106,6 +106,7 @@ class OSRTLMEval(LM):
         default_repetition_penalty: float | None = None,
         extract_answer_block: bool | None = None,
         max_gen_toks: int = 256,
+        gen_prefix: str = "",
     ) -> None:
         """
         Eval-time prompt + sampling controls
@@ -157,6 +158,9 @@ class OSRTLMEval(LM):
         self._batch_size = batch_size
         self._max_length = max_length
         self._max_gen_toks = int(max_gen_toks)
+        # Prepended to every generate_until context (e.g. "```python\n" so a
+        # chat-annealed base continues code instead of closing a fence).
+        self._gen_prefix = gen_prefix
         # base_model=True: raw prompts, greedy, no answer extraction (a
         # pretrained trunk has no chat schema to put it "in distribution").
         # base_model=False: the v6 SFT defaults (chat wrap, temp 0.7, rp 1.2).
@@ -520,7 +524,7 @@ class OSRTLMEval(LM):
             # immediately after <|assistant|>, exactly where the model
             # learned to emit <|think|>...<|/think|><|answer|>... .
             ctx_ids = self.tok_encode(
-                self._wrap_context(context, for_generate=True),
+                self._gen_prefix + self._wrap_context(context, for_generate=True),
             )
             # Leave room for max_new tokens within the model's
             # max_position_embeddings. Drop oldest context if needed.

@@ -41,7 +41,7 @@ app = modal.App("osrt-lm-eval", image=image)
               secrets=[modal.Secret.from_name("hf-secret")])
 def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | None,
              batch_size: int, max_gen_toks: int, hf_repo: str,
-             log_samples: bool = False) -> str:
+             log_samples: bool = False, gen_prefix: str = "") -> str:
     import json
     import os
     import time
@@ -63,7 +63,8 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
     assert os.path.exists(path), path
     wrapper = OSRTLMEval(ckpt_path=path, tokenizer_path="/root/tokenizer",
                          batch_size=batch_size, base_model=True,
-                         max_gen_toks=max_gen_toks)
+                         max_gen_toks=max_gen_toks,
+                         gen_prefix=gen_prefix.encode().decode("unicode_escape"))
     task_list = [t.strip() for t in tasks.split(",") if t.strip()]
     t0 = time.time()
     res = simple_evaluate(model=wrapper, tasks=task_list,
@@ -112,7 +113,9 @@ def main(ckpt: str = "osrt_final.pt",
          tasks: str = "hellaswag,arc_easy,arc_challenge,piqa,winogrande",
          limit: int = 0, tag: str = "base", num_fewshot: int = -1,
          batch_size: int = 8, max_gen_toks: int = 256,
-         hf_repo: str = "HallD/OSRT-Ostinato-trunk", log_samples: bool = False):
+         hf_repo: str = "HallD/OSRT-Ostinato-trunk", log_samples: bool = False,
+         gen_prefix: str = ""):
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
-                          batch_size, max_gen_toks, hf_repo, log_samples))
+                          batch_size, max_gen_toks, hf_repo, log_samples,
+                          gen_prefix))
