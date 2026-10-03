@@ -493,90 +493,132 @@ class OSRTLMEval(LM):
 
     # ── generate_until (open-ended generation) ─────────────────────
 
+    def _gen_settings(self, gen_kwargs: dict) -> dict:
+        """Resolved per-request generation settings (hashable for grouping)."""
+        until = list(gen_kwargs.get("until") or [])
+        if isinstance(until, str):
+            until = [until]
+        # Always stop at the trained end of an assistant turn in chat mode;
+        # continuing past it only generates the next (hallucinated) turn.
+        if self._chat_format_generate and "<|end_turn|>" not in until:
+            until.append("<|end_turn|>")
+        requested_temp = float(gen_kwargs.get("temperature", self._default_temperature))
+        return {
+            "until": tuple(until),
+            "max_new": int(gen_kwargs.get("max_gen_toks", self.max_gen_toks)),
+            "temperature": min(requested_temp, self._max_temperature),
+            "top_p": float(gen_kwargs.get("top_p", self._default_top_p)),
+            "top_k": int(gen_kwargs.get("top_k", self._default_top_k)),
+            "repetition_penalty": float(gen_kwargs.get(
+                "repetition_penalty", self._default_repetition_penalty)),
+        }
+
+    def _stop_token_ids(self, until: tuple[str, ...]) -> list[int]:
+        """Stop strings that are a single token id stop generation EARLY
+        (the model's decode loop takes `stop_token_ids`); the rest are only
+        truncated in post. `<|end_turn|>` and `<|user|>` are single ids, so a
+        finished answer costs no further decode steps."""
+        ids = []
+        for stop in until:
+            enc = self.tok_encode(stop)
+            if len(enc) == 1:
+                ids.append(int(enc[0]))
+        return ids
+
+    def _encode_context(self, context: str, max_new: int) -> list[int]:
+        ctx_ids = self.tok_encode(
+            self._gen_prefix + self._wrap_context(context, for_generate=True),
+        )
+        # Leave room for max_new tokens within max_position_embeddings:
+        # drop the oldest context if needed.
+        keep = self._max_length - max_new
+        if len(ctx_ids) > keep:
+            ctx_ids = ctx_ids[-keep:]
+        return ctx_ids
+
+    def _cut_generated(self, gen_ids: list[int], stop_ids: list[int]) -> list[int]:
+        """Generated ids up to (excluding) the first EOS / stop id. Finished
+        rows of a batch are padded with EOS by the decode loop, so this also
+        strips that fill."""
+        stops = set(stop_ids) | {self.eot_token_id}
+        for i, t in enumerate(gen_ids):
+            if t in stops:
+                return gen_ids[:i]
+        return gen_ids
+
+    def _postprocess(self, text: str, until: tuple[str, ...]) -> str:
+        min_idx = math.inf
+        for stop in until:
+            idx = text.find(stop)
+            if idx != -1 and idx < min_idx:
+                min_idx = idx
+        if min_idx != math.inf:
+            text = text[: int(min_idx)]
+        return self._extract_answer(text)
+
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]) -> list[str]:
         """Generate continuations up to a stop string or max_gen_toks.
 
-        gsm8k passes `until=["</s>", "Question:", "\n\n"]` (or similar);
-        IFEval passes `until=["\n\n"]`. We use the model's KV-cached
-        .generate, then post-process to truncate at the first stop
-        string encountered.
-
-        Sampling defaults are tuned for the undertrained 363M MoE
-        (see __init__ docstring): temp 0.7, top_p 0.9, top_k 50,
-        repetition_penalty 1.2. Per-request gen_kwargs override these
-        but temperature is hard-capped at max_temperature (1.0).
+        Requests are grouped by identical resolved settings, sorted by
+        context length, and decoded `batch_size` at a time with LEFT padding
+        and an attention mask (the model's generate supports exactly that).
+        Single-token stop strings stop a row early in the decode loop; the
+        remaining stop strings are truncated in post. Results come back in
+        request order. Progress is printed per batch so a container log
+        shows where a run is.
         """
-        results: list[str] = []
-        for req in requests:
+        import time
+
+        pad_id = self._tok.pad_token_id
+        if pad_id is None:
+            pad_id = self.eot_token_id
+        n = len(requests)
+        results: list[str | None] = [None] * n
+        groups: dict[tuple, list[int]] = {}
+        settings: list[dict] = []
+        contexts: list[list[int]] = []
+        for i, req in enumerate(requests):
             context, gen_kwargs = req.args
-            until = list(gen_kwargs.get("until") or [])
-            if isinstance(until, str):
-                until = [until]
-            # Always stop at the model's trained end-of-answer tag —
-            # the answer block is the target output for every benchmark
-            # we run, and continuing past it just generates noise.
-            if self._chat_format_generate and "<|end_turn|>" not in until:
-                until.append("<|end_turn|>")
-            max_new = int(gen_kwargs.get("max_gen_toks", self.max_gen_toks))
-            requested_temp = float(
-                gen_kwargs.get("temperature", self._default_temperature),
-            )
-            temperature = min(requested_temp, self._max_temperature)
-            top_p = float(gen_kwargs.get("top_p", self._default_top_p))
-            top_k = int(gen_kwargs.get("top_k", self._default_top_k))
-            repetition_penalty = float(
-                gen_kwargs.get(
-                    "repetition_penalty",
-                    self._default_repetition_penalty,
-                ),
-            )
+            st = self._gen_settings(gen_kwargs)
+            settings.append(st)
+            contexts.append(self._encode_context(context, st["max_new"]))
+            groups.setdefault(tuple(sorted(st.items())), []).append(i)
 
-            # Wrap with SFT chat schema. The generation will start
-            # immediately after <|assistant|>, exactly where the model
-            # learned to emit <|think|>...<|/think|><|answer|>... .
-            ctx_ids = self.tok_encode(
-                self._gen_prefix + self._wrap_context(context, for_generate=True),
-            )
-            # Leave room for max_new tokens within the model's
-            # max_position_embeddings. Drop oldest context if needed.
-            keep = self._max_length - max_new
-            if len(ctx_ids) > keep:
-                ctx_ids = ctx_ids[-keep:]
-            ctx_tensor = torch.tensor(
-                [ctx_ids],
-                dtype=torch.long,
-                device=self._device,
-            )
-
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out_ids = self._model.generate(
-                    ctx_tensor,
-                    max_new_tokens=max_new,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repetition_penalty=repetition_penalty,
-                    eos_token_id=self.eot_token_id,
-                )
-
-            gen_ids = out_ids[0, len(ctx_ids) :].tolist()
-            text = self.tok_decode(gen_ids)
-
-            # Truncate at first occurrence of any stop string. The
-            # <|/answer|> auto-stop above means we cut cleanly at the
-            # answer-block close in the common case.
-            min_idx = math.inf
-            for stop in until:
-                idx = text.find(stop)
-                if idx != -1 and idx < min_idx:
-                    min_idx = idx
-            if min_idx != math.inf:
-                text = text[: int(min_idx)]
-            # Strip the <|think|>...<|/think|> wrapper and return only
-            # the answer-block contents so lm-eval's gsm8k extractor
-            # (which looks for "#### X", "\\boxed{X}", or last number)
-            # can find our numeric answer without us reformatting it.
-            text = self._extract_answer(text)
-            results.append(text)
-        return results
+        done, t0 = 0, time.time()
+        for _, idxs in groups.items():
+            st = settings[idxs[0]]
+            stop_ids = self._stop_token_ids(st["until"])
+            idxs = sorted(idxs, key=lambda i: -len(contexts[i]))
+            for b in range(0, len(idxs), self._batch_size):
+                batch = idxs[b : b + self._batch_size]
+                width = max(len(contexts[i]) for i in batch)
+                ids = torch.full((len(batch), width), pad_id, dtype=torch.long)
+                mask = torch.zeros((len(batch), width), dtype=torch.long)
+                for r, i in enumerate(batch):
+                    c = contexts[i]
+                    ids[r, width - len(c):] = torch.tensor(c, dtype=torch.long)
+                    mask[r, width - len(c):] = 1
+                ids = ids.to(self._device)
+                mask = mask.to(self._device) if len(batch) > 1 else None
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out_ids = self._model.generate(
+                        ids,
+                        max_new_tokens=st["max_new"],
+                        attention_mask=mask,
+                        temperature=st["temperature"],
+                        top_p=st["top_p"],
+                        top_k=st["top_k"],
+                        repetition_penalty=st["repetition_penalty"],
+                        eos_token_id=self.eot_token_id,
+                        stop_token_ids=stop_ids or None,
+                    )
+                for r, i in enumerate(batch):
+                    gen_ids = self._cut_generated(
+                        out_ids[r, width:].tolist(), stop_ids)
+                    results[i] = self._postprocess(self.tok_decode(gen_ids), st["until"])
+                done += len(batch)
+                el = time.time() - t0
+                print(f"[lm_eval] generate_until {done}/{n} | {el:.0f}s | "
+                      f"{el / done:.1f}s/req", flush=True)
+        return [r if r is not None else "" for r in results]

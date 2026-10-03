@@ -65,3 +65,33 @@ def test_chat_wrap_uses_render_chat_with_generation_prompt():
     assert w._wrap_context("hi", for_generate=True) == (
         "<|system|>Be brief.<|user|>hi<|assistant|>")
     assert w._wrap_context("hi", for_generate=False) == "hi"
+
+
+def test_generate_helpers_group_stop_and_cut():
+    w = _ChatStub()
+    w._chat_format_generate = True
+    w._max_temperature = 1.0
+    w._default_temperature = 0.0
+    w._default_top_p = 1.0
+    w._default_top_k = 0
+    w._default_repetition_penalty = 1.0
+    w._max_gen_toks = 64
+    st = w._gen_settings({"until": ["Question:", "\n\n"], "max_gen_toks": 32})
+    assert st["until"] == ("Question:", "\n\n", "<|end_turn|>") and st["max_new"] == 32
+    # Same kwargs -> same group key; a different cap -> a different group.
+    k1 = tuple(sorted(w._gen_settings({"until": ["Question:", "\n\n"],
+                                       "max_gen_toks": 32}).items()))
+    assert k1 == tuple(sorted(st.items()))
+    assert k1 != tuple(sorted(w._gen_settings({"until": ["Question:"]}).items()))
+    stop_ids = w._stop_token_ids(st["until"])
+    end_turn = w.tok_encode("<|end_turn|>")
+    assert len(end_turn) == 1 and end_turn[0] in stop_ids
+    assert all(len(w.tok_encode(s)) == 1 for s in st["until"]
+               if w.tok_encode(s)[0] in stop_ids)
+    eos = w.eot_token_id
+    gen = [5, 6, end_turn[0], 7, eos, eos]
+    assert w._cut_generated(gen, stop_ids) == [5, 6]
+    assert w._cut_generated([5, 6, eos, eos], stop_ids) == [5, 6]
+    assert w._cut_generated([5, 6], stop_ids) == [5, 6]
+    assert w._postprocess("The answer is 4.\n\nQuestion: next", st["until"]) == (
+        "The answer is 4.")
