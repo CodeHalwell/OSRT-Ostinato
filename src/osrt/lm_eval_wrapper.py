@@ -108,6 +108,7 @@ class OSRTLMEval(LM):
         max_gen_toks: int = 256,
         gen_prefix: str = "",
         legacy_gates: bool = True,
+        fast: bool = False,
     ) -> None:
         """
         Eval-time prompt + sampling controls
@@ -219,7 +220,8 @@ class OSRTLMEval(LM):
             router_bias_in_gates=legacy_gates,
         )
         self._cfg = cfg
-        self.resolved_config = {"legacy_gates": legacy_gates, "ckpt_path": ckpt_path,
+        self.resolved_config = {"legacy_gates": legacy_gates, "fast": fast,
+                                "ckpt_path": ckpt_path,
                                 "tokenizer_path": tokenizer_path,
                                 "base_model": base_model, "max_length": max_length,
                                 "max_gen_toks": max_gen_toks, "gen_prefix": gen_prefix,
@@ -236,6 +238,14 @@ class OSRTLMEval(LM):
         del ckpt, state_dict
 
         model.train(False)  # disables MoE capacity drops, enables KV-cache path
+        if fast:
+            # Compiled forward (telemetry off, prepacked experts): 10.9 ->
+            # 88.9 tok/s at batch 1 on an H100, greedy-identical to eager
+            # (scripts/bench_decode.py, PROGRESS §9d). Not the CUDA-graph
+            # static cache: that path takes no attention_mask, and
+            # generate_until batches with left padding. Cold compile ~3 min;
+            # set TORCHINDUCTOR_CACHE_DIR to a volume to pay it once.
+            model.optimize_for_inference(compile_model=True, reduce_overhead=False)
         self._model = model
         print("[lm_eval] Model ready.", flush=True)
 

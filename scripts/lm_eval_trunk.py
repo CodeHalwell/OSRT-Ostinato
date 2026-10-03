@@ -21,7 +21,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "build-essential")
     .env({"PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false",
-          "HF_ALLOW_CODE_EVAL": "1"})
+          "HF_ALLOW_CODE_EVAL": "1", "TORCHINDUCTOR_CACHE_DIR": "/vol/inductor_cache"})
     .pip_install(
         "torch==2.10.0+cu128",
         extra_options="--index-url https://download.pytorch.org/whl/cu128",
@@ -45,7 +45,8 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
              batch_size: int, max_gen_toks: int, hf_repo: str,
              log_samples: bool = True, gen_prefix: str = "",
              legacy_gates: bool = True, keep_text: bool = False,
-             hf_subdir: str = "trunk", chat: bool = False) -> str:
+             hf_subdir: str = "trunk", chat: bool = False,
+             fast: bool = False) -> str:
     import json
     import os
     import time
@@ -69,7 +70,7 @@ def evaluate(ckpt: str, tasks: str, limit: int, tag: str, num_fewshot: int | Non
                          batch_size=batch_size, base_model=not chat,
                          max_gen_toks=max_gen_toks,
                          gen_prefix=gen_prefix.encode().decode("unicode_escape"),
-                         legacy_gates=legacy_gates)
+                         legacy_gates=legacy_gates, fast=fast)
     task_list = [t.strip() for t in tasks.split(",") if t.strip()]
     t0 = time.time()
     res = simple_evaluate(model=wrapper, tasks=task_list,
@@ -133,9 +134,10 @@ def main(ckpt: str = "osrt_final.pt",
          batch_size: int = 8, max_gen_toks: int = 256,
          hf_repo: str = "HallD/OSRT-Ostinato-trunk", log_samples: bool = True,
          gen_prefix: str = "", legacy_gates: bool = True, keep_text: bool = False,
-         hf_subdir: str = "trunk", chat: bool = False):
+         hf_subdir: str = "trunk", chat: bool = False, fast: bool = False):
     """--chat: v7 chat mode (render_chat wrap, <|end_turn|> stop, boxed/code
     extraction) for SFT'd checkpoints; --hf-subdir sft pulls `sft/<ckpt>`.
+    --fast: compiled forward (8x decode; inductor cache on the volume).
 
     Run generation tasks with `modal run --detach`: the function is `.remote()`,
     and a client that dies (shell timeout, laptop sleep) cancels the input a
@@ -144,4 +146,5 @@ def main(ckpt: str = "osrt_final.pt",
     print(evaluate.remote(ckpt, tasks, limit, tag,
                           None if num_fewshot < 0 else num_fewshot,
                           batch_size, max_gen_toks, hf_repo, log_samples,
-                          gen_prefix, legacy_gates, keep_text, hf_subdir, chat))
+                          gen_prefix, legacy_gates, keep_text, hf_subdir, chat,
+                          fast))
