@@ -172,8 +172,9 @@ fixed retrospectively):
   router bias (a fresh model's zero bias hides the difference), copies the
   weights and compares — 0.0 logit difference with the flag, 5.8e-2 without
   (`tests/test_trunk_loader_equivalence.py`). The lm-eval wrapper and the
-  held-out scorer on `main` default to the flag. Still to run: the GPU
-  reproduction of the soup's held-out 3.183 through `main`'s scorer.
+  held-out scorer on `main` default to the flag. **Closed on a GPU the same
+  day:** `main`'s `scripts/eval_trunk.py` scored the soup at 3.1827 (8192×2)
+  and 3.2450 (4096×6), the pinned numbers to four decimals.
 - **Evaluation bookkeeping.** The wrapper now tokenises (context,
   continuation) jointly and splits, as the harness does (the trailing-space
   case diverged); the runner saves complete per-item outcomes, the resolved
@@ -199,13 +200,44 @@ fixed retrospectively):
 Ladder ~$30; trunk ~$280 across five workspaces over September and the first
 days of October; evaluation ~$12.
 
+## 9c. SFT probe (2026-10-03, running)
+
+The question is how much of the base's 0/164 HumanEval and 6–8% GSM8K is
+chat-format mismatch and how much is the base; the answer picks between a
+midtrain and the SFT + GRPO path. Spec with preregistered reads:
+`docs/specs/2026-10-03-sft-probe.md`.
+
+- **Code (`main`):** `osrt.sft_data` (`format="sft"`: any chat-shaped row
+  through `render_chat`, Python tabs → 4 spaces in assistant turns; `SFTStream`:
+  the pretraining packer with labels only on assistant spans, carried across
+  windows); `osrt.sft_train` (strict base load with the trunk's routing, HRA
+  rank 256 as the only trainable parameters, Gumbel 0 and balance
+  accumulation off, AdamW 2e-4 cosine, held-out SFT loss and fineweb loss
+  every 250 steps, adapters merged back into plain linears at the end via
+  `merge_hra` so the evaluators load the result unchanged);
+  `SFTProbeConfig`; `app.py --sft-probe-run`; `scripts/preflight_data.py --sft`.
+  The evaluator's chat mode follows the v7 `<|end_turn|>` contract and
+  extracts `\boxed{}` answers and leading code fences.
+- **Data:** data plan §2.1 no-think backbone, five sources (Dolci-Instruct,
+  smoltalk2 magpie + personas-IF, OpenCodeInstruct with
+  `average_test_score = 1.0`, OpenMathInstruct-2), rows over 4,096 tokens
+  dropped, first 500 rows of each source held out. **Preflight found that
+  `nvidia/Nemotron-SFT-Instruction-Following-Chat-v2` `reasoning_off` renders
+  empty on 399 of 400 rows through `render_chat`**; it is out of the probe
+  and was 5% of the anneal mix, so the trunk likely saw little of it.
+- **Run:** B200 on codhe-hugging-mcp, 1,000 steps × 262,144 tokens ≈ 0.26B,
+  ~25K tok/s, about 2.5 h. Step 0 (adapters at zero): held-out SFT loss
+  1.134 on assistant tokens, fineweb 3.2450 (the soup exactly). About 70% of
+  every packed window is supervised assistant text (v6's padded loader
+  managed ~24%).
+
 ## 12. Next
 
-1. `main` loader gate: load the soup with the trunk's recipe
-   (`router_bias_in_gates=True`, Muon 0.02) and reproduce held-out 3.18.
-2. SFT on the frozen soup with HRA adapters, per the data plan: short
-   chain-of-thought, length-matched, indentation normalised, the chat schema
-   the base already half-knows.
+1. Read the probe (GSM8K 0-shot chat on 200, HumanEval chat, held-out
+   curves) against the preregistered thresholds; decide midtrain vs SFT path.
+2. If SFT: the full data-plan §2 run (short-think slice, tool calling, 2
+   epochs ≈ 1.5B tokens), still adapters on the frozen soup unless the probe
+   says the base needs to move.
 3. GRPO with strict verifiable rewards (no partial credit), rollout
    temperature 0.4, dead-prompt filtering, paired-bootstrap checkpoint
    selection, ship a soup.
