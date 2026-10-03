@@ -206,6 +206,12 @@ loses on this model: 38% acceptance does not pay for the verify forward on
 top of the compiled baseline. The evaluators still run the eager path; moving
 them to the CUDA-graph path is the next engineering step.
 
+`scripts/lm_eval_trunk.py --fast` now uses the compiled path under the
+batched `generate_until`: on GSM8K chat the first batch of 8 paid a 238 s cold
+compile, then each batch of 8 took 5–6 s, 0.7 s per request against 4.5 s on
+eager (6.5×); scores matched (10.4% on 48 vs 10.5% on 200). The inductor
+cache lives on the volume, so the next run skips most of the compile.
+
 ## 10. Tooling that exists now
 
 - `scripts/eval_trunk.py` — held-out scoring of checkpoints and soups on
