@@ -21,6 +21,8 @@ is a design constraint, not a deployment afterthought.
 
 ## Shape
 
+![OSRT v7 architecture: three physical blocks looped six times, each with grouped-query attention over a compressed-latent KV cache and an MoE layer of one shared plus 28 routed SiTU-GLU experts, top-4](docs/diagrams/00-osrt-v7.png)
+
 | | |
 |---|---|
 | blocks × loops | 3 × 6 (18 effective layers), dim 1536 |
