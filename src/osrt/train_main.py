@@ -42,7 +42,9 @@ import torch
 
 from osrt.config import OSRTConfig
 from osrt.train import run_training
-from osrt.train_config import PretrainConfig
+from osrt.train_config import MidtrainConfig, PretrainConfig
+
+CONFIGS = {"pretrain": PretrainConfig, "midtrain": MidtrainConfig}
 
 try:
     from dotenv import load_dotenv
@@ -109,6 +111,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Pretrain OSRT v7 outside Modal (Colab, on-prem, etc.)",
     )
     p.add_argument(
+        "--config",
+        choices=sorted(CONFIGS),
+        default="pretrain",
+        help="Training recipe: 'pretrain' (the trunk) or 'midtrain' "
+             "(MidtrainConfig; resume it from the midtrain HF mirror).",
+    )
+    p.add_argument(
         "--tokenizer-path",
         default=os.environ.get("OSRT_TOKENIZER_PATH", "./tokenizer"),
         help="Local path to the HF tokenizer directory (default: ./tokenizer "
@@ -139,7 +148,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--wandb-run-name",
         default=None,
-        help="Override the W&B run name. Defaults to PretrainConfig value.",
+        help="Override the W&B run name. Defaults to the config's value.",
     )
     p.add_argument(
         "--wandb-run-id",
@@ -248,7 +257,7 @@ def main(argv: list[str] | None = None) -> None:
 
     model_config = _build_model_config(args.tokenizer_path)
 
-    train_cfg = PretrainConfig()
+    train_cfg = CONFIGS[args.config]()
     if args.total_steps is not None:
         train_cfg.total_steps = args.total_steps
     scale = args.micro_batch_scale

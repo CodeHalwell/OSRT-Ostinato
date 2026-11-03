@@ -58,13 +58,12 @@ image = (
         }
     )
     .pip_install(
-        "torch==2.10.0+cu128",
-        extra_options="--index-url https://download.pytorch.org/whl/cu128",
+        "torch==2.15.0",  # PyPI wheel, CUDA 13.2 (PROGRESS §9f)
     )
     .pip_install(
         "transformers==5.3.0",
         "datasets==4.6.1",
-        "triton==3.6.0",
+        "triton~=3.9.0",
         "wandb==0.25.1",
         "tokenizers==0.22.2",
         "safetensors==0.7.0",
@@ -419,8 +418,10 @@ def sft_probe(steps: int = 0, run_name: str = "", push_hf: bool = True) -> dict:
     return result
 
 
-MIDTRAIN_HF_REPO = "HallD/OSRT-Ostinato-midtrain"   # private; created on first run
-MIDTRAIN_INIT = ("HallD/OSRT-Ostinato-trunk", "trunk/osrt_soup_17000_17500_18000.pt")
+MIDTRAIN_HF_REPO = "HallD/OSRT-Ostinato-midtrain-v4"   # private; created on first run
+# v4 widens v3's mix (new sources = new recipe), so it starts from v3's newest
+# mirrored checkpoint with a fresh optimizer. "latest" = highest osrt_step_*.pt.
+MIDTRAIN_INIT = ("HallD/OSRT-Ostinato-midtrain-v3", "latest")
 
 
 @app.function(
@@ -474,7 +475,7 @@ def midtrain(hf_repo: str = MIDTRAIN_HF_REPO, total_steps: int | None = None,
     train_cfg.scale_micro_batches(micro_batch_scale)
     train_cfg.dataloader_num_workers = 0
 
-    ckpt_dir = "/vol/midtrain"
+    ckpt_dir = "/vol/midtrain_v4"
     os.makedirs(ckpt_dir, exist_ok=True)
     sync = None
     if hf_repo:
@@ -483,11 +484,16 @@ def midtrain(hf_repo: str = MIDTRAIN_HF_REPO, total_steps: int | None = None,
         sync.pull_latest(hf_repo, ckpt_dir, "osrt")
     if not glob.glob(f"{ckpt_dir}/osrt_*step_*.pt"):
         base_repo, base_file = MIDTRAIN_INIT
-        local = f"/vol/trunk/{os.path.basename(base_file)}"
-        if not os.path.exists(local):
-            print(f"[midtrain] pulling {base_file} from {base_repo}", flush=True)
-            local = hf_hub_download(base_repo, base_file, local_dir="/root/base")
-        train_cfg.init_weights_path = local
+        # Always from the mirror: a same-named file on a workspace volume
+        # (e.g. the TRUNK's osrt_step_500.pt) would be the wrong weights.
+        print(f"[midtrain] pulling {base_file} from {base_repo}", flush=True)
+        if base_file == "latest":
+            from scripts import hf_ckpt_sync
+            base_file = hf_ckpt_sync.pull_latest(base_repo, "/root/base", "osrt")
+            train_cfg.init_weights_path = f"/root/base/{base_file}"
+        else:
+            train_cfg.init_weights_path = hf_hub_download(
+                base_repo, base_file, local_dir="/root/base")
     run_id = persisted_wandb_run_id(ckpt_dir, wandb_run_id or None)
     vol.commit()
     train_cfg.wandb_run_id = run_id
@@ -540,7 +546,7 @@ def main(arm: str = "a", total_steps: int = 8000, seq_len: int = 2048,
     if midtrain_run:
         call = midtrain.spawn(hf_repo or MIDTRAIN_HF_REPO, midtrain_steps or None,
                               micro_batch_scale, wandb_run_id)
-        print(f"spawned midtrain: {call.object_id} — resumes from /vol/midtrain, "
+        print(f"spawned midtrain: {call.object_id} — resumes from /vol/midtrain_v4, "
               f"mirrors to {hf_repo or MIDTRAIN_HF_REPO}")
         return
     if sft_probe_run:

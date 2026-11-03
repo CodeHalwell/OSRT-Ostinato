@@ -21,12 +21,11 @@ image = (
         {"PYTHONUNBUFFERED": "1", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     )  # noqa: E501
     .pip_install(
-        "torch==2.10.0+cu128",
-        extra_options="--index-url https://download.pytorch.org/whl/cu128",
+        "torch==2.15.0",  # PyPI wheel, CUDA 13.2 (PROGRESS §9f)
     )
     .pip_install(
         "transformers==5.3.0",
-        "triton==3.6.0",
+        "triton~=3.9.0",
         "safetensors==0.7.0",
         "huggingface_hub>=0.35",
         "numpy",

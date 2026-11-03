@@ -238,6 +238,115 @@ beyond this month's credit. Next attempt: no re-warm (stable at the soup's
 final 6e-5 / Muon 2e-3 then decay), warmup ≥ 1,000, general web ≥ 0.30, and
 a step-0 eval so the first point is the soup itself.
 
+## 9f. Throughput, torch 2.15 and the long run (2026-11-02)
+
+Target set: **2× Chinchilla on physical parameters** = 38.7B tokens; the trunk
+did 5.43B, so 33.3B to go. At the trunk's 45K tok/s that is 205 B200-hours
+(~$1,290), so the work started with the step, not the credit.
+
+`scripts/profile_step.py` (synthetic batches, trunk shape 6×4096×11, Muon +
+AdamW, compile on; one GPU per card, ~$2 each):
+
+| | tok/s | peak GB | note |
+|---|---|---|---|
+| B200, torch 2.10, as the trunk ran (grad ckpt off) | 52.7K | 114 | kernel-bound, not launch-bound; optimizer 2.5% of the step |
+| H200 | 33.1K | 114 | $38 per B tokens vs B200 $33 |
+| H100, 3×4096×22 | 27.4K | 71 | $40 per B tokens |
+| B200 after the graph-break fix | 56.2K | 88 | |
+| B200, torch 2.15.0+cu132 (PyPI) | 58.5K | 106 | |
+| **B200, fix + torch 2.15** | **64.2K** | **88** | +24% tok/s, −14% memory vs the trunk's code |
+| B200, fix + 2.15, 12×4096×5 | 66.4K | 159 | not worth the memory |
+
+Throughput tracked memory bandwidth across the three cards (glue-bound). The
+kernel table showed half the GPU time in eager elementwise/copy/cat/index_add,
+and `TORCH_LOGS=graph_breaks` named the cause: `MoELayer._accumulate_balance_counts`
+sat behind `torch._dynamo.disable` (for `torch.bincount`'s data-dependent
+shape), breaking the compiled graph at every one of the 18 MoE layers per
+micro-batch. Fix: scatter_add and no decorator; `tests/test_compile_breaks.py`
+asserts one graph, zero breaks on the grouped-GEMM path. torch 2.15.0 (PyPI,
+CUDA 13.2, triton 3.9) runs on Modal's B200 and reproduced the soup's held-out
+loss exactly (3.1827 / 3.2450); every GPU image now pins it.
+
+**Launched 2026-11-02 ~10:30 GMT on inference-syn** (app `ap-KPcXnOA08MiXUGAtZPFnak`,
+mirror `HallD/OSRT-Ostinato-midtrain-v2`): `MidtrainConfig` from the soup,
+WSD warmup 2,000 → 1e-4 (Muon 3e-3), flat to step 104,550, decay to 1e-5 at
+123,000; maths 0.30 / reasoning 0.15 / code 0.25 / general 0.30; eval and
+checkpoint every 500; **step-0 held-out 3.2451 (the soup)**. Gate: fineweb
+under 3.245 by step 5,000 or the peak comes down. This month's $200 ≈ 32 h
+≈ 7.4B tokens ≈ 27,000 steps, relayed across the five workspaces with the
+same command under the next `MODAL_PROFILE`.
+
+| step | held-out fineweb 4096×6 | note |
+|---|---|---|
+| 0 | 3.2451 | the soup |
+| 500 | 3.1638 | −0.08 vs the soup at LR 2.5e-5; last night's attempt read 3.510 here |
+| 1,000 | 3.2324 | LR 5e-5 |
+| 1,500 | 3.3663 | LR 7.5e-5 — **stopped**: degradation tracks the LR level, not the ramp |
+
+**v3 (launched ~12:45 GMT, app `ap-yxSHq1FspVQQD5Rjo8E4WC`, mirror
+`HallD/OSRT-Ostinato-midtrain-v3`):** peak 5e-5 / Muon 1.5e-3, warmup
+1,000, otherwise the same schedule and mix. Initialised from v2's step-500
+weights (held-out 3.164, the best weights so far) with a fresh optimizer, so
+the 500 good steps are kept. Reasoning: a WSD plateau holds the peak for
+100k steps and we fund ~5% of the schedule a month, so the peak must be a
+level at which plateau checkpoints are themselves usable bases.
+
+v3 held-out (fineweb, cached batches): 3.1638@0 → 3.1640@500 (LR 2.5e-5) →
+3.2360@1000 → 3.2621@1500 → 3.2578@2000 → 3.2381@2500 → 3.2624@3000 →
+3.2394@3500 → 3.2411@4000 → **3.2234@4500** (all 5e-5). The rise at the
+plateau turned by step 2,000 and the band is now trending down, so 5e-5 stays. inference-syn
+cut the container at step ~1,300 (14:51 GMT); relayed to gradio-winter-hack
+(app `ap-T3TbP16V84sVuMi8rbvQxE`) resuming from the step-1000 mirror
+checkpoint, same W&B run.
+
+**v4 (prepared 2026-11-02, launches at the next credit cut):** v3's recipe
+with six unused Nemotron pools added, group totals unchanged (maths 0.30 /
+reasoning 0.15 / code 0.25 / general 0.30): `Nemotron-Pretraining-Specialized-v1.2`
+Fact-Seeking (general 0.04) and Multiple-Choice (reasoning 0.03),
+`Specialized-v1.1` Code-Concepts (code 0.04), `Pretraining-Code-v2`
+Synthetic-Student-Teacher (code 0.03), `Nemotron-CC-v2.1` High-Quality (0.05)
+and High-Quality-DQA (0.02). Paid for by fineweb-edu 0.18→0.10, stack-v3
+0.10→0.07 and small trims elsewhere. Recipe keys are strict on resume, so v4
+is a new run: `/vol/midtrain_v4`, mirror `HallD/OSRT-Ostinato-midtrain-v4`,
+`MIDTRAIN_INIT = (midtrain-v3, "latest")` pulls v3's newest mirrored
+checkpoint as `init_weights_path` with a fresh optimizer. Same launch command.
+Candidates reviewed but not added: Nemotron-MIND (138B claimed, viewer shows
+3.3 GB — verify), Pretraining-SFT-v1 (gated, access requested 11-02),
+Legal-v1, Nemotron-Math-v2 / OpenMathReasoning (long-CoT, SFT-stage).
+
+**v3 ended at step 5,000 (23:20 GMT) by the step-5000 router-sharpening
+gate, not by credit:** `clean_per_token_entropy 2.906 > 2.449`. The gate's
+target is a 26.5% drop from ln 28; the trunk's own converged router ends at
+2.73 (W&B qz3od3gx), so no continuation of this base can pass it. All other
+router checks passed (bal 1.01–1.04, dead experts 0, raw_max 0.21 vs 0.15
+floor). `osrt_failed_step_5000.pt` is on the mirror; the resume scan and
+`pull_latest` ignore it, so v4 initialised from `osrt_step_4500.pt`.
+`MidtrainConfig.per_token_entropy_drop_frac = 0.05` (target 3.17) keeps a
+guard against a router going uniform without failing the base. Note the
+drift: per-token entropy rose 2.73 → 2.91 over v3's 5,000 steps at 5e-5.
+v4 launched 23:35 GMT on build-small, app `ap-LVl5QWFRzOQ69kgk7xm7xb`,
+W&B run 4aa49ce0. Held-out: 3.2234@0 (= v3's step 4,500) → **3.0872@500**
+(LR 2.5e-5, warmup) → 3.2080@1000 → 3.2256@1500 → 3.2089@2000 → 3.2107@2500 → 3.2063@3000 → 3.1952@3500 → 3.1960@4000 → 3.1833@4500 → 3.1919@5000 → 3.1857@5500 → 3.1920@6000 → 3.1781@6500 → 3.1717@7000 → 3.1711@7500 → 3.1633@8000 → 3.1603@8500 → 3.1589@9000 → 3.1665@9500 (LR 5e-5
+plateau; turned at 2,000 as v3 did, now trending down). The relaxed
+step-5000 router gate passed. build-small cut at ~2,600 (04:25 GMT
+11-03); relayed to danielhalwell (app `ap-7W3KN70kCQr7vUyu19cQo6`) from 2,500.
+danielhalwell cut at ~5,700 (10:17 GMT); relayed to codhe-hugging-mcp (app
+`ap-qD0hgOGJnbNbyTa0TxvCyn`) from 5,500 — the last workspace with free credit.
+codhe-hugging-mcp cut at step 9,500 (17:33 GMT 11-03), clean exit, right after
+the step-9,500 checkpoint and eval. **Free credit exhausted. v4 stands at
+step 9,500: 2.57B tokens on the widened mix, ≈9.4B in the lineage
+(trunk 5.43B + v2 0.14B + v3 1.22B + v4 2.57B). Latest weights:
+`HallD/OSRT-Ostinato-midtrain-v4/osrt_step_9500.pt` (held-out 3.1665; best
+3.1589 at step 9,000).** To continue: same launch command on any workspace
+with credit, or Colab RTX PRO 6000 via `train_main` (needs a `--config
+midtrain` switch).
+ Part of the
+step-500 drop is distribution match (CC-v2.1 + Fact-Seeking are web-shaped
+like the fineweb-edu held-out). The step-1000 jump is the third run in a row
+where the first plateau eval at 5e-5 is worse than the step-500 eval at
+2.5e-5 (v2 +0.07, v3 +0.07, v4 +0.12); in v3 the band then needed 4,000
+steps to get back to its step-500 level.
+
 ## 10. Tooling that exists now
 
 - `scripts/eval_trunk.py` — held-out scoring of checkpoints and soups on

@@ -160,6 +160,7 @@ class PretrainConfig:
     # Weights to start from when the checkpoint dir is empty (midtrain /
     # continued pretraining from a finished run). Fresh optimizer, step 0.
     init_weights_path: str = ""
+    eval_at_start: bool = False  # held-out eval before step 1 (midtrain: the soup)
 
     # ── Loop-collapse floor (roadmap §17.3) ────────────────────────────
     # Per-effective-layer residual update ||Δx||/||x||. Two independent groups
@@ -813,38 +814,53 @@ class SFTProbeConfig:
 
 
 class MidtrainConfig(PretrainConfig):
-    """Midtrain of the v7 base (the soup) — docs/specs/2026-10-03-sft-probe.md
-    result: maths is the base's problem, code was format. One phase at seq
-    4096 on the knowledge pools re-weighted toward maths and reasoning, full
-    model, HRA off, Muon + AdamW, cosine from a moderate peak. Fixed schedule
-    of `total_steps`; drip-funded across workspaces like the trunk (resume
-    from the highest checkpoint, HF mirror `HallD/OSRT-Ostinato-midtrain`).
+    """Continued pretraining of the v7 base toward 2x Chinchilla on PHYSICAL
+    parameters (38.7B tokens; the trunk did 5.43B): docs/PROGRESS.md §9e-f.
 
-    Starts from `init_weights_path` (the soup, pulled from the trunk mirror by
-    app.py) with a fresh optimizer. Router Gumbel is off: the router is
-    trained. Held-out eval at 4096 x 6 so the gate compares with the soup's
-    3.245 (roadmap §20.5).
+    One phase at seq 4096 on the knowledge pools re-weighted toward maths and
+    reasoning with general web held at 0.30, full model, HRA off, Muon +
+    AdamW. Warmup-stable-decay: a long flat phase that drip-funding can stop
+    and resume anywhere, decay only at the end. Starts from the soup
+    (`init_weights_path`, fresh optimizer) with an eval at step 0 so the
+    first held-out point IS the soup (3.245 at 4096x6).
+
+    History: 2026-10-03 attempt 1 (cosine, peak 2e-4) re-warmed the base
+    (loss 1.79 -> 2.08 by step 250); attempt 2 (peak 1e-4, general 0.20) held
+    fineweb at 3.51 vs 3.245 through step 1,000. Gate for this run: fineweb
+    back under 3.245 by step 5,000 or the peak comes down.
     """
 
-    _total_steps: int = 20_000           # 20,000 x 270,336 ≈ 5.4B tokens
-    warmup_steps: int = 300
-    lr_schedule: str = "cosine"
-    # First launch (2026-10-03, peak 2e-4 / Muon 6e-3) re-warmed the converged
-    # base: task loss 1.79 -> 2.08 and grad norm 0.5 -> 2.1 by step 250 with
-    # the LR still climbing. Half the peak: ~1.7x the trunk's FINAL LR
-    # (6e-5 / 2e-3), not 3x.
-    peak_lr: float = 1e-4
-    min_lr: float = 1e-5
-    muon_lr: float = 3e-3
-    muon_min_lr: float = 3e-4
+    # v2 (2026-11-02, peak 1e-4, warmup 2k, general 0.30): held-out 3.164 at
+    # LR 2.5e-5, 3.232 at 5e-5, 3.366 at 7.5e-5 — the base degrades above
+    # 5e-5 regardless of ramp speed, and a WSD plateau holds the peak for
+    # 100k steps, so the peak IS the tolerated level. v3 starts from v2's
+    # step-500 weights (3.164) with a fresh optimizer. v3 held 3.24-3.26 on
+    # the plateau through step 4,500. v4 = v3's mix widened with six unused
+    # Nemotron pools (fact-seeking QA, code concepts, MCQ, student-teacher
+    # code, CC-v2.1 web + DQA), group totals unchanged; init from v3's
+    # latest checkpoint with a fresh optimizer (recipe keys are strict).
+    _total_steps: int = 123_000          # 123,000 x 270,336 ≈ 33.3B tokens
+    warmup_steps: int = 1_000
+    lr_schedule: str = "wsd"
+    wsd_decay_frac: float = 0.15
+    peak_lr: float = 5e-5
+    min_lr: float = 5e-6
+    muon_lr: float = 1.5e-3
+    muon_min_lr: float = 1.5e-4
     router_gumbel_tau_init: float = 0.0
     router_gumbel_tau_final: float = 0.0
     router_gumbel_anneal_steps: int = 1
+    eval_at_start: bool = True
     eval_interval: int = 500
     ckpt_interval: int = 500
     eval_seq_len: int = 4096
     eval_batch_size: int = 6
-    wandb_run_name: str = "osrt-v7-midtrain"
+    # The step-5000 router-sharpening gate killed v3: the converged trunk
+    # router sits at per-token entropy 2.73 (v3: 2.91) against a target of
+    # 2.45, so the 0.265 drop fraction never fits this base. 0.05 (target
+    # 3.17) still catches a router going uniform; the other checks stay.
+    per_token_entropy_drop_frac: float = 0.05
+    wandb_run_name: str = "osrt-v7-midtrain-v4"
 
     _phase_spec: dict = {  # noqa: RUF012
         "midtrain": {
@@ -853,53 +869,69 @@ class MidtrainConfig(PretrainConfig):
             "batch_size": 6,          # 6 x 4096 = 24K tokens/micro-batch
             "grad_accum_steps": 11,   # 270,336 tokens/step (trunk knowledge shape)
             "datasets": [
-                # maths 0.35
+                # maths 0.30
                 dict(name="nemotron-cc-math-4plus", hf_id="nvidia/Nemotron-CC-Math-v1",
-                     hf_config="4plus", weight=0.08),
+                     hf_config="4plus", weight=0.07),
                 dict(name="nemotron-cc-math-mind", hf_id="nvidia/Nemotron-CC-Math-v1",
-                     hf_config="4plus_MIND", weight=0.05),
+                     hf_config="4plus_MIND", weight=0.04),
                 dict(name="finemath-4plus", hf_id="HuggingFaceTB/finemath",
-                     hf_config="finemath-4plus", weight=0.05),
+                     hf_config="finemath-4plus", weight=0.04),
                 dict(name="infiwebmath-4plus", hf_id="HuggingFaceTB/finemath",
                      hf_config="infiwebmath-4plus", weight=0.02),
                 dict(name="nemotron-math-textbooks",
                      hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
-                     hf_config="Nemotron-Pretraining-Math-Textbooks", weight=0.05),
+                     hf_config="Nemotron-Pretraining-Math-Textbooks", weight=0.04),
                 dict(name="openmathinstruct-2", hf_id="nvidia/OpenMathInstruct-2",
-                     format="openmath_instruct2", weight=0.10),
-                # reasoning / STEM 0.20
+                     format="openmath_instruct2", weight=0.09),
+                # reasoning / STEM 0.15
                 dict(name="nemotron-stem-sft",
                      hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
-                     hf_config="Nemotron-Pretraining-STEM-SFT", weight=0.06),
+                     hf_config="Nemotron-Pretraining-STEM-SFT", weight=0.03),
                 dict(name="nemotron-rqa",
                      hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
-                     hf_config="Nemotron-Pretraining-RQA", weight=0.05),
+                     hf_config="Nemotron-Pretraining-RQA", weight=0.03),
+                dict(name="nemotron-mcq",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1.2",
+                     hf_config="Nemotron-Pretraining-Multiple-Choice", weight=0.03),
                 dict(name="nemotron-infinibyte",
                      hf_id="nvidia/Nemotron-Pretraining-Specialized-v1",
                      hf_config="Nemotron-Pretraining-InfiniByte-Reasoning",
-                     weight=0.04),
-                dict(name="stackexchange", hf_id="common-pile/stackexchange_filtered",
                      weight=0.03),
+                dict(name="stackexchange", hf_id="common-pile/stackexchange_filtered",
+                     weight=0.02),
                 dict(name="nemotron-science-mcq", hf_id="nvidia/Nemotron-Science-v1",
-                     split="MCQ", max_tokens=2048, weight=0.02),
+                     split="MCQ", max_tokens=2048, weight=0.01),
                 # code 0.25
                 dict(name="stack-v3", hf_id="HuggingFaceCode/stack-v3-train",
-                     format="stack_v3", weight=0.10),
+                     format="stack_v3", weight=0.07),
+                dict(name="nemotron-code-concepts",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1.1",
+                     hf_config="Nemotron-Pretraining-Code-Concepts", weight=0.04),
                 dict(name="opencodeinstruct", hf_id="nvidia/OpenCodeInstruct",
                      format="io_pair", weight=0.06,
                      filter={"average_test_score": ["1.0", "1", "1.00", 1.0, 1]}),
                 dict(name="nemotron-code-syn-qa",
                      hf_id="nvidia/Nemotron-Pretraining-Code-v2",
-                     hf_config="Synthetic-Question-Answering", weight=0.05),
+                     hf_config="Synthetic-Question-Answering", weight=0.03),
+                dict(name="nemotron-code-student-teacher",
+                     hf_id="nvidia/Nemotron-Pretraining-Code-v2",
+                     hf_config="Synthetic-Student-Teacher", weight=0.03),
                 dict(name="opc-algorithmic", hf_id="OpenCoder-LLM/opc-annealing-corpus",
-                     hf_config="algorithmic_corpus", weight=0.04),
-                # general 0.20
+                     hf_config="algorithmic_corpus", weight=0.02),
+                # general 0.30
                 dict(name="fineweb-edu", hf_id="HuggingFaceFW/fineweb-edu",
-                     weight=0.12),
+                     weight=0.10),
+                dict(name="nemotron-cc-hq", hf_id="nvidia/Nemotron-CC-v2.1",
+                     hf_config="High-Quality", weight=0.05),
+                dict(name="nemotron-cc-dqa", hf_id="nvidia/Nemotron-CC-v2.1",
+                     hf_config="High-Quality-DQA", weight=0.02),
+                dict(name="nemotron-fact-seeking",
+                     hf_id="nvidia/Nemotron-Pretraining-Specialized-v1.2",
+                     hf_config="Nemotron-Pretraining-Fact-Seeking", weight=0.04),
                 dict(name="cosmopedia-v2", hf_id="HuggingFaceTB/smollm-corpus",
                      hf_config="cosmopedia-v2", weight=0.04),
                 dict(name="finepdfs-edu", hf_id="HuggingFaceFW/finepdfs-edu",
-                     hf_config="eng_Latn", weight=0.04),
+                     hf_config="eng_Latn", weight=0.05),
             ],
         },
     }

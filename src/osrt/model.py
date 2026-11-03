@@ -485,7 +485,6 @@ class MoELayer(nn.Module):
                 expert, seed=self._moe_seed * 1000 + ei, gain=1.0,
             )
 
-    @torch._dynamo.disable
     @torch.no_grad()
     def _accumulate_balance_counts(
         self, top_idx: Tensor, loop_idx: int, score: Tensor | None = None,
@@ -499,7 +498,13 @@ class MoELayer(nn.Module):
         if not self.bias_enabled:
             return
         flat = top_idx.reshape(-1)
-        counts = torch.bincount(flat, minlength=self.num_routed).float()
+        # scatter_add, not bincount: bincount's data-dependent output shape
+        # was why this method sat behind torch._dynamo.disable, which broke
+        # the compiled graph at every MoE layer (18x per micro-batch; profiled
+        # 2026-11-02 at half the step's GPU time in eager glue).
+        counts = torch.zeros(
+            self.num_routed, dtype=torch.float32, device=flat.device,
+        ).scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
         self.balance_count_accum[loop_idx].add_(counts)
         self.balance_total_accum[loop_idx].add_(counts.sum())
 

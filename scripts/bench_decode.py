@@ -32,11 +32,10 @@ image = (
     .env({"PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false",
           "TORCHINDUCTOR_CACHE_DIR": "/vol/inductor_cache"})
     .pip_install(
-        "torch==2.10.0+cu128",
-        extra_options="--index-url https://download.pytorch.org/whl/cu128",
+        "torch==2.15.0",  # PyPI wheel, CUDA 13.2 (PROGRESS §9f)
     )
     .pip_install(
-        "transformers==5.3.0", "triton==3.6.0", "tokenizers==0.22.2",
+        "transformers==5.3.0", "triton~=3.9.0", "tokenizers==0.22.2",
         "safetensors==0.7.0", "huggingface_hub>=0.35", "numpy",
     )
     .add_local_dir(str(Path(__file__).resolve().parent.parent / "src"), "/root/src")

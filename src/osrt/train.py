@@ -1532,6 +1532,20 @@ def run_training(
         del init_ckpt, init_sd
         print(f"Initialised weights from {init_path} (fresh optimizer, step 0)",
               flush=True)
+        if getattr(train_cfg, "eval_at_start", False):
+            # The first held-out point is the initial weights themselves, so
+            # every later eval reads as a delta from the base (midtrain gate).
+            m0 = run_eval(
+                model, tokenizer_name,
+                getattr(train_cfg, "eval_seq_len", 2048),
+                getattr(train_cfg, "eval_batch_size", 8),
+                train_cfg.eval_steps, device,
+            )
+            print(f"  EVAL step 0 | loss {m0['eval/loss']:.4f} | "
+                  f"ppl {math.exp(m0['eval/loss']):.1f}", flush=True)
+            if use_wandb:
+                wandb.log(m0, step=0)
+            model.train()
     if start_step >= train_cfg.total_steps:
         print(
             f"Run already complete: checkpoint step {start_step - 1} >= "
