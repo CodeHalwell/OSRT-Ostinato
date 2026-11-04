@@ -1303,6 +1303,13 @@ def run_training(
             _dynamo.config.capture_scalar_outputs = True
             _dynamo.config.capture_dynamic_output_shape_ops = True
             print("Grouped-GEMM MoE: enabled dynamo scalar/dynamic-shape capture")
+        if torch.cuda.get_device_properties(device).major == 12:
+            # sm_120 (RTX PRO 6000 / consumer Blackwell) caps shared memory at
+            # 99 KB per block; Inductor's persistent fused-RMSNorm backward
+            # reduction needs ~120 KB and fails with "No valid triton configs".
+            import torch._inductor.config as _inductor
+            _inductor.triton.persistent_reductions = False
+            print("sm_120: inductor persistent reductions off (99 KB smem limit)")
         print("Compiling model with torch.compile...")
         compile_start = time.time()
         model = torch.compile(model)
