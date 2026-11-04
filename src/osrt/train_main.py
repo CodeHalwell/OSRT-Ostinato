@@ -203,7 +203,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_model_config(tokenizer_path: str) -> OSRTConfig:
+def _build_model_config(tokenizer_path: str, legacy_gates: bool = False) -> OSRTConfig:
     """Load the tokenizer once to seed vocab/special-token IDs into the config.
 
     Two distinct vocab numbers, and conflating them is a real bug:
@@ -252,6 +252,7 @@ def _build_model_config(tokenizer_path: str) -> OSRTConfig:
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
         fused_cross_entropy_chunks=8,
+        router_bias_in_gates=legacy_gates,
     )
 
 
@@ -282,7 +283,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 
-    model_config = _build_model_config(args.tokenizer_path)
+    # The midtrain lineage keeps the trunk's routing function (app.py midtrain:
+    # router_bias_in_gates=True); the resume check refuses anything else.
+    model_config = _build_model_config(args.tokenizer_path, args.config == "midtrain")
 
     train_cfg = CONFIGS[args.config]()
     if args.total_steps is not None:
