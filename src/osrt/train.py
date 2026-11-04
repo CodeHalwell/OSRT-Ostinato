@@ -1309,7 +1309,10 @@ def run_training(
             # reduction needs ~120 KB and fails with "No valid triton configs".
             import torch._inductor.config as _inductor
             _inductor.triton.persistent_reductions = False
-            print("sm_120: inductor persistent reductions off (99 KB smem limit)")
+            print("sm_120: inductor persistent reductions off (99 KB smem limit); "
+                  f"effective={_inductor.triton.persistent_reductions} — if a "
+                  "triton_per_* kernel still fails, export "
+                  "TORCHINDUCTOR_PERSISTENT_REDUCTIONS=0 before python starts")
         print("Compiling model with torch.compile...")
         compile_start = time.time()
         model = torch.compile(model)
