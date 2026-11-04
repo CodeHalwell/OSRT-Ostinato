@@ -340,6 +340,16 @@ step 9,500: 2.57B tokens on the widened mix, ≈9.4B in the lineage
 3.1589 at step 9,000).** To continue: same launch command on any workspace
 with credit, or Colab RTX PRO 6000 via `train_main` (needs a `--config
 midtrain` switch).
+
+**Colab continuation + release path (built 2026-11-03):** Colab Pro+ holds
+~1,950 compute units (~8/h on an RTX PRO 6000 ≈ 240 h ≈ 13–17B tokens).
+`train_main --config midtrain` resumes v4 from the mirror
+(`notebooks/v7_midtrain_colab.ipynb` §5). Plan agreed: run to 2× Chinchilla on
+active params (10.5B lineage ≈ v4 step 13,600), then
+`--cooldown-steps 1000` branch (optimizer kept, LR 5e-5 → 5e-6 over exactly
+those steps, separate mirror `-v4-cooldown`; §7), `scripts/soup.py` over the
+last three checkpoints (§8), and `scripts/run_sft.py` (the SFT probe outside
+Modal; §9) on the soup, then chat-mode GSM8K/HumanEval on Modal.
  Part of the
 step-500 drop is distribution match (CC-v2.1 + Fact-Seeking are web-shaped
 like the fineweb-edu held-out). The step-1000 jump is the third run in a row

@@ -34,7 +34,9 @@ and `--no-wandb`; the launch gate of the real shape is
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import re
 import secrets
 import sys
 
@@ -45,6 +47,21 @@ from osrt.train import run_training
 from osrt.train_config import MidtrainConfig, PretrainConfig
 
 CONFIGS = {"pretrain": PretrainConfig, "midtrain": MidtrainConfig}
+
+
+def cooldown_schedule(resume_step: int, cooldown_steps: int) -> tuple[int, float]:
+    """(total_steps, wsd_decay_frac) that hold the peak up to `resume_step` and
+    decay linearly to min_lr over the next `cooldown_steps` (train.get_lr)."""
+    if cooldown_steps < 1 or resume_step < 1:
+        raise ValueError("cooldown needs a resumed step and >= 1 cooldown steps")
+    total = resume_step + cooldown_steps
+    return total, cooldown_steps / total
+
+
+def latest_local_step(ckpt_dir: str) -> int | None:
+    paths = glob.glob(os.path.join(ckpt_dir, "osrt_*step_*.pt"))
+    steps = [int(m.group(1)) for p in paths if (m := re.search(r"step_(\d+)\.pt$", p))]
+    return max(steps) if steps else None
 
 try:
     from dotenv import load_dotenv
@@ -144,6 +161,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Override PretrainConfig.total_steps (default "
              f"{PretrainConfig().total_steps:,}). Useful for sanity / "
              f"partial-budget runs; never change it mid-run.",
+    )
+    p.add_argument(
+        "--cooldown-steps",
+        type=int,
+        default=None,
+        help="Branch a WSD cooldown off the checkpoint in --ckpt-dir: the run "
+             "ends `N` steps after the resumed step, decaying to min_lr over "
+             "exactly those steps (optimizer state kept). Sets "
+             "OSRT_ALLOW_RECIPE_DRIFT=1 for this process. Point --hf-repo at a "
+             "SEPARATE mirror so the main run's 'latest' is untouched.",
     )
     p.add_argument(
         "--wandb-run-name",
@@ -287,6 +314,15 @@ def main(argv: list[str] | None = None) -> None:
         # Also pulls wandb_run_id.txt, so the id below is the previous
         # session's, not a fresh one on a wiped Colab disk.
         sync.pull_latest(args.hf_repo, args.ckpt_dir, "osrt")
+    if args.cooldown_steps is not None:
+        resume_step = latest_local_step(args.ckpt_dir)
+        if resume_step is None:
+            sys.exit(f"--cooldown-steps: nothing to branch from in {args.ckpt_dir}")
+        train_cfg.total_steps, train_cfg.wsd_decay_frac = cooldown_schedule(
+            resume_step, args.cooldown_steps)
+        os.environ["OSRT_ALLOW_RECIPE_DRIFT"] = "1"
+        print(f"cooldown: step {resume_step} -> {train_cfg.total_steps}, "
+              f"wsd_decay_frac {train_cfg.wsd_decay_frac:.4f}", flush=True)
     if train_cfg.wandb_log:
         train_cfg.wandb_run_id = persisted_wandb_run_id(
             args.ckpt_dir, args.wandb_run_id)
