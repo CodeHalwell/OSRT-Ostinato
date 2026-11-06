@@ -163,6 +163,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              f"partial-budget runs; never change it mid-run.",
     )
     p.add_argument(
+        "--stop-step",
+        type=int,
+        default=None,
+        help="Return once osrt_step_N.pt for this step is saved (schedule "
+        "untouched, so the plateau can resume later).",
+    )
+    p.add_argument(
         "--cooldown-steps",
         type=int,
         default=None,
@@ -259,6 +266,7 @@ def _build_model_config(tokenizer_path: str, legacy_gates: bool = False) -> OSRT
 # What each `run_training` status means for the person at the keyboard.
 _STATUS_HINTS = {
     "complete": "done; osrt_final.pt (+ its step alias) written",
+    "stopped": "--stop-step reached; the plateau resumes from the mirror's latest",
     "already_complete": "nothing to do — a checkpoint at/after total_steps "
                         "already exists in --ckpt-dir",
     "early_stop": "health criteria failed; osrt_failed_step_N.pt holds the "
@@ -347,6 +355,7 @@ def main(argv: list[str] | None = None) -> None:
             vol=_LocalVol(),
             tokenizer_name=args.tokenizer_path,
             ckpt_dir=args.ckpt_dir,
+            stop_step=args.stop_step,
         )
     finally:
         # The push daemon polls, and both the rescue path and the end-of-run

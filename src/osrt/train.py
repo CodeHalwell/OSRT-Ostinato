@@ -1206,6 +1206,7 @@ def run_training(
     vol,
     tokenizer_name: str,
     ckpt_dir: str = "/vol/checkpoints/v7",
+    stop_step: int | None = None,
 ) -> str:
     """Execute the v7 pre-training loop.
 
@@ -1627,6 +1628,13 @@ def run_training(
         _save(f"{ckpt_dir}/osrt_failed_step_{step}.pt", step)
 
     while step < train_cfg.total_steps and not early_stop_triggered:
+        if stop_step is not None and step > stop_step:
+            # osrt_step_{stop_step}.pt is already saved; the schedule is untouched
+            # so the mirror's latest resumes the plateau as if nothing happened.
+            print(f"\nStopped after step {stop_step} (--stop-step)", flush=True)
+            if use_wandb:
+                wandb.finish()
+            return "stopped"
         phase_name, phase_cfg = get_phase(step, train_cfg)
 
         if phase_name != current_phase:

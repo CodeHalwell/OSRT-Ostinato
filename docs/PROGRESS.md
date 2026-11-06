@@ -353,6 +353,30 @@ Run notes: Colab sessions die every few hours (rescue ckpt at 12,970; two
 restarts from 13,000); the W&B client buffers for up to 2 h and the run
 shows "crashed" while training continues — trust the cell output.
 
+**SFT probe done (2026-11-06, Colab, W&B run 5keunybd).** HRA r256 adapters
+on the frozen 14,500 base, 1,000 steps × 262K tokens (2×4096×32 on the 96 GB
+card; 8×4096 OOMs). SFT holdout 1.1188@0 → 1.0045@250 → 0.9816@500 →
+0.9703@750 → **0.9656@1000**; fineweb held-out 2.9375 → 2.9614 (+0.024, flat
+after step 500). Merged weights:
+`HallD/OSRT-Ostinato-midtrain-v4-cooldown/sft/osrt-v7-sft-v4_merged_step_1000.pt`
+(+ `_bf16.safetensors`). Next: chat-mode GSM8K / HumanEval on that merge.
+
+**Local sniff test of the merge (2026-11-06, MPS bf16):** greedy, NO repetition
+penalty (1.2 suppresses the prompt's own tokens and the model stops answering
+the question). Chat format and `<|end_turn|>` stop are learned; a Python
+Fibonacci is correct; general prose is fluent; factual recall ("capital of
+France") and a GSM8K-style word problem fail (right template, wrong numbers,
+loops after ~150 tokens). Format learned, substance not — the base needs
+tokens, not more SFT.
+
+**Decision 2026-11-06: 18,000 more stable-phase steps, then a 2,000-step
+cooldown.** Resume `-v4` from 13,500 (cell 5 unchanged, LR stays 5e-5; the
+14,500 cooldown branch is a leaf), stop after the 31,500 checkpoint lands
+(~125 h of RTX PRO 6000 ≈ 1,000 units; lineage → ≈15.4B tokens, ~2.9×
+Chinchilla active), then §7 with FROM_STEP=31500, COOLDOWN_STEPS=2000 into
+`-v4-cooldown-31500`. After that: full-weight SFT (to build: SFT labels
+through `run_training` + Muon), then the HRA probe on the full-SFT merge.
+
 **Colab continuation + release path (built 2026-11-03):** Colab Pro+ holds
 ~1,950 compute units (~8/h on an RTX PRO 6000 ≈ 240 h ≈ 13–17B tokens).
 `train_main --config midtrain` resumes v4 from the mirror
