@@ -25,6 +25,13 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=0, help="0 = SFTProbeConfig default")
     p.add_argument("--run-name", default="")
     p.add_argument(
+        "--micro-batch-scale",
+        type=float,
+        default=1.0,
+        help="1.0 = B200 shape (8x4096); 0.25 on a 96 GB RTX PRO 6000. "
+        "Accumulation adjusts to hold tokens/step.",
+    )
+    p.add_argument(
         "--push", action="store_true", help="upload merged ckpt to --base-repo"
     )
     args = p.parse_args()
@@ -46,6 +53,10 @@ def main() -> None:
         cfg.total_steps = args.steps
     if args.run_name:
         cfg.wandb_run_name = args.run_name
+    if args.micro_batch_scale != 1.0:
+        tokens = cfg.tokens_per_step()
+        cfg.batch_size = max(1, round(cfg.batch_size * args.micro_batch_scale))
+        cfg.grad_accum_steps = max(1, round(tokens / (cfg.seq_len * cfg.batch_size)))
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     validate_tokenizer_contract(tok)
     real = len(tok)
@@ -66,7 +77,8 @@ def main() -> None:
     )
     out_dir = os.path.join(args.out_dir, cfg.wandb_run_name)
     print(
-        f"[sft] {cfg.total_steps} steps x {cfg.tokens_per_step():,} tokens | "
+        f"[sft] {cfg.total_steps} steps x {cfg.tokens_per_step():,} tokens "
+        f"({cfg.batch_size}x{cfg.seq_len}x{cfg.grad_accum_steps}) | "
         f"base {base_path}",
         flush=True,
     )

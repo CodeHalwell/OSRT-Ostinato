@@ -326,7 +326,7 @@ guard against a router going uniform without failing the base. Note the
 drift: per-token entropy rose 2.73 → 2.91 over v3's 5,000 steps at 5e-5.
 v4 launched 23:35 GMT on build-small, app `ap-LVl5QWFRzOQ69kgk7xm7xb`,
 W&B run 4aa49ce0. Held-out: 3.2234@0 (= v3's step 4,500) → **3.0872@500**
-(LR 2.5e-5, warmup) → 3.2080@1000 → 3.2256@1500 → 3.2089@2000 → 3.2107@2500 → 3.2063@3000 → 3.1952@3500 → 3.1960@4000 → 3.1833@4500 → 3.1919@5000 → 3.1857@5500 → 3.1920@6000 → 3.1781@6500 → 3.1717@7000 → 3.1711@7500 → 3.1633@8000 → 3.1603@8500 → 3.1589@9000 → 3.1665@9500 (LR 5e-5
+(LR 2.5e-5, warmup) → 3.2080@1000 → 3.2256@1500 → 3.2089@2000 → 3.2107@2500 → 3.2063@3000 → 3.1952@3500 → 3.1960@4000 → 3.1833@4500 → 3.1919@5000 → 3.1857@5500 → 3.1920@6000 → 3.1781@6500 → 3.1717@7000 → 3.1711@7500 → 3.1633@8000 → 3.1603@8500 → 3.1589@9000 → 3.1665@9500 → 3.1417@10000 → 3.1753@10500 → 3.1578@11000 → 3.1802@11500 → 3.1534@12000 → 3.2047@12500 → 3.1434@13000 → 3.1299@13500 (LR 5e-5
 plateau; turned at 2,000 as v3 did, now trending down). The relaxed
 step-5000 router gate passed. build-small cut at ~2,600 (04:25 GMT
 11-03); relayed to danielhalwell (app `ap-7W3KN70kCQr7vUyu19cQo6`) from 2,500.
@@ -336,10 +336,22 @@ codhe-hugging-mcp cut at step 9,500 (17:33 GMT 11-03), clean exit, right after
 the step-9,500 checkpoint and eval. **Free credit exhausted. v4 stands at
 step 9,500: 2.57B tokens on the widened mix, ≈9.4B in the lineage
 (trunk 5.43B + v2 0.14B + v3 1.22B + v4 2.57B). Latest weights:
-`HallD/OSRT-Ostinato-midtrain-v4/osrt_step_9500.pt` (held-out 3.1665; best
-3.1589 at step 9,000).** To continue: same launch command on any workspace
+`HallD/OSRT-Ostinato-midtrain-v4/osrt_step_10000.pt` (held-out 3.1417, best
+so far; Colab RTX PRO 6000 run).** To continue: same launch command on any workspace
 with credit, or Colab RTX PRO 6000 via `train_main` (needs a `--config
 midtrain` switch).
+
+**Cooldown done (2026-11-06, Colab RTX PRO 6000).** v4 ran to step 13,500
+(2× Chinchilla on active params ≈ 10.5B lineage tokens; held-out flat at
+3.13–3.20 from step 9,000 = peak-LR plateau), then a 1,000-step WSD cooldown
+(5e-5 → 5e-6, repo `HallD/OSRT-Ostinato-midtrain-v4-cooldown`):
+3.1299@13500 → 3.0442@14000 → **2.9375@14500** (ppl 18.9). The cooldown is
+worth 0.19 nats, more than the whole 4,500-step plateau. Soup of
+13500/14000/14500 scored 2.9439 — worse than 14500 alone, because it
+averages in pre-cooldown weights. **Base for SFT: `osrt_step_14500.pt`.**
+Run notes: Colab sessions die every few hours (rescue ckpt at 12,970; two
+restarts from 13,000); the W&B client buffers for up to 2 h and the run
+shows "crashed" while training continues — trust the cell output.
 
 **Colab continuation + release path (built 2026-11-03):** Colab Pro+ holds
 ~1,950 compute units (~8/h on an RTX PRO 6000 ≈ 240 h ≈ 13–17B tokens).
